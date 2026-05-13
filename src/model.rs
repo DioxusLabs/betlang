@@ -1,4 +1,4 @@
-//! Inference for the wordseq Magika source-language student.
+//! Inference for the wordseq v2 student.
 //!
 //! Loads `assets/magika/source-student-q4.bin` (49.92 KB MSQ1 export) and
 //! runs a forward pass: byte-window tokenization → v2 word-unit tokenization
@@ -16,8 +16,8 @@
 //! - QDense 256→96 (2-bit) + GELU
 //! - QDense 96→67 (4-bit)
 //!
-//! Implementation is scalar Rust. SIMD specializations have been removed
-//! relative to the prior conv-xwide-hash-hidden model; can be re-added.
+//! Convolution hot paths use `fearless_simd` with scalar fallbacks for
+//! edges and out-channel counts not divisible by 16.
 
 use crate::language::{CLASS_LANGUAGES, Language};
 use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
@@ -228,13 +228,14 @@ fn hash_bin(unit: u32, head: usize) -> usize {
 /// Conv1d (SAME pad) for a block of `BLOCK` consecutive output positions
 /// starting at `t_base`. Accumulates into `accs` (`BLOCK * out_channels` long).
 ///
-/// `kernel` is the original `[k][in_c][out_c]` layout (used by slow paths).
-/// `kernel_chunked` is the `[chunk][k][in_c][lane]` layout used by the
-/// SIMD chunk-outer fast path so each chunk's (k, in_c) reads are sequential.
+/// `kernel` is `[k][in_c][out_c]` with the inner row contiguous over
+/// out_channels; both scalar and SIMD paths read it directly.
 ///
-/// BLOCK=4 + all positions in-bounds → SIMD fast path with 4 acc rows held
-/// in named `f32x4` variables across the full (k, in_c) inner loop.
-/// Edges / BLOCK != 4 → scalar fallback over the original kernel layout.
+/// BLOCK=4 + all positions in-bounds → SIMD fast path. When out_channels
+/// is a multiple of 16, the group-16 kernel keeps 16 `f32x4` accumulators
+/// register-resident across the full (k, in_c) inner loop; otherwise a
+/// chunk-inner SIMD path with 4 named acc rows is used.
+/// Edges / BLOCK != 4 → scalar fallback.
 #[inline(always)]
 fn conv1d_block<S: Simd, const BLOCK: usize>(
     simd: S,

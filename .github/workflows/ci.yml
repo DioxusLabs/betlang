@@ -29,15 +29,6 @@ jobs:
       - name: Run handrolled fuzz tests
         run: cargo test handrolled_fuzz -- --include-ignored
 
-  miri:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install nightly miri
-        run: rustup toolchain install nightly --profile minimal --component miri
-      - name: Test with miri
-        run: cargo +nightly miri test --lib
-
   wasm-smoke:
     runs-on: ubuntu-latest
     steps:

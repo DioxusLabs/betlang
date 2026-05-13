@@ -1,4 +1,4 @@
-//! CPU inference for the compact Magika source-language student.
+//! CPU inference for the compact wordseq v2 student.
 
 mod language;
 mod model;
