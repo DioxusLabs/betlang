@@ -42,6 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - name: Install wasm target
         run: rustup target add wasm32-unknown-unknown
       - name: Build scalar wasm smoke
