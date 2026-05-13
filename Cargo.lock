@@ -72,6 +72,7 @@ name = "betlang"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "fearless_simd",
  "wasmtime",
 ]
 
@@ -471,6 +472,12 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "fearless_simd"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76258897e51fd156ee03b6246ea53f3e0eb395d0b327e9961c4fc4c8b2fa151a"
 
 [[package]]
 name = "find-msvc-tools"

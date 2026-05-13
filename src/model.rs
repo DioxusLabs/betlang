@@ -20,7 +20,14 @@
 //! relative to the prior conv-xwide-hash-hidden model; can be re-added.
 
 use crate::language::{CLASS_LANGUAGES, Language};
+use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::sync::OnceLock;
+
+/// Detect the best available SIMD level once per process.
+fn simd_level() -> Level {
+    static LEVEL: OnceLock<Level> = OnceLock::new();
+    *LEVEL.get_or_init(Level::new)
+}
 
 static MODEL_BYTES: &[u8] = include_bytes!("../assets/magika/source-student-q4.bin");
 
@@ -32,7 +39,6 @@ const MAGIKA_BLOCK_SIZE: usize = 4_096;
 
 // Wordseq architecture constants. Must match what the model was trained with.
 const BINS: usize = 1_024;
-const HASH_COUNT: usize = 3;
 const MAX_UNITS: usize = 2_048;
 const EMBED: usize = 24;
 const CONV0_KERNEL: usize = 7;
@@ -58,13 +64,11 @@ const NUM_FLAG: u32 = 0x4000_0000;
 struct Model {
     /// 1024 × 24 dequantized embedding rows.
     embedding: Vec<f32>,
-    /// (CONV0_KERNEL, EMBED, CONV0) flattened.
+    /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
     conv0_kernel: Vec<f32>,
     conv0_bias: [f32; CONV0],
-    /// (CONV1_KERNEL, CONV0, CONV1) flattened.
     conv1_kernel: Vec<f32>,
     conv1_bias: [f32; CONV1],
-    /// (CONV2_KERNEL, CONV1, CONV2) flattened.
     conv2_kernel: Vec<f32>,
     conv2_bias: [f32; CONV2],
     /// (POOLED, DENSE) flattened.
@@ -140,8 +144,8 @@ impl Model {
 
     /// Run the full forward pass on a unit-id sequence (length = `len`).
     fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
-        // 1) HashEmbedding: for each position, hash unit_id into K=3 bins,
-        //    sum the K embedding rows. Pad positions (unit_id < 0) → zero vector.
+        // 1) HashEmbedding (K=3 hashed rows summed) + GELU, fused per position.
+        //    Padding positions (unit_id < 0) → gelu(0) = 0.
         let t = len.min(MAX_UNITS);
         let mut embed = vec![0.0f32; t * EMBED];
         for pos in 0..t {
@@ -149,55 +153,63 @@ impl Model {
             if id < 0 {
                 continue;
             }
-            let unsigned = id as u32;
             let dst = &mut embed[pos * EMBED..(pos + 1) * EMBED];
-            for h in 0..HASH_COUNT {
-                let bin = hash_bin(unsigned, h);
-                let row = &self.embedding[bin * EMBED..(bin + 1) * EMBED];
-                for (d, w) in dst.iter_mut().zip(row) {
-                    *d += *w;
-                }
+            embed_position(&self.embedding, id as u32, dst);
+            for v in dst.iter_mut() {
+                *v = gelu(*v);
             }
         }
-        // 2) GELU
-        for v in &mut embed {
-            *v = gelu(*v);
-        }
 
-        // 3) QConv1D k=7 24→64 with SAME padding; activation GELU
-        let conv0 = conv1d_same(&embed, t, EMBED, &self.conv0_kernel, CONV0_KERNEL, CONV0, &self.conv0_bias);
-        let conv0_act = gelu_vec(conv0);
+        // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
+        //    ~524 KB intermediate buffer and the second read pass.
+        let (pool0, t1) = conv_gelu_maxpool(
+            &embed, t, EMBED,
+            &self.conv0_kernel, CONV0_KERNEL, CONV0, &self.conv0_bias,
+            CONV0_POOL,
+        );
 
-        // 4) MaxPool(4) along sequence dim
-        let (pool0, t1) = max_pool_1d(&conv0_act, t, CONV0, CONV0_POOL);
+        // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
+        let (pool1, t2) = conv_gelu_maxpool(
+            &pool0, t1, CONV0,
+            &self.conv1_kernel, CONV1_KERNEL, CONV1, &self.conv1_bias,
+            CONV1_POOL,
+        );
 
-        // 5) QConv1D k=5 64→128 with SAME padding; activation GELU
-        let conv1 = conv1d_same(&pool0, t1, CONV0, &self.conv1_kernel, CONV1_KERNEL, CONV1, &self.conv1_bias);
-        let conv1_act = gelu_vec(conv1);
-
-        // 6) MaxPool(2)
-        let (pool1, t2) = max_pool_1d(&conv1_act, t1, CONV1, CONV1_POOL);
-
-        // 7) QConv1D k=3 128→128 with SAME padding; activation GELU
-        let conv2 = conv1d_same(&pool1, t2, CONV1, &self.conv2_kernel, CONV2_KERNEL, CONV2, &self.conv2_bias);
-        let conv2_act = gelu_vec(conv2);
-
-        // 8) GlobalMaxPool ⊕ GlobalAvgPool → 256-dim
+        // 4) Conv2 (k=3, 128→128) + GELU + GlobalMax/AvgPool → 256-dim,
+        //    fused so the conv2 output is never materialized.
         let mut pooled = [0.0f32; POOLED];
-        global_max_pool(&conv2_act, t2, CONV2, &mut pooled[..CONV2]);
-        global_avg_pool(&conv2_act, t2, CONV2, &mut pooled[CONV2..]);
+        let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
+        conv_gelu_global_pool(
+            &pool1, t2, CONV1,
+            &self.conv2_kernel, CONV2_KERNEL, CONV2, &self.conv2_bias,
+            max_slice, avg_slice,
+        );
 
-        // 9) QDense 256→96 + GELU
+        // 5) Dense 256→96 + GELU
         let mut dense0_out = [0.0f32; DENSE];
         dense_forward(&pooled, &self.dense0_kernel, &self.dense0_bias, &mut dense0_out);
         for v in &mut dense0_out {
             *v = gelu(*v);
         }
 
-        // 10) QDense 96→67 → logits
+        // 6) Dense 96→67 → logits
         let mut logits = [0.0f32; CLASSES];
         dense_forward(&dense0_out, &self.output_kernel, &self.output_bias, &mut logits);
         logits
+    }
+}
+
+/// Sum the K=3 hashed embedding rows for one unit-id into `dst` (length EMBED).
+#[inline]
+fn embed_position(embedding: &[f32], unit: u32, dst: &mut [f32]) {
+    let b0 = hash_bin(unit, 0);
+    let b1 = hash_bin(unit, 1);
+    let b2 = hash_bin(unit, 2);
+    let row0 = &embedding[b0 * EMBED..b0 * EMBED + EMBED];
+    let row1 = &embedding[b1 * EMBED..b1 * EMBED + EMBED];
+    let row2 = &embedding[b2 * EMBED..b2 * EMBED + EMBED];
+    for i in 0..EMBED {
+        dst[i] = row0[i] + row1[i] + row2[i];
     }
 }
 
@@ -213,9 +225,19 @@ fn hash_bin(unit: u32, head: usize) -> usize {
     (h as usize) % BINS
 }
 
-/// SAME-padded 1D conv: out[t,c_out] = bias[c_out] + sum_k sum_c kernel[k,c,c_out] * x[t+k-pad, c]
-/// where pad = (kernel_size - 1) / 2.
-fn conv1d_same(
+/// Conv1d (SAME pad) for a block of `BLOCK` consecutive output positions
+/// starting at `t_base`. Accumulates into `accs` (`BLOCK * out_channels` long).
+///
+/// `kernel` is the original `[k][in_c][out_c]` layout (used by slow paths).
+/// `kernel_chunked` is the `[chunk][k][in_c][lane]` layout used by the
+/// SIMD chunk-outer fast path so each chunk's (k, in_c) reads are sequential.
+///
+/// BLOCK=4 + all positions in-bounds → SIMD fast path with 4 acc rows held
+/// in named `f32x4` variables across the full (k, in_c) inner loop.
+/// Edges / BLOCK != 4 → scalar fallback over the original kernel layout.
+#[inline(always)]
+fn conv1d_block<S: Simd, const BLOCK: usize>(
+    simd: S,
     input: &[f32],
     seq_len: usize,
     in_channels: usize,
@@ -223,80 +245,424 @@ fn conv1d_same(
     kernel_size: usize,
     out_channels: usize,
     bias: &[f32],
-) -> Vec<f32> {
+    t_base: usize,
+    accs: &mut [f32],
+) {
+    debug_assert_eq!(accs.len(), BLOCK * out_channels);
+    debug_assert_eq!(out_channels % 4, 0);
     let pad = (kernel_size - 1) / 2;
-    let mut out = vec![0.0f32; seq_len * out_channels];
-    for t in 0..seq_len {
-        let out_row = &mut out[t * out_channels..(t + 1) * out_channels];
-        out_row.copy_from_slice(bias);
+    if BLOCK == 4 {
+        let all_in_bounds =
+            t_base >= pad && t_base + 4 + (kernel_size - 1).saturating_sub(pad) <= seq_len;
+        if all_in_bounds {
+            conv1d_block4_simd_inner(
+                simd, input, in_channels, kernel, kernel_size,
+                out_channels, bias, t_base, pad, accs,
+            );
+            return;
+        }
+    }
+    // Scalar fallback (BLOCK != 4 OR sequence edge). Uses the original layout
+    // where the inner kernel row is contiguous.
+    for s in 0..BLOCK {
+        accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
+    }
+    for k in 0..kernel_size {
+        let src_t_at_s0 = t_base as isize + k as isize - pad as isize;
+        let s_lo = if src_t_at_s0 < 0 {
+            ((-src_t_at_s0) as usize).min(BLOCK)
+        } else {
+            0
+        };
+        let s_hi_signed = seq_len as isize - src_t_at_s0;
+        let s_hi = if s_hi_signed > 0 {
+            (s_hi_signed as usize).min(BLOCK)
+        } else {
+            0
+        };
+        if s_lo >= s_hi {
+            continue;
+        }
+        let kbase = k * in_channels * out_channels;
+        for in_c in 0..in_channels {
+            let krow_off = kbase + in_c * out_channels;
+            let krow = &kernel[krow_off..krow_off + out_channels];
+            for s in s_lo..s_hi {
+                let src_t = (src_t_at_s0 + s as isize) as usize;
+                let x = input[src_t * in_channels + in_c];
+                let acc = &mut accs[s * out_channels..(s + 1) * out_channels];
+                for (a, &w) in acc.iter_mut().zip(krow) {
+                    *a = w.mul_add(x, *a);
+                }
+            }
+        }
+    }
+}
+
+/// BLOCK=4 SIMD hot path. Out-channels are processed in 16-wide groups so
+/// that each group's 4 accumulator rows × 4 chunks (= 16 NEON registers)
+/// live in regs across the entire (k, in_c) inner loop. Combined with the
+/// chunk-inner inner pattern, kernel and input reads stay cache-sequential
+/// while the per-iter accs load/store traffic is eliminated.
+#[inline(always)]
+fn conv1d_block4_simd_inner<S: Simd>(
+    simd: S,
+    input: &[f32],
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    t_base: usize,
+    pad: usize,
+    accs: &mut [f32],
+) {
+    const GROUP: usize = 16;
+    if out_channels % GROUP == 0 {
+        conv1d_block4_group16::<S>(
+            simd, input, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, pad, accs,
+        );
+        return;
+    }
+    // Fallback for out_channels not a multiple of 16: chunk-inner SIMD.
+    for s in 0..4 {
+        accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
+    }
+    let (a01, a23) = accs.split_at_mut(2 * out_channels);
+    let (a0, a1) = a01.split_at_mut(out_channels);
+    let (a2, a3) = a23.split_at_mut(out_channels);
+    for k in 0..kernel_size {
+        let base_t = t_base + k - pad;
+        let row0_off = base_t * in_channels;
+        let row1_off = (base_t + 1) * in_channels;
+        let row2_off = (base_t + 2) * in_channels;
+        let row3_off = (base_t + 3) * in_channels;
+        let kbase = k * in_channels * out_channels;
+        for in_c in 0..in_channels {
+            let krow = &kernel[kbase + in_c * out_channels..kbase + (in_c + 1) * out_channels];
+            let xv0 = f32x4::splat(simd, input[row0_off + in_c]);
+            let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
+            let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
+            let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
+            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow.chunks_exact(4)
+                .zip(a0.chunks_exact_mut(4))
+                .zip(a1.chunks_exact_mut(4))
+                .zip(a2.chunks_exact_mut(4))
+                .zip(a3.chunks_exact_mut(4))
+            {
+                let kr = f32x4::from_slice(simd, kr_c);
+                let av0 = f32x4::from_slice(simd, a0_c);
+                let av1 = f32x4::from_slice(simd, a1_c);
+                let av2 = f32x4::from_slice(simd, a2_c);
+                let av3 = f32x4::from_slice(simd, a3_c);
+                kr.mul_add(xv0, av0).store_slice(a0_c);
+                kr.mul_add(xv1, av1).store_slice(a1_c);
+                kr.mul_add(xv2, av2).store_slice(a2_c);
+                kr.mul_add(xv3, av3).store_slice(a3_c);
+            }
+        }
+    }
+}
+
+/// Group-16 SIMD kernel. For each 16-wide out-channel group, holds
+/// `4 acc rows × 4 chunks = 16 f32x4` accumulators in NEON registers
+/// across the entire (k, in_c) inner loop.
+///
+/// Per (k, in_c) iter: 4 kernel f32x4 loads + 4 broadcast x loads + 16 FMAs.
+/// All 16 accumulators stay register-resident — no per-iter accs load/store.
+#[inline(always)]
+fn conv1d_block4_group16<S: Simd>(
+    simd: S,
+    input: &[f32],
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    t_base: usize,
+    pad: usize,
+    accs: &mut [f32],
+) {
+    let groups = out_channels / 16;
+    for g in 0..groups {
+        let g_off = g * 16;
+        let b0 = f32x4::from_slice(simd, &bias[g_off..g_off + 4]);
+        let b1 = f32x4::from_slice(simd, &bias[g_off + 4..g_off + 8]);
+        let b2 = f32x4::from_slice(simd, &bias[g_off + 8..g_off + 12]);
+        let b3 = f32x4::from_slice(simd, &bias[g_off + 12..g_off + 16]);
+        let (mut a0_0, mut a0_1, mut a0_2, mut a0_3) = (b0, b1, b2, b3);
+        let (mut a1_0, mut a1_1, mut a1_2, mut a1_3) = (b0, b1, b2, b3);
+        let (mut a2_0, mut a2_1, mut a2_2, mut a2_3) = (b0, b1, b2, b3);
+        let (mut a3_0, mut a3_1, mut a3_2, mut a3_3) = (b0, b1, b2, b3);
+
         for k in 0..kernel_size {
-            let src_t = (t + k).wrapping_sub(pad);
-            // SAME padding: zero out-of-bounds positions.
-            if src_t >= seq_len {
-                continue;
-            }
-            let src = &input[src_t * in_channels..(src_t + 1) * in_channels];
-            // Kernel layout: [k, in_c, out_c] → row offset (k * in_channels + in_c) * out_channels
+            let base_t = t_base + k - pad;
+            let row0_off = base_t * in_channels;
+            let row1_off = (base_t + 1) * in_channels;
+            let row2_off = (base_t + 2) * in_channels;
+            let row3_off = (base_t + 3) * in_channels;
+            let kbase = k * in_channels * out_channels;
             for in_c in 0..in_channels {
-                let x = src[in_c];
-                if x == 0.0 {
-                    continue;
-                }
-                let krow_off = (k * in_channels + in_c) * out_channels;
-                let krow = &kernel[krow_off..krow_off + out_channels];
-                for (o, &w) in out_row.iter_mut().zip(krow) {
-                    *o += x * w;
+                let krow_off = kbase + in_c * out_channels + g_off;
+                let kr0 = f32x4::from_slice(simd, &kernel[krow_off..krow_off + 4]);
+                let kr1 = f32x4::from_slice(simd, &kernel[krow_off + 4..krow_off + 8]);
+                let kr2 = f32x4::from_slice(simd, &kernel[krow_off + 8..krow_off + 12]);
+                let kr3 = f32x4::from_slice(simd, &kernel[krow_off + 12..krow_off + 16]);
+                let xv0 = f32x4::splat(simd, input[row0_off + in_c]);
+                let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
+                let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
+                let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
+                a0_0 = kr0.mul_add(xv0, a0_0);
+                a0_1 = kr1.mul_add(xv0, a0_1);
+                a0_2 = kr2.mul_add(xv0, a0_2);
+                a0_3 = kr3.mul_add(xv0, a0_3);
+                a1_0 = kr0.mul_add(xv1, a1_0);
+                a1_1 = kr1.mul_add(xv1, a1_1);
+                a1_2 = kr2.mul_add(xv1, a1_2);
+                a1_3 = kr3.mul_add(xv1, a1_3);
+                a2_0 = kr0.mul_add(xv2, a2_0);
+                a2_1 = kr1.mul_add(xv2, a2_1);
+                a2_2 = kr2.mul_add(xv2, a2_2);
+                a2_3 = kr3.mul_add(xv2, a2_3);
+                a3_0 = kr0.mul_add(xv3, a3_0);
+                a3_1 = kr1.mul_add(xv3, a3_1);
+                a3_2 = kr2.mul_add(xv3, a3_2);
+                a3_3 = kr3.mul_add(xv3, a3_3);
+            }
+        }
+
+        // Store the 4×4 accumulator tile back into accs[s][g_off..g_off+16].
+        a0_0.store_slice(&mut accs[g_off..g_off + 4]);
+        a0_1.store_slice(&mut accs[g_off + 4..g_off + 8]);
+        a0_2.store_slice(&mut accs[g_off + 8..g_off + 12]);
+        a0_3.store_slice(&mut accs[g_off + 12..g_off + 16]);
+        a1_0.store_slice(&mut accs[out_channels + g_off..out_channels + g_off + 4]);
+        a1_1.store_slice(&mut accs[out_channels + g_off + 4..out_channels + g_off + 8]);
+        a1_2.store_slice(&mut accs[out_channels + g_off + 8..out_channels + g_off + 12]);
+        a1_3.store_slice(&mut accs[out_channels + g_off + 12..out_channels + g_off + 16]);
+        a2_0.store_slice(&mut accs[2 * out_channels + g_off..2 * out_channels + g_off + 4]);
+        a2_1.store_slice(&mut accs[2 * out_channels + g_off + 4..2 * out_channels + g_off + 8]);
+        a2_2.store_slice(&mut accs[2 * out_channels + g_off + 8..2 * out_channels + g_off + 12]);
+        a2_3.store_slice(&mut accs[2 * out_channels + g_off + 12..2 * out_channels + g_off + 16]);
+        a3_0.store_slice(&mut accs[3 * out_channels + g_off..3 * out_channels + g_off + 4]);
+        a3_1.store_slice(&mut accs[3 * out_channels + g_off + 4..3 * out_channels + g_off + 8]);
+        a3_2.store_slice(&mut accs[3 * out_channels + g_off + 8..3 * out_channels + g_off + 12]);
+        a3_3.store_slice(&mut accs[3 * out_channels + g_off + 12..3 * out_channels + g_off + 16]);
+    }
+}
+
+/// Fused conv1d (SAME pad) + GELU + MaxPool(pool).
+/// Always accumulates BLOCK=4 consecutive conv positions per outer iteration
+/// (max NEON-friendly krow reuse), then applies POOL-wide maxpool over them.
+fn conv_gelu_maxpool(
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pool: usize,
+) -> (Vec<f32>, usize) {
+    let pooled_len = seq_len / pool;
+    let mut out = vec![0.0f32; pooled_len * out_channels];
+    let level = simd_level();
+    dispatch!(level, simd => conv_gelu_maxpool_simd(
+        simd, input, seq_len, in_channels, kernel, kernel_size,
+        out_channels, bias, pool, pooled_len, &mut out,
+    ));
+    (out, pooled_len)
+}
+
+#[inline(always)]
+fn conv_gelu_maxpool_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pool: usize,
+    pooled_len: usize,
+    out: &mut [f32],
+) {
+    match pool {
+        4 => conv_gelu_maxpool_run::<S, 4, 4>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+        2 => conv_gelu_maxpool_run::<S, 4, 2>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+        _ => conv_gelu_maxpool_run::<S, 1, 1>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+    }
+}
+
+#[inline(always)]
+fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pooled_len: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(BLOCK % POOL, 0);
+    let outs_per_block: usize = BLOCK / POOL;
+    let mut accs = vec![0.0f32; BLOCK * out_channels];
+    let block_count = pooled_len / outs_per_block;
+    for tb in 0..block_count {
+        let t_base = tb * BLOCK;
+        conv1d_block::<S, BLOCK>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, &mut accs,
+        );
+        for op in 0..outs_per_block {
+            let pooled_idx = tb * outs_per_block + op;
+            let dst = &mut out[pooled_idx * out_channels..(pooled_idx + 1) * out_channels];
+            let s_first = op * POOL;
+            let first = &accs[s_first * out_channels..(s_first + 1) * out_channels];
+            for (d_c, a_c) in dst.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+                let v = f32x4::from_slice(simd, a_c);
+                gelu_simd(simd, v).store_slice(d_c);
+            }
+            for s in 1..POOL {
+                let acc_idx = s_first + s;
+                let acc = &accs[acc_idx * out_channels..(acc_idx + 1) * out_channels];
+                for (d_c, a_c) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                    let v = f32x4::from_slice(simd, a_c);
+                    let g = gelu_simd(simd, v);
+                    let dv = f32x4::from_slice(simd, d_c);
+                    g.max(dv).store_slice(d_c);
                 }
             }
         }
     }
-    out
-}
-
-fn max_pool_1d(input: &[f32], seq_len: usize, channels: usize, pool: usize) -> (Vec<f32>, usize) {
-    let new_len = seq_len / pool;
-    let mut out = vec![f32::NEG_INFINITY; new_len * channels];
-    for t in 0..new_len {
-        let dst = &mut out[t * channels..(t + 1) * channels];
-        for k in 0..pool {
-            let src_t = t * pool + k;
-            let src = &input[src_t * channels..(src_t + 1) * channels];
-            for (d, &s) in dst.iter_mut().zip(src) {
-                if s > *d {
-                    *d = s;
+    let processed = block_count * outs_per_block;
+    if processed < pooled_len {
+        let mut tail_accs = vec![0.0f32; POOL * out_channels];
+        for tp in processed..pooled_len {
+            let t_base = tp * POOL;
+            conv1d_block::<S, POOL>(
+                simd, input, seq_len, in_channels, kernel, kernel_size,
+                out_channels, bias, t_base, &mut tail_accs,
+            );
+            let dst = &mut out[tp * out_channels..(tp + 1) * out_channels];
+            let first = &tail_accs[..out_channels];
+            for (d_c, a_c) in dst.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+                let v = f32x4::from_slice(simd, a_c);
+                gelu_simd(simd, v).store_slice(d_c);
+            }
+            for s in 1..POOL {
+                let acc = &tail_accs[s * out_channels..(s + 1) * out_channels];
+                for (d_c, a_c) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                    let v = f32x4::from_slice(simd, a_c);
+                    let g = gelu_simd(simd, v);
+                    let dv = f32x4::from_slice(simd, d_c);
+                    g.max(dv).store_slice(d_c);
                 }
             }
         }
     }
-    (out, new_len)
 }
 
-fn global_max_pool(input: &[f32], seq_len: usize, channels: usize, out: &mut [f32]) {
-    out.fill(f32::NEG_INFINITY);
-    for t in 0..seq_len {
-        let src = &input[t * channels..(t + 1) * channels];
-        for (d, &s) in out.iter_mut().zip(src) {
-            if s > *d {
-                *d = s;
-            }
-        }
-    }
-}
-
-fn global_avg_pool(input: &[f32], seq_len: usize, channels: usize, out: &mut [f32]) {
-    out.fill(0.0);
+/// Fused conv1d (SAME pad) + GELU + (GlobalMax || GlobalAvg) pool.
+/// Writes max into `out_max` and average into `out_avg` (each `out_channels` long).
+/// Processes T_BLOCK=4 positions per outer iteration to reuse kernel rows.
+fn conv_gelu_global_pool(
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    out_max: &mut [f32],
+    out_avg: &mut [f32],
+) {
+    out_max.fill(f32::NEG_INFINITY);
+    out_avg.fill(0.0);
     if seq_len == 0 {
         return;
     }
-    for t in 0..seq_len {
-        let src = &input[t * channels..(t + 1) * channels];
-        for (d, &s) in out.iter_mut().zip(src) {
-            *d += s;
+    let level = simd_level();
+    dispatch!(level, simd => conv_gelu_global_pool_simd(
+        simd, input, seq_len, in_channels, kernel, kernel_size,
+        out_channels, bias, out_max, out_avg,
+    ));
+}
+
+#[inline(always)]
+fn conv_gelu_global_pool_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    out_max: &mut [f32],
+    out_avg: &mut [f32],
+) {
+    const T_BLOCK: usize = 4;
+    let mut accs = vec![0.0f32; T_BLOCK * out_channels];
+    let block_count = seq_len / T_BLOCK;
+    for tb in 0..block_count {
+        let t_base = tb * T_BLOCK;
+        conv1d_block::<S, T_BLOCK>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, &mut accs,
+        );
+        for s in 0..T_BLOCK {
+            let acc = &accs[s * out_channels..(s + 1) * out_channels];
+            for ((mx_c, av_c), a_c) in out_max
+                .chunks_exact_mut(4)
+                .zip(out_avg.chunks_exact_mut(4))
+                .zip(acc.chunks_exact(4))
+            {
+                let v = f32x4::from_slice(simd, a_c);
+                let g = gelu_simd(simd, v);
+                let mx_v = f32x4::from_slice(simd, mx_c);
+                let av_v = f32x4::from_slice(simd, av_c);
+                g.max(mx_v).store_slice(mx_c);
+                (av_v + g).store_slice(av_c);
+            }
+        }
+    }
+    let mut tail_accs = vec![0.0f32; out_channels];
+    for t in (block_count * T_BLOCK)..seq_len {
+        conv1d_block::<S, 1>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t, &mut tail_accs,
+        );
+        for ((mx_c, av_c), a_c) in out_max
+            .chunks_exact_mut(4)
+            .zip(out_avg.chunks_exact_mut(4))
+            .zip(tail_accs.chunks_exact(4))
+        {
+            let v = f32x4::from_slice(simd, a_c);
+            let g = gelu_simd(simd, v);
+            let mx_v = f32x4::from_slice(simd, mx_c);
+            let av_v = f32x4::from_slice(simd, av_c);
+            g.max(mx_v).store_slice(mx_c);
+            (av_v + g).store_slice(av_c);
         }
     }
     let inv = 1.0 / seq_len as f32;
-    for d in out.iter_mut() {
-        *d *= inv;
+    for av in out_avg.iter_mut() {
+        *av *= inv;
     }
 }
 
@@ -305,35 +671,61 @@ fn dense_forward(input: &[f32], kernel: &[f32], bias: &[f32], out: &mut [f32]) {
     let out_len = out.len();
     debug_assert_eq!(kernel.len(), in_len * out_len);
     out.copy_from_slice(bias);
-    for i in 0..in_len {
-        let x = input[i];
-        if x == 0.0 {
-            continue;
-        }
+    for (i, &x) in input.iter().enumerate() {
         let krow = &kernel[i * out_len..(i + 1) * out_len];
         for (o, &w) in out.iter_mut().zip(krow) {
-            *o += x * w;
+            *o = w.mul_add(x, *o);
         }
     }
 }
 
+#[inline(always)]
 fn gelu(x: f32) -> f32 {
-    // Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))).
-    // libm not available without dep; use the standard approximation from Hendrycks & Gimpel.
+    // Tanh-form GELU (Hendrycks & Gimpel), matching how the student was trained.
+    // 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
     0.5 * x * (1.0 + tanh_approx(0.797_884_56 * (x + 0.044_715 * x * x * x)))
 }
 
-fn gelu_vec(mut v: Vec<f32>) -> Vec<f32> {
-    for x in v.iter_mut() {
-        *x = gelu(*x);
-    }
-    v
+/// [7/6] Padé approximation of tanh, accurate to ~1e-6 over the clamped range.
+/// Replaces the libm `tanh` call so the GELU step auto-vectorizes (no function call).
+#[inline(always)]
+fn tanh_approx(x: f32) -> f32 {
+    let x = x.clamp(-5.0, 5.0);
+    let x2 = x * x;
+    let num = x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)));
+    let den = 135135.0 + x2 * (62370.0 + x2 * (3150.0 + x2 * 28.0));
+    num / den
 }
 
-#[inline]
-fn tanh_approx(x: f32) -> f32 {
-    // Use std's tanh — it's exact-ish via libm.
-    x.tanh()
+#[inline(always)]
+fn gelu_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    let half = f32x4::splat(simd, 0.5);
+    let one = f32x4::splat(simd, 1.0);
+    let c1 = f32x4::splat(simd, 0.797_884_56);
+    let c2 = f32x4::splat(simd, 0.044_715);
+    let x2 = x * x;
+    let x3 = x * x2;
+    let inner = c1 * (x + c2 * x3);
+    let t = tanh_approx_simd(simd, inner);
+    half * x * (one + t)
+}
+
+/// SIMD [7/6] Padé tanh approximation matching `tanh_approx`.
+#[inline(always)]
+fn tanh_approx_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    let neg5 = f32x4::splat(simd, -5.0);
+    let pos5 = f32x4::splat(simd, 5.0);
+    let x = x.max(neg5).min(pos5);
+    let x2 = x * x;
+    let c28 = f32x4::splat(simd, 28.0);
+    let c378 = f32x4::splat(simd, 378.0);
+    let c3150 = f32x4::splat(simd, 3150.0);
+    let c17325 = f32x4::splat(simd, 17325.0);
+    let c62370 = f32x4::splat(simd, 62370.0);
+    let c135135 = f32x4::splat(simd, 135135.0);
+    let num = x * (c135135 + x2 * (c17325 + x2 * (c378 + x2)));
+    let den = c135135 + x2 * (c62370 + x2 * (c3150 + c28 * x2));
+    num / den
 }
 
 // ============================================================================
