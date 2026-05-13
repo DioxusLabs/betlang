@@ -1,0 +1,40 @@
+[package]
+name = "betlang"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+description = "Magika source-language detection for code."
+repository = "https://github.com/ealmloff/betlang"
+homepage = "https://github.com/ealmloff/betlang"
+keywords = ["language", "detection", "code", "magika"]
+categories = ["development-tools", "text-processing"]
+
+[features]
+default = []
+wasm-bench = ["dep:wasmtime"]
+
+[dependencies]
+wasmtime = { version = "44.0.1", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
+
+[lib]
+name = "betlang"
+path = "src/lib.rs"
+
+[[example]]
+name = "wasm_smoke"
+path = "examples/wasm_smoke.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "wasm_bench"
+path = "examples/wasm_bench.rs"
+required-features = ["wasm-bench"]
+
+[[bench]]
+name = "detect"
+harness = false
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = "0.5"
+
+[workspace]
