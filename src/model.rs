@@ -1,140 +1,137 @@
+//! Inference for the wordseq Magika source-language student.
+//!
+//! Loads `assets/magika/source-student-q4.bin` (49.92 KB MSQ1 export) and
+//! runs a forward pass: byte-window tokenization → v2 word-unit tokenization
+//! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
+//! max+avg pool → 2 dense layers → 67-class softmax logits.
+//!
+//! Model architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
+//! - 1024-bin × 24-dim shared HashEmbedding table (4-bit, ~12 KB)
+//! - QConv1D k=7 24→64ch (2-bit ternary)
+//! - MaxPool(4)
+//! - QConv1D k=5 64→128ch (2-bit)
+//! - MaxPool(2)
+//! - QConv1D k=3 128→128ch (2-bit)
+//! - GlobalMax ⊕ GlobalAvg → 256-dim
+//! - QDense 256→96 (2-bit) + GELU
+//! - QDense 96→67 (4-bit)
+//!
+//! Implementation is scalar Rust. SIMD specializations have been removed
+//! relative to the prior conv-xwide-hash-hidden model; can be re-added.
+
 use crate::language::{CLASS_LANGUAGES, Language};
+use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::sync::OnceLock;
 
-mod architectures;
+/// Detect the best available SIMD level once per process.
+fn simd_level() -> Level {
+    static LEVEL: OnceLock<Level> = OnceLock::new();
+    *LEVEL.get_or_init(Level::new)
+}
 
 static MODEL_BYTES: &[u8] = include_bytes!("../assets/magika/source-student-q4.bin");
 
-const MODEL_MAGIC_LEN: usize = 8;
-type Token = u16;
-const TOKEN_LENGTH: usize = 2_048;
-const TOKEN_VOCAB_SIZE: usize = 257;
-const PADDING_TOKEN: Token = 256;
-const PADDING_TOKEN_INDEX: usize = PADDING_TOKEN as usize;
+const MODEL_MAGIC: [u8; 8] = [0x4d, 0x53, 0x51, 0x31, 0x01, 0x00, 0x00, 0x00];
+
 const MAGIKA_BEG_SIZE: usize = 1_024;
 const MAGIKA_END_SIZE: usize = 1_024;
 const MAGIKA_BLOCK_SIZE: usize = 4_096;
 
-const EMBED: usize = 40;
+// Wordseq architecture constants. Must match what the model was trained with.
+const BINS: usize = 1_024;
+const MAX_UNITS: usize = 2_048;
+const EMBED: usize = 24;
 const CONV0_KERNEL: usize = 7;
-const CONV0: usize = 80;
+const CONV0: usize = 64;
 const CONV0_POOL: usize = 4;
-const CONV0_POOL_WIDTH: usize = TOKEN_LENGTH / CONV0_POOL;
 const CONV1_KERNEL: usize = 5;
-const CONV1: usize = 160;
-#[cfg(all(target_arch = "aarch64", not(miri)))]
-const CONV1_I8MM_CHUNKS: usize = CONV0 / 8;
-const POOLED: usize = CONV1 * 2;
-const DENSE: usize = 176;
-const HASH_BINS: usize = 256;
-const HASH: usize = 64;
-const FEATURES: usize = DENSE + HASH;
-const CLASSES: usize = 67;
+const CONV1: usize = 128;
+const CONV1_POOL: usize = 2;
+const CONV2_KERNEL: usize = 3;
+const CONV2: usize = 128;
+const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
+const DENSE: usize = 96;
+pub(crate) const CLASSES: usize = 67;
 const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
+
+// v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
+const WORD_MASK: u32 = 0x00FF_FFFF;
+const PUNCT_FLAG: u32 = 0x1000_0000;
+const INDENT_FLAG: u32 = 0x2000_0000;
+const NUM_FLAG: u32 = 0x4000_0000;
 
 #[derive(Debug)]
 struct Model {
-    conv0_lookup: Vec<f32>,
+    /// 1024 × 24 dequantized embedding rows.
+    embedding: Vec<f32>,
+    /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
+    conv0_kernel: Vec<f32>,
     conv0_bias: [f32; CONV0],
-    conv1_kernel: I8Matrix,
-    conv1_i8mm_kernel: Option<Conv1I8mmKernel>,
-    conv1_padding_lookup: [[f32; CONV1]; CONV1_KERNEL],
+    conv1_kernel: Vec<f32>,
     conv1_bias: [f32; CONV1],
-    dense0_kernel: I8Matrix,
+    conv2_kernel: Vec<f32>,
+    conv2_bias: [f32; CONV2],
+    /// (POOLED, DENSE) flattened.
+    dense0_kernel: Vec<f32>,
     dense0_bias: [f32; DENSE],
-    hash_kernel: I8Matrix,
-    hash_bias: [f32; HASH],
-    output_kernel: I8Matrix,
+    /// (DENSE, CLASSES) flattened.
+    output_kernel: Vec<f32>,
     output_bias: [f32; CLASSES],
-}
-
-#[derive(Debug)]
-struct I8Weights {
-    data: Vec<i8>,
-    scale: f32,
-}
-
-#[derive(Debug)]
-struct I8Matrix {
-    data: Vec<i8>,
-    input_len: usize,
-    output_len: usize,
-    scale: f32,
-}
-
-#[derive(Debug)]
-struct Conv1I8mmKernel {
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
-    data: Vec<i8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct QuantizedVector<const N: usize> {
-    values: [i8; N],
-    scale: f32,
-}
-
-struct Tokenized {
-    tokens: [Token; TOKEN_LENGTH],
-    begin_len: usize,
-    end_start: usize,
-    end_len: usize,
-}
-
-impl Tokenized {
-    #[inline(always)]
-    fn is_dense(&self) -> bool {
-        self.tokens[MAGIKA_BEG_SIZE] != PADDING_TOKEN
-    }
-}
-
-struct Conv0Pooled {
-    rows: Vec<QuantizedVector<CONV0>>,
-    row_slots: [u16; CONV0_POOL_WIDTH],
 }
 
 impl Model {
     fn load() -> Self {
-        assert!(has_model_magic(MODEL_BYTES));
-        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).expect("Magika metadata");
-        let metadata = std::str::from_utf8(&MODEL_BYTES[metadata_start..]).expect("utf-8 metadata");
-        assert!(metadata.contains(r#""architecture":"conv-xwide-hash-hidden""#));
+        assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
+        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).expect("no metadata");
+        let metadata = std::str::from_utf8(&MODEL_BYTES[metadata_start..]).expect("utf-8 meta");
+        assert!(
+            metadata.contains(r#""architecture":"wordseq-b1024-k3-m2048-tiny-3conv-hidden""#),
+            "shipped model is not the expected wordseq architecture",
+        );
         let scales = parse_scales(metadata);
-        assert_eq!(scales.len(), 6);
+        // 6 layers, each with 1 weight tensor → 6 scales total.
+        assert_eq!(scales.len(), 6, "expected 6 weight scales");
 
-        let mut cursor = MODEL_MAGIC_LEN;
-        let embedding = read_i8_weights(&mut cursor, TOKEN_VOCAB_SIZE * EMBED, scales[0]);
-        let conv0_kernel = read_i8_weights(&mut cursor, CONV0_KERNEL * EMBED * CONV0, scales[1]);
-        let conv0_bias = read_f32_array::<CONV0>(&mut cursor);
-        let conv0_lookup = precompute_conv0_lookup(&embedding, &conv0_kernel);
-        let conv0_padding_pooled = precompute_conv0_padding_pooled(&conv0_lookup, &conv0_bias);
-        let conv1_kernel = read_i8_matrix(&mut cursor, CONV1_KERNEL * CONV0, CONV1, scales[2]);
-        let conv1_i8mm_kernel = precompute_conv1_i8mm_kernel(&conv1_kernel);
-        let conv1_padding_lookup =
-            precompute_conv1_padding_lookup(&conv0_padding_pooled, &conv1_kernel);
-        let conv1_bias = read_f32_array::<CONV1>(&mut cursor);
-        let dense0_kernel = read_i8_matrix(&mut cursor, POOLED, DENSE, scales[3]);
-        let dense0_bias = read_f32_array::<DENSE>(&mut cursor);
-        let hash_kernel = read_i8_matrix(&mut cursor, HASH_BINS, HASH, scales[4]);
-        let hash_bias = read_f32_array::<HASH>(&mut cursor);
-        let output_kernel = read_i8_matrix(&mut cursor, FEATURES, CLASSES, scales[5]);
-        let output_bias = read_f32_array::<CLASSES>(&mut cursor);
+        let mut cur = MODEL_MAGIC.len();
 
-        assert_eq!(cursor + 4, metadata_start);
-        let metadata_len = u32::from_le_bytes(MODEL_BYTES[cursor..cursor + 4].try_into().unwrap());
+        // q_hash_embedding: weights [(1024, 24)] int4
+        let embedding = read_int4_dequant(&mut cur, BINS * EMBED, scales[0]);
+
+        // q_conv_0: weights [(7, 24, 64)] ternary, bias [(64,)] f32
+        let conv0_kernel = read_ternary_dequant(&mut cur, CONV0_KERNEL * EMBED * CONV0, scales[1]);
+        let conv0_bias = read_f32_array::<CONV0>(&mut cur);
+
+        // q_conv_1: weights [(5, 64, 128)] ternary, bias [(128,)] f32
+        let conv1_kernel = read_ternary_dequant(&mut cur, CONV1_KERNEL * CONV0 * CONV1, scales[2]);
+        let conv1_bias = read_f32_array::<CONV1>(&mut cur);
+
+        // q_conv_2: weights [(3, 128, 128)] ternary, bias [(128,)] f32
+        let conv2_kernel = read_ternary_dequant(&mut cur, CONV2_KERNEL * CONV1 * CONV2, scales[3]);
+        let conv2_bias = read_f32_array::<CONV2>(&mut cur);
+
+        // q_dense_0: weights [(256, 96)] ternary, bias [(96,)] f32
+        let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, scales[4]);
+        let dense0_bias = read_f32_array::<DENSE>(&mut cur);
+
+        // q_output: weights [(96, 67)] int4, bias [(67,)] f32
+        let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
+        let output_bias = read_f32_array::<CLASSES>(&mut cur);
+
+        // Trailing 4-byte LE metadata length (not used for indexing here, just sanity).
+        assert_eq!(cur + 4, metadata_start, "unexpected payload length");
+        let metadata_len = u32::from_le_bytes(MODEL_BYTES[cur..cur + 4].try_into().unwrap());
         assert_eq!(metadata_len as usize, MODEL_BYTES.len() - metadata_start);
 
         Self {
-            conv0_lookup,
+            embedding,
+            conv0_kernel,
             conv0_bias,
             conv1_kernel,
-            conv1_i8mm_kernel,
-            conv1_padding_lookup,
             conv1_bias,
+            conv2_kernel,
+            conv2_bias,
             dense0_kernel,
             dense0_bias,
-            hash_kernel,
-            hash_bias,
             output_kernel,
             output_bias,
         }
@@ -145,973 +142,887 @@ impl Model {
         MODEL.get_or_init(Self::load)
     }
 
-    fn logits(&self, tokenized: &Tokenized) -> [f32; CLASSES] {
-        let pooled0 = self.conv0_average_pool(tokenized);
-        let pooled = self.conv1_global_pool(&pooled0);
-        let mut conv_features =
-            dense_quantized_array::<POOLED, DENSE>(&pooled, &self.dense0_kernel, &self.dense0_bias);
-        gelu_slice(&mut conv_features);
-
-        let hash_counts = hashed_bigram_features(tokenized);
-        let mut hash_features = dense_quantized_array::<HASH_BINS, HASH>(
-            &hash_counts,
-            &self.hash_kernel,
-            &self.hash_bias,
-        );
-        gelu_slice(&mut hash_features);
-
-        let mut features = [0.0; FEATURES];
-        features[..DENSE].copy_from_slice(&conv_features);
-        features[DENSE..].copy_from_slice(&hash_features);
-
-        dense_quantized_array::<FEATURES, CLASSES>(
-            &features,
-            &self.output_kernel,
-            &self.output_bias,
-        )
-    }
-
-    fn conv0_average_pool(&self, tokenized: &Tokenized) -> Conv0Pooled {
-        let tokens = &tokenized.tokens;
-        if tokenized.is_dense() {
-            return self.conv0_average_pool_dense(tokens);
+    /// Run the full forward pass on a unit-id sequence (length = `len`).
+    fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
+        // 1) HashEmbedding (K=3 hashed rows summed) + GELU, fused per position.
+        //    Padding positions (unit_id < 0) → gelu(0) = 0.
+        let t = len.min(MAX_UNITS);
+        let mut embed = vec![0.0f32; t * EMBED];
+        for pos in 0..t {
+            let id = units[pos];
+            if id < 0 {
+                continue;
+            }
+            let dst = &mut embed[pos * EMBED..(pos + 1) * EMBED];
+            embed_position(&self.embedding, id as u32, dst);
+            for v in dst.iter_mut() {
+                *v = gelu(*v);
+            }
         }
 
-        let mut rows = Vec::with_capacity(64);
-        let mut row_slots = [u16::MAX; CONV0_POOL_WIDTH];
-
-        self.push_conv0_pool_span(tokens, &mut row_slots, &mut rows, 0, tokenized.begin_len);
-        self.push_conv0_pool_span(
-            tokens,
-            &mut row_slots,
-            &mut rows,
-            tokenized.end_start,
-            tokenized.end_start + tokenized.end_len,
+        // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
+        //    ~524 KB intermediate buffer and the second read pass.
+        let (pool0, t1) = conv_gelu_maxpool(
+            &embed, t, EMBED,
+            &self.conv0_kernel, CONV0_KERNEL, CONV0, &self.conv0_bias,
+            CONV0_POOL,
         );
 
-        Conv0Pooled { rows, row_slots }
-    }
+        // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
+        let (pool1, t2) = conv_gelu_maxpool(
+            &pool0, t1, CONV0,
+            &self.conv1_kernel, CONV1_KERNEL, CONV1, &self.conv1_bias,
+            CONV1_POOL,
+        );
 
-    fn push_conv0_pool_span(
-        &self,
-        tokens: &[Token; TOKEN_LENGTH],
-        row_slots: &mut [u16; CONV0_POOL_WIDTH],
-        rows: &mut Vec<QuantizedVector<CONV0>>,
-        span_start: usize,
-        span_end: usize,
-    ) {
-        if span_start >= span_end {
+        // 4) Conv2 (k=3, 128→128) + GELU + GlobalMax/AvgPool → 256-dim,
+        //    fused so the conv2 output is never materialized.
+        let mut pooled = [0.0f32; POOLED];
+        let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
+        conv_gelu_global_pool(
+            &pool1, t2, CONV1,
+            &self.conv2_kernel, CONV2_KERNEL, CONV2, &self.conv2_bias,
+            max_slice, avg_slice,
+        );
+
+        // 5) Dense 256→96 + GELU
+        let mut dense0_out = [0.0f32; DENSE];
+        dense_forward(&pooled, &self.dense0_kernel, &self.dense0_bias, &mut dense0_out);
+        for v in &mut dense0_out {
+            *v = gelu(*v);
+        }
+
+        // 6) Dense 96→67 → logits
+        let mut logits = [0.0f32; CLASSES];
+        dense_forward(&dense0_out, &self.output_kernel, &self.output_bias, &mut logits);
+        logits
+    }
+}
+
+/// Sum the K=3 hashed embedding rows for one unit-id into `dst` (length EMBED).
+#[inline]
+fn embed_position(embedding: &[f32], unit: u32, dst: &mut [f32]) {
+    let b0 = hash_bin(unit, 0);
+    let b1 = hash_bin(unit, 1);
+    let b2 = hash_bin(unit, 2);
+    let row0 = &embedding[b0 * EMBED..b0 * EMBED + EMBED];
+    let row1 = &embedding[b1 * EMBED..b1 * EMBED + EMBED];
+    let row2 = &embedding[b2 * EMBED..b2 * EMBED + EMBED];
+    for i in 0..EMBED {
+        dst[i] = row0[i] + row1[i] + row2[i];
+    }
+}
+
+/// K=3 prime-mix hash matching `hash_unit_indices` in the Python trainer.
+fn hash_bin(unit: u32, head: usize) -> usize {
+    const PRIMES: [u64; 4] = [2_654_435_761, 2_246_822_519, 3_266_489_917, 668_265_263];
+    let mask = 0xFFFF_FFFFu64;
+    let p1 = PRIMES[head % PRIMES.len()];
+    let p2 = PRIMES[(head + 1) % PRIMES.len()];
+    let mut h = ((unit as u64).wrapping_mul(p1)) & mask;
+    h ^= h >> 13;
+    h = (h.wrapping_mul(p2)) & mask;
+    (h as usize) % BINS
+}
+
+/// Conv1d (SAME pad) for a block of `BLOCK` consecutive output positions
+/// starting at `t_base`. Accumulates into `accs` (`BLOCK * out_channels` long).
+///
+/// `kernel` is the original `[k][in_c][out_c]` layout (used by slow paths).
+/// `kernel_chunked` is the `[chunk][k][in_c][lane]` layout used by the
+/// SIMD chunk-outer fast path so each chunk's (k, in_c) reads are sequential.
+///
+/// BLOCK=4 + all positions in-bounds → SIMD fast path with 4 acc rows held
+/// in named `f32x4` variables across the full (k, in_c) inner loop.
+/// Edges / BLOCK != 4 → scalar fallback over the original kernel layout.
+#[inline(always)]
+fn conv1d_block<S: Simd, const BLOCK: usize>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    t_base: usize,
+    accs: &mut [f32],
+) {
+    debug_assert_eq!(accs.len(), BLOCK * out_channels);
+    debug_assert_eq!(out_channels % 4, 0);
+    let pad = (kernel_size - 1) / 2;
+    if BLOCK == 4 {
+        let all_in_bounds =
+            t_base >= pad && t_base + 4 + (kernel_size - 1).saturating_sub(pad) <= seq_len;
+        if all_in_bounds {
+            conv1d_block4_simd_inner(
+                simd, input, in_channels, kernel, kernel_size,
+                out_channels, bias, t_base, pad, accs,
+            );
             return;
         }
-
-        let pad = CONV0_KERNEL / 2;
-        let first_position = span_start.saturating_sub(CONV0_POOL - 1 + pad);
-        let last_position_exclusive = (span_end + pad).min(TOKEN_LENGTH);
-        let start_pool = first_position / CONV0_POOL;
-        let end_pool = last_position_exclusive
-            .div_ceil(CONV0_POOL)
-            .min(CONV0_POOL_WIDTH);
-
-        for (pooled_index, slot) in row_slots
-            .iter_mut()
-            .enumerate()
-            .take(end_pool)
-            .skip(start_pool)
-        {
-            if *slot != u16::MAX {
-                continue;
-            }
-
-            let position_start = pooled_index * CONV0_POOL;
-            if is_full_padding_conv0_pool(tokens, position_start) {
-                continue;
-            }
-
-            *slot = rows.len() as u16;
-            if is_dense_conv0_pool_span(pooled_index, span_start, span_end) {
-                rows.push(self.conv0_pool_row_dense(tokens, pooled_index));
-            } else {
-                rows.push(self.conv0_pool_row(tokens, pooled_index));
-            }
-        }
     }
-
-    #[inline(always)]
-    fn conv0_average_pool_dense(&self, tokens: &[Token; TOKEN_LENGTH]) -> Conv0Pooled {
-        let mut rows = Vec::with_capacity(CONV0_POOL_WIDTH);
-        let mut row_slots = [u16::MAX; CONV0_POOL_WIDTH];
-
-        row_slots[0] = 0;
-        rows.push(self.conv0_pool_row(tokens, 0));
-
-        for (pooled_index, slot) in row_slots
-            .iter_mut()
-            .enumerate()
-            .take(CONV0_POOL_WIDTH - 1)
-            .skip(1)
-        {
-            *slot = rows.len() as u16;
-            rows.push(self.conv0_pool_row_dense(tokens, pooled_index));
-        }
-
-        row_slots[CONV0_POOL_WIDTH - 1] = rows.len() as u16;
-        rows.push(self.conv0_pool_row(tokens, CONV0_POOL_WIDTH - 1));
-
-        Conv0Pooled { rows, row_slots }
+    // Scalar fallback (BLOCK != 4 OR sequence edge). Uses the original layout
+    // where the inner kernel row is contiguous.
+    for s in 0..BLOCK {
+        accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
     }
-
-    #[inline(always)]
-    fn conv0_pool_row(
-        &self,
-        tokens: &[Token; TOKEN_LENGTH],
-        pooled_index: usize,
-    ) -> QuantizedVector<CONV0> {
-        let position_start = pooled_index * CONV0_POOL;
-        let pad = CONV0_KERNEL / 2;
-        let mut pooled_row = [0.0; CONV0];
-        for position in position_start..position_start + CONV0_POOL {
-            let mut row = self.conv0_bias;
-            for kernel_position in 0..CONV0_KERNEL {
-                let source_position = if kernel_position < pad {
-                    let offset = pad - kernel_position;
-                    if position < offset {
-                        continue;
-                    }
-                    position - offset
-                } else {
-                    let source_position = position + (kernel_position - pad);
-                    if source_position >= TOKEN_LENGTH {
-                        continue;
-                    }
-                    source_position
-                };
-
-                let token = tokens[source_position].min(PADDING_TOKEN) as usize;
-                let lookup_start = (kernel_position * TOKEN_VOCAB_SIZE + token) * CONV0;
-                let lookup = &self.conv0_lookup[lookup_start..lookup_start + CONV0];
-                add_assign::<CONV0>(&mut row, lookup);
-            }
-
-            add_gelu_quarter::<CONV0>(&mut pooled_row, &row);
+    for k in 0..kernel_size {
+        let src_t_at_s0 = t_base as isize + k as isize - pad as isize;
+        let s_lo = if src_t_at_s0 < 0 {
+            ((-src_t_at_s0) as usize).min(BLOCK)
+        } else {
+            0
+        };
+        let s_hi_signed = seq_len as isize - src_t_at_s0;
+        let s_hi = if s_hi_signed > 0 {
+            (s_hi_signed as usize).min(BLOCK)
+        } else {
+            0
+        };
+        if s_lo >= s_hi {
+            continue;
         }
-
-        quantize_array(&pooled_row)
-    }
-
-    #[inline(always)]
-    fn conv0_pool_row_dense(
-        &self,
-        tokens: &[Token; TOKEN_LENGTH],
-        pooled_index: usize,
-    ) -> QuantizedVector<CONV0> {
-        architectures::conv0_pool_row_dense(self, tokens, pooled_index)
-    }
-
-    fn conv1_global_pool(&self, input: &Conv0Pooled) -> [f32; POOLED] {
-        if let Some(kernel) = &self.conv1_i8mm_kernel
-            && input.rows.len() == CONV0_POOL_WIDTH
-        {
-            return self.conv1_global_pool_dense_i8mm(input, kernel);
-        }
-        if let Some(kernel) = &self.conv1_i8mm_kernel {
-            return self.conv1_global_pool_sparse_i8mm(input, kernel);
-        }
-        let mut pooled = [0.0; POOLED];
-        pooled[..CONV1].fill(f32::NEG_INFINITY);
-
-        let mut position = 0;
-        while position < CONV0_POOL_WIDTH {
-            if input.is_full_padding_conv1_window(position) {
-                let run_start = position;
-                while position < CONV0_POOL_WIDTH && input.is_full_padding_conv1_window(position) {
-                    position += 1;
-                }
-                let row = self.conv1_row(input, run_start);
-                accumulate_conv1_row(&mut pooled, row, position - run_start);
-                continue;
-            }
-
-            let row = self.conv1_row(input, position);
-            accumulate_conv1_row(&mut pooled, row, 1);
-            position += 1;
-        }
-
-        for out_channel in 0..CONV1 {
-            pooled[CONV1 + out_channel] /= CONV0_POOL_WIDTH as f32;
-        }
-
-        pooled
-    }
-
-    fn conv1_global_pool_sparse_i8mm(
-        &self,
-        input: &Conv0Pooled,
-        kernel: &Conv1I8mmKernel,
-    ) -> [f32; POOLED] {
-        let mut pooled = [0.0; POOLED];
-        pooled[..CONV1].fill(f32::NEG_INFINITY);
-
-        let mut position = 0;
-        while position < CONV0_POOL_WIDTH {
-            if input.is_full_padding_conv1_window(position) {
-                let run_start = position;
-                while position < CONV0_POOL_WIDTH && input.is_full_padding_conv1_window(position) {
-                    position += 1;
-                }
-                let row = self.conv1_row(input, run_start);
-                accumulate_conv1_row(&mut pooled, row, position - run_start);
-                continue;
-            }
-
-            if position + 1 < CONV0_POOL_WIDTH && !input.is_full_padding_conv1_window(position + 1)
-            {
-                let (row0, row1) = self.conv1_pair_rows_i8mm(input, kernel, position);
-                accumulate_conv1_row(&mut pooled, row0, 1);
-                accumulate_conv1_row(&mut pooled, row1, 1);
-                position += 2;
-                continue;
-            }
-
-            let row = self.conv1_row(input, position);
-            accumulate_conv1_row(&mut pooled, row, 1);
-            position += 1;
-        }
-
-        for out_channel in 0..CONV1 {
-            pooled[CONV1 + out_channel] /= CONV0_POOL_WIDTH as f32;
-        }
-
-        pooled
-    }
-
-    fn conv1_pair_rows_i8mm(
-        &self,
-        input: &Conv0Pooled,
-        kernel: &Conv1I8mmKernel,
-        position: usize,
-    ) -> ([f32; CONV1], [f32; CONV1]) {
-        debug_assert!(position + 1 < CONV0_POOL_WIDTH);
-
-        let mut row0 = self.conv1_bias;
-        let mut row1 = self.conv1_bias;
-
-        for kernel_position in 0..CONV1_KERNEL {
-            let source_position0 = conv1_source_position(position, kernel_position);
-            let source_position1 = conv1_source_position(position + 1, kernel_position);
-
-            match (source_position0, source_position1) {
-                (Some(source0), Some(source1)) => {
-                    let row0_is_padding = input.is_full_padding_row(source0);
-                    let row1_is_padding = input.is_full_padding_row(source1);
-                    match (row0_is_padding, row1_is_padding) {
-                        (false, false) => unsafe {
-                            add_quantized_conv1_pair_i8mm(
-                                &mut row0,
-                                &mut row1,
-                                input.row(source0),
-                                input.row(source1),
-                                kernel,
-                                kernel_position,
-                                self.conv1_kernel.scale,
-                            );
-                        },
-                        (false, true) => {
-                            add_quantized_conv1_row(
-                                &mut row0,
-                                input.row(source0),
-                                &self.conv1_kernel,
-                                kernel_position,
-                            );
-                            add_assign::<CONV1>(
-                                &mut row1,
-                                &self.conv1_padding_lookup[kernel_position],
-                            );
-                        }
-                        (true, false) => {
-                            add_assign::<CONV1>(
-                                &mut row0,
-                                &self.conv1_padding_lookup[kernel_position],
-                            );
-                            add_quantized_conv1_row(
-                                &mut row1,
-                                input.row(source1),
-                                &self.conv1_kernel,
-                                kernel_position,
-                            );
-                        }
-                        (true, true) => {
-                            add_assign::<CONV1>(
-                                &mut row0,
-                                &self.conv1_padding_lookup[kernel_position],
-                            );
-                            add_assign::<CONV1>(
-                                &mut row1,
-                                &self.conv1_padding_lookup[kernel_position],
-                            );
-                        }
-                    }
-                }
-                (Some(source0), None) => {
-                    if input.is_full_padding_row(source0) {
-                        add_assign::<CONV1>(&mut row0, &self.conv1_padding_lookup[kernel_position]);
-                    } else {
-                        add_quantized_conv1_row(
-                            &mut row0,
-                            input.row(source0),
-                            &self.conv1_kernel,
-                            kernel_position,
-                        );
-                    }
-                }
-                (None, Some(source1)) => {
-                    if input.is_full_padding_row(source1) {
-                        add_assign::<CONV1>(&mut row1, &self.conv1_padding_lookup[kernel_position]);
-                    } else {
-                        add_quantized_conv1_row(
-                            &mut row1,
-                            input.row(source1),
-                            &self.conv1_kernel,
-                            kernel_position,
-                        );
-                    }
-                }
-                (None, None) => {}
-            }
-        }
-
-        (row0, row1)
-    }
-
-    fn conv1_global_pool_dense_i8mm(
-        &self,
-        input: &Conv0Pooled,
-        kernel: &Conv1I8mmKernel,
-    ) -> [f32; POOLED] {
-        let mut pooled = [0.0; POOLED];
-        pooled[..CONV1].fill(f32::NEG_INFINITY);
-
-        let mut row0 = self.conv1_bias;
-        let mut row1 = self.conv1_bias;
-        for kernel_position in CONV1_KERNEL / 2..CONV1_KERNEL {
-            let source_position0 = kernel_position - CONV1_KERNEL / 2;
-            unsafe {
-                add_quantized_conv1_pair_i8mm(
-                    &mut row0,
-                    &mut row1,
-                    &input.rows[source_position0],
-                    &input.rows[source_position0 + 1],
-                    kernel,
-                    kernel_position,
-                    self.conv1_kernel.scale,
-                );
-            }
-        }
-        add_quantized_conv1_row(&mut row1, &input.rows[0], &self.conv1_kernel, 1);
-        accumulate_conv1_row(&mut pooled, row0, 1);
-        accumulate_conv1_row(&mut pooled, row1, 1);
-
-        let mut position = CONV1_KERNEL / 2;
-        while position + 1 < CONV0_POOL_WIDTH - CONV1_KERNEL / 2 {
-            row0 = self.conv1_bias;
-            row1 = self.conv1_bias;
-
-            for kernel_position in 0..CONV1_KERNEL {
-                let source_position0 = position + kernel_position - CONV1_KERNEL / 2;
-                let source_position1 = source_position0 + 1;
-                unsafe {
-                    add_quantized_conv1_pair_i8mm(
-                        &mut row0,
-                        &mut row1,
-                        &input.rows[source_position0],
-                        &input.rows[source_position1],
-                        kernel,
-                        kernel_position,
-                        self.conv1_kernel.scale,
-                    );
+        let kbase = k * in_channels * out_channels;
+        for in_c in 0..in_channels {
+            let krow_off = kbase + in_c * out_channels;
+            let krow = &kernel[krow_off..krow_off + out_channels];
+            for s in s_lo..s_hi {
+                let src_t = (src_t_at_s0 + s as isize) as usize;
+                let x = input[src_t * in_channels + in_c];
+                let acc = &mut accs[s * out_channels..(s + 1) * out_channels];
+                for (a, &w) in acc.iter_mut().zip(krow) {
+                    *a = w.mul_add(x, *a);
                 }
             }
-
-            accumulate_conv1_row(&mut pooled, row0, 1);
-            accumulate_conv1_row(&mut pooled, row1, 1);
-            position += 2;
         }
+    }
+}
 
-        debug_assert_eq!(position, CONV0_POOL_WIDTH - CONV1_KERNEL / 2);
-        row0 = self.conv1_bias;
-        row1 = self.conv1_bias;
-        for kernel_position in 0..CONV1_KERNEL / 2 + 1 {
-            let source_position0 = position + kernel_position - CONV1_KERNEL / 2;
-            unsafe {
-                add_quantized_conv1_pair_i8mm(
-                    &mut row0,
-                    &mut row1,
-                    &input.rows[source_position0],
-                    &input.rows[source_position0 + 1],
-                    kernel,
-                    kernel_position,
-                    self.conv1_kernel.scale,
-                );
-            }
-        }
-        add_quantized_conv1_row(
-            &mut row0,
-            &input.rows[CONV0_POOL_WIDTH - 1],
-            &self.conv1_kernel,
-            3,
+/// BLOCK=4 SIMD hot path. Out-channels are processed in 16-wide groups so
+/// that each group's 4 accumulator rows × 4 chunks (= 16 NEON registers)
+/// live in regs across the entire (k, in_c) inner loop. Combined with the
+/// chunk-inner inner pattern, kernel and input reads stay cache-sequential
+/// while the per-iter accs load/store traffic is eliminated.
+#[inline(always)]
+fn conv1d_block4_simd_inner<S: Simd>(
+    simd: S,
+    input: &[f32],
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    t_base: usize,
+    pad: usize,
+    accs: &mut [f32],
+) {
+    const GROUP: usize = 16;
+    if out_channels % GROUP == 0 {
+        conv1d_block4_group16::<S>(
+            simd, input, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, pad, accs,
         );
-        accumulate_conv1_row(&mut pooled, row0, 1);
-        accumulate_conv1_row(&mut pooled, row1, 1);
+        return;
+    }
+    // Fallback for out_channels not a multiple of 16: chunk-inner SIMD.
+    for s in 0..4 {
+        accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
+    }
+    let (a01, a23) = accs.split_at_mut(2 * out_channels);
+    let (a0, a1) = a01.split_at_mut(out_channels);
+    let (a2, a3) = a23.split_at_mut(out_channels);
+    for k in 0..kernel_size {
+        let base_t = t_base + k - pad;
+        let row0_off = base_t * in_channels;
+        let row1_off = (base_t + 1) * in_channels;
+        let row2_off = (base_t + 2) * in_channels;
+        let row3_off = (base_t + 3) * in_channels;
+        let kbase = k * in_channels * out_channels;
+        for in_c in 0..in_channels {
+            let krow = &kernel[kbase + in_c * out_channels..kbase + (in_c + 1) * out_channels];
+            let xv0 = f32x4::splat(simd, input[row0_off + in_c]);
+            let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
+            let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
+            let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
+            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow.chunks_exact(4)
+                .zip(a0.chunks_exact_mut(4))
+                .zip(a1.chunks_exact_mut(4))
+                .zip(a2.chunks_exact_mut(4))
+                .zip(a3.chunks_exact_mut(4))
+            {
+                let kr = f32x4::from_slice(simd, kr_c);
+                let av0 = f32x4::from_slice(simd, a0_c);
+                let av1 = f32x4::from_slice(simd, a1_c);
+                let av2 = f32x4::from_slice(simd, a2_c);
+                let av3 = f32x4::from_slice(simd, a3_c);
+                kr.mul_add(xv0, av0).store_slice(a0_c);
+                kr.mul_add(xv1, av1).store_slice(a1_c);
+                kr.mul_add(xv2, av2).store_slice(a2_c);
+                kr.mul_add(xv3, av3).store_slice(a3_c);
+            }
+        }
+    }
+}
 
-        for out_channel in 0..CONV1 {
-            pooled[CONV1 + out_channel] /= CONV0_POOL_WIDTH as f32;
+/// Group-16 SIMD kernel. For each 16-wide out-channel group, holds
+/// `4 acc rows × 4 chunks = 16 f32x4` accumulators in NEON registers
+/// across the entire (k, in_c) inner loop.
+///
+/// Per (k, in_c) iter: 4 kernel f32x4 loads + 4 broadcast x loads + 16 FMAs.
+/// All 16 accumulators stay register-resident — no per-iter accs load/store.
+#[inline(always)]
+fn conv1d_block4_group16<S: Simd>(
+    simd: S,
+    input: &[f32],
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    t_base: usize,
+    pad: usize,
+    accs: &mut [f32],
+) {
+    let groups = out_channels / 16;
+    for g in 0..groups {
+        let g_off = g * 16;
+        let b0 = f32x4::from_slice(simd, &bias[g_off..g_off + 4]);
+        let b1 = f32x4::from_slice(simd, &bias[g_off + 4..g_off + 8]);
+        let b2 = f32x4::from_slice(simd, &bias[g_off + 8..g_off + 12]);
+        let b3 = f32x4::from_slice(simd, &bias[g_off + 12..g_off + 16]);
+        let (mut a0_0, mut a0_1, mut a0_2, mut a0_3) = (b0, b1, b2, b3);
+        let (mut a1_0, mut a1_1, mut a1_2, mut a1_3) = (b0, b1, b2, b3);
+        let (mut a2_0, mut a2_1, mut a2_2, mut a2_3) = (b0, b1, b2, b3);
+        let (mut a3_0, mut a3_1, mut a3_2, mut a3_3) = (b0, b1, b2, b3);
+
+        for k in 0..kernel_size {
+            let base_t = t_base + k - pad;
+            let row0_off = base_t * in_channels;
+            let row1_off = (base_t + 1) * in_channels;
+            let row2_off = (base_t + 2) * in_channels;
+            let row3_off = (base_t + 3) * in_channels;
+            let kbase = k * in_channels * out_channels;
+            for in_c in 0..in_channels {
+                let krow_off = kbase + in_c * out_channels + g_off;
+                let kr0 = f32x4::from_slice(simd, &kernel[krow_off..krow_off + 4]);
+                let kr1 = f32x4::from_slice(simd, &kernel[krow_off + 4..krow_off + 8]);
+                let kr2 = f32x4::from_slice(simd, &kernel[krow_off + 8..krow_off + 12]);
+                let kr3 = f32x4::from_slice(simd, &kernel[krow_off + 12..krow_off + 16]);
+                let xv0 = f32x4::splat(simd, input[row0_off + in_c]);
+                let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
+                let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
+                let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
+                a0_0 = kr0.mul_add(xv0, a0_0);
+                a0_1 = kr1.mul_add(xv0, a0_1);
+                a0_2 = kr2.mul_add(xv0, a0_2);
+                a0_3 = kr3.mul_add(xv0, a0_3);
+                a1_0 = kr0.mul_add(xv1, a1_0);
+                a1_1 = kr1.mul_add(xv1, a1_1);
+                a1_2 = kr2.mul_add(xv1, a1_2);
+                a1_3 = kr3.mul_add(xv1, a1_3);
+                a2_0 = kr0.mul_add(xv2, a2_0);
+                a2_1 = kr1.mul_add(xv2, a2_1);
+                a2_2 = kr2.mul_add(xv2, a2_2);
+                a2_3 = kr3.mul_add(xv2, a2_3);
+                a3_0 = kr0.mul_add(xv3, a3_0);
+                a3_1 = kr1.mul_add(xv3, a3_1);
+                a3_2 = kr2.mul_add(xv3, a3_2);
+                a3_3 = kr3.mul_add(xv3, a3_3);
+            }
         }
 
-        pooled
+        // Store the 4×4 accumulator tile back into accs[s][g_off..g_off+16].
+        a0_0.store_slice(&mut accs[g_off..g_off + 4]);
+        a0_1.store_slice(&mut accs[g_off + 4..g_off + 8]);
+        a0_2.store_slice(&mut accs[g_off + 8..g_off + 12]);
+        a0_3.store_slice(&mut accs[g_off + 12..g_off + 16]);
+        a1_0.store_slice(&mut accs[out_channels + g_off..out_channels + g_off + 4]);
+        a1_1.store_slice(&mut accs[out_channels + g_off + 4..out_channels + g_off + 8]);
+        a1_2.store_slice(&mut accs[out_channels + g_off + 8..out_channels + g_off + 12]);
+        a1_3.store_slice(&mut accs[out_channels + g_off + 12..out_channels + g_off + 16]);
+        a2_0.store_slice(&mut accs[2 * out_channels + g_off..2 * out_channels + g_off + 4]);
+        a2_1.store_slice(&mut accs[2 * out_channels + g_off + 4..2 * out_channels + g_off + 8]);
+        a2_2.store_slice(&mut accs[2 * out_channels + g_off + 8..2 * out_channels + g_off + 12]);
+        a2_3.store_slice(&mut accs[2 * out_channels + g_off + 12..2 * out_channels + g_off + 16]);
+        a3_0.store_slice(&mut accs[3 * out_channels + g_off..3 * out_channels + g_off + 4]);
+        a3_1.store_slice(&mut accs[3 * out_channels + g_off + 4..3 * out_channels + g_off + 8]);
+        a3_2.store_slice(&mut accs[3 * out_channels + g_off + 8..3 * out_channels + g_off + 12]);
+        a3_3.store_slice(&mut accs[3 * out_channels + g_off + 12..3 * out_channels + g_off + 16]);
     }
+}
 
-    fn conv1_row(&self, input: &Conv0Pooled, position: usize) -> [f32; CONV1] {
-        let mut row = self.conv1_bias;
-        let pad = CONV1_KERNEL / 2;
+/// Fused conv1d (SAME pad) + GELU + MaxPool(pool).
+/// Always accumulates BLOCK=4 consecutive conv positions per outer iteration
+/// (max NEON-friendly krow reuse), then applies POOL-wide maxpool over them.
+fn conv_gelu_maxpool(
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pool: usize,
+) -> (Vec<f32>, usize) {
+    let pooled_len = seq_len / pool;
+    let mut out = vec![0.0f32; pooled_len * out_channels];
+    let level = simd_level();
+    dispatch!(level, simd => conv_gelu_maxpool_simd(
+        simd, input, seq_len, in_channels, kernel, kernel_size,
+        out_channels, bias, pool, pooled_len, &mut out,
+    ));
+    (out, pooled_len)
+}
 
-        for kernel_position in 0..CONV1_KERNEL {
-            let source_position = if kernel_position < pad {
-                let offset = pad - kernel_position;
-                if position < offset {
-                    continue;
-                }
-                position - offset
-            } else {
-                let source_position = position + (kernel_position - pad);
-                if source_position >= CONV0_POOL_WIDTH {
-                    continue;
-                }
-                source_position
-            };
+#[inline(always)]
+fn conv_gelu_maxpool_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pool: usize,
+    pooled_len: usize,
+    out: &mut [f32],
+) {
+    match pool {
+        4 => conv_gelu_maxpool_run::<S, 4, 4>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+        2 => conv_gelu_maxpool_run::<S, 4, 2>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+        _ => conv_gelu_maxpool_run::<S, 1, 1>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, pooled_len, out,
+        ),
+    }
+}
 
-            if input.is_full_padding_row(source_position) {
-                let lookup = &self.conv1_padding_lookup[kernel_position];
-                add_assign::<CONV1>(&mut row, lookup);
-                continue;
+#[inline(always)]
+fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    pooled_len: usize,
+    out: &mut [f32],
+) {
+    debug_assert_eq!(BLOCK % POOL, 0);
+    let outs_per_block: usize = BLOCK / POOL;
+    let mut accs = vec![0.0f32; BLOCK * out_channels];
+    let block_count = pooled_len / outs_per_block;
+    for tb in 0..block_count {
+        let t_base = tb * BLOCK;
+        conv1d_block::<S, BLOCK>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, &mut accs,
+        );
+        for op in 0..outs_per_block {
+            let pooled_idx = tb * outs_per_block + op;
+            let dst = &mut out[pooled_idx * out_channels..(pooled_idx + 1) * out_channels];
+            let s_first = op * POOL;
+            let first = &accs[s_first * out_channels..(s_first + 1) * out_channels];
+            for (d_c, a_c) in dst.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+                let v = f32x4::from_slice(simd, a_c);
+                gelu_simd(simd, v).store_slice(d_c);
             }
-
-            add_quantized_conv1_row(
-                &mut row,
-                input.row(source_position),
-                &self.conv1_kernel,
-                kernel_position,
+            for s in 1..POOL {
+                let acc_idx = s_first + s;
+                let acc = &accs[acc_idx * out_channels..(acc_idx + 1) * out_channels];
+                for (d_c, a_c) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                    let v = f32x4::from_slice(simd, a_c);
+                    let g = gelu_simd(simd, v);
+                    let dv = f32x4::from_slice(simd, d_c);
+                    g.max(dv).store_slice(d_c);
+                }
+            }
+        }
+    }
+    let processed = block_count * outs_per_block;
+    if processed < pooled_len {
+        let mut tail_accs = vec![0.0f32; POOL * out_channels];
+        for tp in processed..pooled_len {
+            let t_base = tp * POOL;
+            conv1d_block::<S, POOL>(
+                simd, input, seq_len, in_channels, kernel, kernel_size,
+                out_channels, bias, t_base, &mut tail_accs,
             );
-        }
-
-        row
-    }
-}
-
-impl Conv0Pooled {
-    fn is_full_padding_row(&self, index: usize) -> bool {
-        self.row_slots[index] == u16::MAX
-    }
-
-    fn is_full_padding_conv1_window(&self, position: usize) -> bool {
-        let pad = CONV1_KERNEL / 2;
-        position >= pad
-            && position + pad < CONV0_POOL_WIDTH
-            && self.row_slots[position - pad..=position + pad]
-                .iter()
-                .all(|slot| *slot == u16::MAX)
-    }
-
-    fn row(&self, index: usize) -> &QuantizedVector<CONV0> {
-        let slot = self.row_slots[index];
-        debug_assert_ne!(slot, u16::MAX);
-        &self.rows[slot as usize]
-    }
-}
-
-impl I8Matrix {
-    #[inline(always)]
-    fn row(&self, output: usize, input_offset: usize, len: usize) -> &[i8] {
-        debug_assert!(output < self.output_len);
-        debug_assert!(input_offset + len <= self.input_len);
-        let start = output * self.input_len + input_offset;
-        &self.data[start..start + len]
-    }
-}
-
-#[inline(always)]
-fn accumulate_conv1_row(pooled: &mut [f32; POOLED], row: [f32; CONV1], count: usize) {
-    architectures::accumulate_conv1_row(pooled, row, count);
-}
-
-#[inline(always)]
-fn add_gelu_quarter<const N: usize>(target: &mut [f32; N], source: &[f32; N]) {
-    architectures::add_gelu_quarter(target, source);
-}
-
-#[inline(always)]
-fn add_assign<const N: usize>(target: &mut [f32; N], source: &[f32]) {
-    architectures::add_assign(target, source);
-}
-
-#[inline(always)]
-fn add_scaled_i8_slice(target: &mut [f32], weights: &[i8], offset: usize, scale: f32) {
-    let mut index = 0;
-    let weights = &weights[offset..offset + target.len()];
-    while index + 4 <= target.len() {
-        target[index] += scale * weights[index] as f32;
-        target[index + 1] += scale * weights[index + 1] as f32;
-        target[index + 2] += scale * weights[index + 2] as f32;
-        target[index + 3] += scale * weights[index + 3] as f32;
-        index += 4;
-    }
-    if index < target.len() {
-        target[index] += scale * weights[index] as f32;
-        index += 1;
-    }
-    if index < target.len() {
-        target[index] += scale * weights[index] as f32;
-        index += 1;
-    }
-    if index < target.len() {
-        target[index] += scale * weights[index] as f32;
-    }
-}
-
-fn has_model_magic(bytes: &[u8]) -> bool {
-    bytes.len() >= MODEL_MAGIC_LEN
-        && bytes[0] == 0x4d
-        && bytes[1] == 0x53
-        && bytes[2] == 0x51
-        && bytes[3] == 0x31
-        && bytes[4] == 0x01
-        && bytes[5] == 0x00
-        && bytes[6] == 0x00
-        && bytes[7] == 0x00
-}
-
-fn precompute_conv0_lookup(embedding: &I8Weights, kernel: &I8Weights) -> Vec<f32> {
-    debug_assert_eq!(embedding.data.len(), TOKEN_VOCAB_SIZE * EMBED);
-    debug_assert_eq!(kernel.data.len(), CONV0_KERNEL * EMBED * CONV0);
-
-    let mut lookup = vec![0.0; CONV0_KERNEL * TOKEN_VOCAB_SIZE * CONV0];
-    for kernel_position in 0..CONV0_KERNEL {
-        for token in 0..TOKEN_VOCAB_SIZE {
-            let lookup_start = (kernel_position * TOKEN_VOCAB_SIZE + token) * CONV0;
-            let lookup_row = &mut lookup[lookup_start..lookup_start + CONV0];
-
-            for in_channel in 0..EMBED {
-                let input_value = embedding.data[token * EMBED + in_channel] as f32;
-                if input_value == 0.0 {
-                    continue;
+            let dst = &mut out[tp * out_channels..(tp + 1) * out_channels];
+            let first = &tail_accs[..out_channels];
+            for (d_c, a_c) in dst.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
+                let v = f32x4::from_slice(simd, a_c);
+                gelu_simd(simd, v).store_slice(d_c);
+            }
+            for s in 1..POOL {
+                let acc = &tail_accs[s * out_channels..(s + 1) * out_channels];
+                for (d_c, a_c) in dst.chunks_exact_mut(4).zip(acc.chunks_exact(4)) {
+                    let v = f32x4::from_slice(simd, a_c);
+                    let g = gelu_simd(simd, v);
+                    let dv = f32x4::from_slice(simd, d_c);
+                    g.max(dv).store_slice(d_c);
                 }
-                let kernel_start = (kernel_position * EMBED + in_channel) * CONV0;
-                add_scaled_i8_slice(
-                    lookup_row,
-                    &kernel.data,
-                    kernel_start,
-                    input_value * embedding.scale * kernel.scale,
-                );
             }
         }
     }
-
-    lookup
 }
 
-fn precompute_conv0_padding_pooled(
-    conv0_lookup: &[f32],
-    conv0_bias: &[f32; CONV0],
-) -> [f32; CONV0] {
-    let mut row = *conv0_bias;
-    for kernel_position in 0..CONV0_KERNEL {
-        let lookup_start = (kernel_position * TOKEN_VOCAB_SIZE + PADDING_TOKEN_INDEX) * CONV0;
-        let lookup = &conv0_lookup[lookup_start..lookup_start + CONV0];
-        add_assign::<CONV0>(&mut row, lookup);
+/// Fused conv1d (SAME pad) + GELU + (GlobalMax || GlobalAvg) pool.
+/// Writes max into `out_max` and average into `out_avg` (each `out_channels` long).
+/// Processes T_BLOCK=4 positions per outer iteration to reuse kernel rows.
+fn conv_gelu_global_pool(
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    out_max: &mut [f32],
+    out_avg: &mut [f32],
+) {
+    out_max.fill(f32::NEG_INFINITY);
+    out_avg.fill(0.0);
+    if seq_len == 0 {
+        return;
     }
-    for value in &mut row {
-        *value = gelu(*value);
-    }
-    row
+    let level = simd_level();
+    dispatch!(level, simd => conv_gelu_global_pool_simd(
+        simd, input, seq_len, in_channels, kernel, kernel_size,
+        out_channels, bias, out_max, out_avg,
+    ));
 }
 
-fn precompute_conv1_padding_lookup(
-    conv0_padding_pooled: &[f32; CONV0],
-    conv1_kernel: &I8Matrix,
-) -> [[f32; CONV1]; CONV1_KERNEL] {
-    debug_assert_eq!(conv1_kernel.input_len, CONV1_KERNEL * CONV0);
-    debug_assert_eq!(conv1_kernel.output_len, CONV1);
-
-    let mut lookup = [[0.0; CONV1]; CONV1_KERNEL];
-    for (kernel_position, lookup_row) in lookup.iter_mut().enumerate() {
-        let input_offset = kernel_position * CONV0;
-        for (out_channel, output) in lookup_row.iter_mut().enumerate() {
-            let weights = conv1_kernel.row(out_channel, input_offset, CONV0);
-            let mut sum = 0.0;
-            for (input_value, weight) in conv0_padding_pooled.iter().zip(weights) {
-                sum += *input_value * *weight as f32;
+#[inline(always)]
+fn conv_gelu_global_pool_simd<S: Simd>(
+    simd: S,
+    input: &[f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &[f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &[f32],
+    out_max: &mut [f32],
+    out_avg: &mut [f32],
+) {
+    const T_BLOCK: usize = 4;
+    let mut accs = vec![0.0f32; T_BLOCK * out_channels];
+    let block_count = seq_len / T_BLOCK;
+    for tb in 0..block_count {
+        let t_base = tb * T_BLOCK;
+        conv1d_block::<S, T_BLOCK>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t_base, &mut accs,
+        );
+        for s in 0..T_BLOCK {
+            let acc = &accs[s * out_channels..(s + 1) * out_channels];
+            for ((mx_c, av_c), a_c) in out_max
+                .chunks_exact_mut(4)
+                .zip(out_avg.chunks_exact_mut(4))
+                .zip(acc.chunks_exact(4))
+            {
+                let v = f32x4::from_slice(simd, a_c);
+                let g = gelu_simd(simd, v);
+                let mx_v = f32x4::from_slice(simd, mx_c);
+                let av_v = f32x4::from_slice(simd, av_c);
+                g.max(mx_v).store_slice(mx_c);
+                (av_v + g).store_slice(av_c);
             }
-            *output = sum * conv1_kernel.scale;
         }
     }
-    lookup
-}
-
-fn precompute_conv1_i8mm_kernel(conv1_kernel: &I8Matrix) -> Option<Conv1I8mmKernel> {
-    architectures::precompute_conv1_i8mm_kernel(conv1_kernel)
-}
-
-fn is_full_padding_conv0_pool(tokens: &[Token; TOKEN_LENGTH], position_start: usize) -> bool {
-    let pad = CONV0_KERNEL / 2;
-    if position_start < pad {
-        return false;
-    }
-
-    let source_start = position_start - pad;
-    let source_end = position_start + CONV0_POOL - 1 + pad;
-    source_end < TOKEN_LENGTH
-        && tokens[source_start..=source_end]
-            .iter()
-            .all(|token| *token == PADDING_TOKEN)
-}
-
-fn is_dense_conv0_pool_span(pooled_index: usize, span_start: usize, span_end: usize) -> bool {
-    let pad = CONV0_KERNEL / 2;
-    let position_start = pooled_index * CONV0_POOL;
-    position_start >= pad
-        && position_start >= span_start + pad
-        && position_start + CONV0_POOL - 1 + pad < span_end
-}
-
-fn conv1_source_position(position: usize, kernel_position: usize) -> Option<usize> {
-    let pad = CONV1_KERNEL / 2;
-    if kernel_position < pad {
-        position.checked_sub(pad - kernel_position)
-    } else {
-        let source_position = position + (kernel_position - pad);
-        (source_position < CONV0_POOL_WIDTH).then_some(source_position)
-    }
-}
-
-fn read_i8_weights(cursor: &mut usize, values: usize, scale: f32) -> I8Weights {
-    let bytes = values.div_ceil(2);
-    let start = *cursor;
-    *cursor += bytes;
-
-    let mut data = Vec::with_capacity(values);
-    for &packed in &MODEL_BYTES[start..start + bytes] {
-        if data.len() < values {
-            data.push((packed & 0x0f) as i8 - 8);
-        }
-        if data.len() < values {
-            data.push((packed >> 4) as i8 - 8);
+    let mut tail_accs = vec![0.0f32; out_channels];
+    for t in (block_count * T_BLOCK)..seq_len {
+        conv1d_block::<S, 1>(
+            simd, input, seq_len, in_channels, kernel, kernel_size,
+            out_channels, bias, t, &mut tail_accs,
+        );
+        for ((mx_c, av_c), a_c) in out_max
+            .chunks_exact_mut(4)
+            .zip(out_avg.chunks_exact_mut(4))
+            .zip(tail_accs.chunks_exact(4))
+        {
+            let v = f32x4::from_slice(simd, a_c);
+            let g = gelu_simd(simd, v);
+            let mx_v = f32x4::from_slice(simd, mx_c);
+            let av_v = f32x4::from_slice(simd, av_c);
+            g.max(mx_v).store_slice(mx_c);
+            (av_v + g).store_slice(av_c);
         }
     }
-
-    I8Weights { data, scale }
+    let inv = 1.0 / seq_len as f32;
+    for av in out_avg.iter_mut() {
+        *av *= inv;
+    }
 }
 
-fn read_i8_matrix(cursor: &mut usize, input_len: usize, output_len: usize, scale: f32) -> I8Matrix {
-    let values = input_len * output_len;
-    let bytes = values.div_ceil(2);
+fn dense_forward(input: &[f32], kernel: &[f32], bias: &[f32], out: &mut [f32]) {
+    let in_len = input.len();
+    let out_len = out.len();
+    debug_assert_eq!(kernel.len(), in_len * out_len);
+    out.copy_from_slice(bias);
+    for (i, &x) in input.iter().enumerate() {
+        let krow = &kernel[i * out_len..(i + 1) * out_len];
+        for (o, &w) in out.iter_mut().zip(krow) {
+            *o = w.mul_add(x, *o);
+        }
+    }
+}
+
+#[inline(always)]
+fn gelu(x: f32) -> f32 {
+    // Tanh-form GELU (Hendrycks & Gimpel), matching how the student was trained.
+    // 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+    0.5 * x * (1.0 + tanh_approx(0.797_884_56 * (x + 0.044_715 * x * x * x)))
+}
+
+/// [7/6] Padé approximation of tanh, accurate to ~1e-6 over the clamped range.
+/// Replaces the libm `tanh` call so the GELU step auto-vectorizes (no function call).
+#[inline(always)]
+fn tanh_approx(x: f32) -> f32 {
+    let x = x.clamp(-5.0, 5.0);
+    let x2 = x * x;
+    let num = x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)));
+    let den = 135135.0 + x2 * (62370.0 + x2 * (3150.0 + x2 * 28.0));
+    num / den
+}
+
+#[inline(always)]
+fn gelu_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    let half = f32x4::splat(simd, 0.5);
+    let one = f32x4::splat(simd, 1.0);
+    let c1 = f32x4::splat(simd, 0.797_884_56);
+    let c2 = f32x4::splat(simd, 0.044_715);
+    let x2 = x * x;
+    let x3 = x * x2;
+    let inner = c1 * (x + c2 * x3);
+    let t = tanh_approx_simd(simd, inner);
+    half * x * (one + t)
+}
+
+/// SIMD [7/6] Padé tanh approximation matching `tanh_approx`.
+#[inline(always)]
+fn tanh_approx_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
+    let neg5 = f32x4::splat(simd, -5.0);
+    let pos5 = f32x4::splat(simd, 5.0);
+    let x = x.max(neg5).min(pos5);
+    let x2 = x * x;
+    let c28 = f32x4::splat(simd, 28.0);
+    let c378 = f32x4::splat(simd, 378.0);
+    let c3150 = f32x4::splat(simd, 3150.0);
+    let c17325 = f32x4::splat(simd, 17325.0);
+    let c62370 = f32x4::splat(simd, 62370.0);
+    let c135135 = f32x4::splat(simd, 135135.0);
+    let num = x * (c135135 + x2 * (c17325 + x2 * (c378 + x2)));
+    let den = c135135 + x2 * (c62370 + x2 * (c3150 + c28 * x2));
+    num / den
+}
+
+// ============================================================================
+// MSQ1 file format readers
+// ============================================================================
+
+fn read_int4_dequant(cursor: &mut usize, count: usize, scale: f32) -> Vec<f32> {
+    let bytes = count.div_ceil(2);
     let payload = &MODEL_BYTES[*cursor..*cursor + bytes];
     *cursor += bytes;
-
-    let mut data = vec![0; values];
-    for input_index in 0..input_len {
-        for output_index in 0..output_len {
-            let packed_index = input_index * output_len + output_index;
-            let packed = payload[packed_index / 2];
-            let nibble = if packed_index.is_multiple_of(2) {
-                packed & 0x0f
-            } else {
-                packed >> 4
-            };
-            data[output_index * input_len + input_index] = nibble as i8 - 8;
+    let mut out = Vec::with_capacity(count);
+    for &packed in payload {
+        if out.len() < count {
+            let lo = (packed & 0x0f) as i8 - 8;
+            out.push(lo as f32 * scale);
+        }
+        if out.len() < count {
+            let hi = (packed >> 4) as i8 - 8;
+            out.push(hi as f32 * scale);
         }
     }
+    out
+}
 
-    I8Matrix {
-        data,
-        input_len,
-        output_len,
-        scale,
+fn read_ternary_dequant(cursor: &mut usize, count: usize, scale: f32) -> Vec<f32> {
+    let bytes = count.div_ceil(4);
+    let payload = &MODEL_BYTES[*cursor..*cursor + bytes];
+    *cursor += bytes;
+    let mut out = Vec::with_capacity(count);
+    for &packed in payload {
+        for shift in [0u32, 2, 4, 6] {
+            if out.len() >= count {
+                break;
+            }
+            let code = (packed >> shift) & 0x03;
+            let v = match code {
+                0 => -scale,
+                2 => scale,
+                _ => 0.0, // 1 → 0; codes outside {0,1,2} treated as 0 too
+            };
+            out.push(v);
+        }
     }
+    out
 }
 
 fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
-    let result = std::array::from_fn(|index| read_f32_at(MODEL_BYTES, *cursor + index * 4));
+    let mut out = [0.0; N];
+    for i in 0..N {
+        let off = *cursor + i * 4;
+        out[i] = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
+    }
     *cursor += N * 4;
-    result
-}
-
-fn read_f32_at(bytes: &[u8], offset: usize) -> f32 {
-    f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    out
 }
 
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .rposition(|window| window == needle)
+    haystack.windows(needle.len()).rposition(|w| w == needle).map(|i| i)
 }
 
 fn parse_scales(metadata: &str) -> Vec<f32> {
     let mut scales = Vec::new();
     let mut rest = metadata;
-    while let Some(index) = rest.find(r#""scale":"#) {
-        let value_start = index + r#""scale":"#.len();
+    while let Some(idx) = rest.find(r#""scale":"#) {
+        let value_start = idx + r#""scale":"#.len();
         let value_end = rest[value_start..]
             .find([',', '}'])
-            .map(|end| value_start + end)
+            .map(|e| value_start + e)
             .expect("scale terminator");
-        scales.push(rest[value_start..value_end].parse().expect("scale value"));
+        scales.push(rest[value_start..value_end].parse::<f32>().expect("scale parse"));
         rest = &rest[value_end..];
     }
     scales
 }
 
-fn dense_quantized_array<const IN: usize, const OUT: usize>(
-    input: &[f32; IN],
-    kernel: &I8Matrix,
-    bias: &[f32; OUT],
-) -> [f32; OUT] {
-    architectures::dense_quantized_array(input, kernel, bias)
-}
+// ============================================================================
+// Byte windowing + v2 word-unit tokenization
+// ============================================================================
 
-fn add_quantized_conv1_row(
-    output: &mut [f32; CONV1],
-    input: &QuantizedVector<CONV0>,
-    kernel: &I8Matrix,
-    kernel_position: usize,
-) {
-    architectures::add_quantized_conv1_row(output, input, kernel, kernel_position);
-}
+/// v2 tokenizer ported from `numpy_word_units_apply_v2` in the Python trainer.
+///
+/// Walks the input bytes, treating any value >= 0x80 with the high bit set
+/// as "padding" and stopping at the first such byte (matching the Python
+/// `if value >= PADDING_TOKEN: break`). Returns a vector of unit IDs (i32)
+/// up to MAX_UNITS.
+fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
+    const PRIME: u64 = 2_654_435_761;
+    let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
+    let mut word: Vec<u8> = Vec::new();
+    let mut number: Vec<u8> = Vec::new();
+    let mut punct: Vec<u8> = Vec::new();
+    let mut at_line_start = true;
+    let mut indent_units: u32 = 0;
 
-unsafe fn add_quantized_conv1_pair_i8mm(
-    output0: &mut [f32; CONV1],
-    output1: &mut [f32; CONV1],
-    input0: &QuantizedVector<CONV0>,
-    input1: &QuantizedVector<CONV0>,
-    kernel: &Conv1I8mmKernel,
-    kernel_position: usize,
-    kernel_scale: f32,
-) {
-    unsafe {
-        architectures::add_quantized_conv1_pair_i8mm(
-            output0,
-            output1,
-            input0,
-            input1,
-            kernel,
-            kernel_position,
-            kernel_scale,
-        );
-    }
-}
-
-fn quantize_array<const N: usize>(input: &[f32; N]) -> QuantizedVector<N> {
-    let max_abs = max_abs_array(input);
-
-    if max_abs == 0.0 || !max_abs.is_finite() {
-        return QuantizedVector {
-            values: [0; N],
-            scale: 1.0,
-        };
-    }
-
-    let scale = max_abs / 127.0;
-    let inv_scale = 1.0 / scale;
-    let values = quantize_values(input, inv_scale);
-
-    QuantizedVector { values, scale }
-}
-
-#[inline(always)]
-fn quantize_values<const N: usize>(input: &[f32; N], inv_scale: f32) -> [i8; N] {
-    architectures::quantize_values(input, inv_scale)
-}
-
-#[inline(always)]
-fn max_abs_array<const N: usize>(input: &[f32; N]) -> f32 {
-    architectures::max_abs_array(input)
-}
-
-#[inline(always)]
-fn quantize_i8(value: f32, inv_scale: f32) -> i8 {
-    let scaled = value * inv_scale;
-    let rounded = if scaled >= 0.0 {
-        scaled + 0.5
-    } else {
-        scaled - 0.5
+    let flush_word = |word: &mut Vec<u8>, out: &mut Vec<i32>| {
+        if word.is_empty() || out.len() >= MAX_UNITS {
+            return;
+        }
+        let mut h: u64 = 0;
+        for &b in word.iter() {
+            h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+        }
+        out.push(((h as u32) & WORD_MASK) as i32);
+        word.clear();
     };
-    rounded.clamp(-127.0, 127.0) as i8
-}
+    let flush_number = |number: &mut Vec<u8>, out: &mut Vec<i32>| {
+        if number.is_empty() || out.len() >= MAX_UNITS {
+            return;
+        }
+        let mut h: u64 = 0;
+        for &b in number.iter() {
+            h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+        }
+        out.push((((h as u32) & WORD_MASK) | NUM_FLAG) as i32);
+        number.clear();
+    };
+    let flush_punct = |punct: &mut Vec<u8>, out: &mut Vec<i32>| {
+        if punct.is_empty() || out.len() >= MAX_UNITS {
+            return;
+        }
+        let mut h: u64 = 0;
+        for &b in punct.iter() {
+            h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+        }
+        out.push((((h as u32) & WORD_MASK) | PUNCT_FLAG) as i32);
+        punct.clear();
+    };
+    let push_indent = |out: &mut Vec<i32>, indent: u32| {
+        if indent > 0 && out.len() < MAX_UNITS {
+            out.push((indent.min(63) | INDENT_FLAG) as i32);
+        }
+    };
 
-#[cfg(miri)]
-fn dot_i8(left: &[i8], right: &[i8]) -> i32 {
-    architectures::dot_i8(left, right)
-}
-
-fn hashed_bigram_features(tokenized: &Tokenized) -> [f32; HASH_BINS] {
-    let tokens = &tokenized.tokens;
-    let mut counts = [0.0; HASH_BINS];
-    let padding_bucket = (PADDING_TOKEN_INDEX * 263 + PADDING_TOKEN_INDEX * 17) & (HASH_BINS - 1);
-
-    add_bigram_span(&mut counts, tokens, 0, tokenized.begin_len);
-
-    if tokenized.begin_len < tokenized.end_start {
-        if tokenized.begin_len > 0 {
-            add_bigram_count(
-                &mut counts,
-                tokens[tokenized.begin_len - 1],
-                PADDING_TOKEN,
-                1.0,
-            );
+    for (col, &value) in bytes.iter().enumerate() {
+        if padding_mask[col] {
+            // Stop at first padding byte.
+            break;
         }
 
-        let padding_len = tokenized.end_start - tokenized.begin_len;
-        if padding_len > 1 {
-            counts[padding_bucket] += (padding_len - 1) as f32;
+        let is_letter = (b'a'..=b'z').contains(&value)
+            || (b'A'..=b'Z').contains(&value)
+            || value == b'_';
+        let is_digit = (b'0'..=b'9').contains(&value);
+        let is_newline = value == b'\n';
+        let is_cr = value == b'\r';
+        let is_space = value == b' ' || value == b'\t';
+
+        if !is_letter {
+            flush_word(&mut word, &mut out);
+        }
+        if !(is_digit || value == b'.') {
+            flush_number(&mut number, &mut out);
+        }
+        let need_flush_punct = is_letter
+            || is_digit
+            || is_space
+            || is_newline
+            || is_cr
+            || value == b'.';
+        if need_flush_punct {
+            flush_punct(&mut punct, &mut out);
         }
 
-        if tokenized.end_len > 0 {
-            add_bigram_count(&mut counts, PADDING_TOKEN, tokens[tokenized.end_start], 1.0);
+        if out.len() >= MAX_UNITS {
+            break;
         }
-    } else if tokenized.begin_len > 0 && tokenized.end_len > 0 {
-        add_bigram_count(
-            &mut counts,
-            tokens[tokenized.begin_len - 1],
-            tokens[tokenized.end_start],
-            1.0,
-        );
+
+        if is_letter {
+            if at_line_start {
+                push_indent(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            word.push(value);
+            continue;
+        }
+        if is_digit || value == b'.' {
+            // Lone `.` (not after a digit) is punctuation, not a number start.
+            if value == b'.' && number.is_empty() {
+                if at_line_start {
+                    push_indent(&mut out, indent_units);
+                }
+                at_line_start = false;
+                indent_units = 0;
+                punct.push(value);
+                continue;
+            }
+            if at_line_start {
+                push_indent(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            number.push(value);
+            continue;
+        }
+        if is_newline {
+            if at_line_start {
+                push_indent(&mut out, indent_units);
+            }
+            if out.len() < MAX_UNITS {
+                out.push(((b'\n' as u32) | PUNCT_FLAG) as i32);
+            }
+            at_line_start = true;
+            indent_units = 0;
+            continue;
+        }
+        if is_cr {
+            continue;
+        }
+        if at_line_start && is_space {
+            indent_units += if value == b' ' { 1 } else { 4 };
+            continue;
+        }
+        if at_line_start {
+            push_indent(&mut out, indent_units);
+        }
+        at_line_start = false;
+        indent_units = 0;
+        if is_space {
+            // Collapse multiple spaces to one PUNCT_FLAG | b' '.
+            let space_token = ((b' ' as u32) | PUNCT_FLAG) as i32;
+            if out.last() != Some(&space_token) && out.len() < MAX_UNITS {
+                out.push(space_token);
+            }
+            continue;
+        }
+        // Otherwise: punctuation char, accumulate in punct run.
+        punct.push(value);
     }
+    // End-of-input: flush any pending word/number/punct.
+    flush_word(&mut word, &mut out);
+    flush_number(&mut number, &mut out);
+    flush_punct(&mut punct, &mut out);
 
-    add_bigram_span(
-        &mut counts,
-        tokens,
-        tokenized.end_start,
-        tokenized.end_start + tokenized.end_len,
-    );
-
-    for count in &mut counts {
-        *count /= (TOKEN_LENGTH - 1) as f32;
-    }
-    counts
-}
-
-fn add_bigram_span(
-    counts: &mut [f32; HASH_BINS],
-    tokens: &[Token; TOKEN_LENGTH],
-    start: usize,
-    end: usize,
-) {
-    if end.saturating_sub(start) < 2 {
-        return;
-    }
-
-    let mut index = start;
-    while index + 1 < end {
-        add_bigram_count(counts, tokens[index], tokens[index + 1], 1.0);
-        index += 1;
-    }
-}
-
-#[inline(always)]
-fn add_bigram_count(counts: &mut [f32; HASH_BINS], left: Token, right: Token, count: f32) {
-    let bucket = (left as usize * 263 + right as usize * 17) & (HASH_BINS - 1);
-    counts[bucket] += count;
-}
-
-fn gelu_slice(values: &mut [f32]) {
-    architectures::gelu_slice(values);
-}
-
-fn gelu(value: f32) -> f32 {
-    let cubic = value * value * value;
-    let inner = 0.797_884_6 * (value + 0.044_715 * cubic);
-    0.5 * value * (1.0 + fast_tanh(inner))
-}
-
-fn fast_tanh(value: f32) -> f32 {
-    if value <= -3.0 {
-        return -1.0;
-    }
-    if value >= 3.0 {
-        return 1.0;
-    }
-
-    let squared = value * value;
-    value * (27.0 + squared) / (27.0 + 9.0 * squared)
-}
-
-fn magika_tokens(source: &str) -> Option<Tokenized> {
-    let bytes = source.as_bytes();
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let block = bytes.len().min(MAGIKA_BLOCK_SIZE);
-    let stripped_beg = trim_start_ascii(&bytes[..block]);
-    if stripped_beg.len() < 8 {
-        return None;
-    }
-    let stripped_end = trim_end_ascii(&bytes[bytes.len() - block..]);
-
-    let mut tokens = [PADDING_TOKEN; TOKEN_LENGTH];
-    let beg = &stripped_beg[..stripped_beg.len().min(MAGIKA_BEG_SIZE)];
-    let begin_len = beg.len();
-    for (index, &byte) in beg.iter().enumerate() {
-        tokens[index] = byte as Token;
-    }
-
-    let end_len = stripped_end.len().min(MAGIKA_END_SIZE);
-    let end = &stripped_end[stripped_end.len() - end_len..];
-    let end_start = MAGIKA_BEG_SIZE + (MAGIKA_END_SIZE - end_len);
-    for (index, &byte) in end.iter().enumerate() {
-        tokens[end_start + index] = byte as Token;
-    }
-
-    Some(Tokenized {
-        tokens,
-        begin_len,
-        end_start,
-        end_len,
-    })
+    out
 }
 
 fn trim_start_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
     &bytes[start..]
 }
 
 fn trim_end_ascii(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map(|index| index + 1)
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
         .unwrap_or(0);
     &bytes[..end]
 }
 
-/// Detect the source language for a source string.
-///
-/// Use [`Language::slug`] to map the result to an Arborium/tree-sitter language
-/// identifier.
-pub fn detect(source: &str) -> Option<Language> {
-    let tokenized = magika_tokens(source)?;
-    let logits = Model::get().logits(&tokenized);
-    let class_index = reliable_class_from_logits(&logits)?;
-    Some(CLASS_LANGUAGES[class_index])
+/// Build the (begin + end) byte window with a parallel padding mask.
+/// Mirrors `magika_features` in the trainer.
+fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
+    if source.is_empty() {
+        return None;
+    }
+    let block = source.len().min(MAGIKA_BLOCK_SIZE);
+    let stripped_beg_full = trim_start_ascii(&source[..block]);
+    if stripped_beg_full.len() < 8 {
+        return None;
+    }
+    let stripped_end_full = trim_end_ascii(&source[source.len() - block..]);
+
+    let beg_len = stripped_beg_full.len().min(MAGIKA_BEG_SIZE);
+    let end_len = stripped_end_full.len().min(MAGIKA_END_SIZE);
+    let total = MAGIKA_BEG_SIZE + MAGIKA_END_SIZE;
+    let mut buf = vec![0u8; total];
+    let mut pad = vec![false; total];
+
+    buf[..beg_len].copy_from_slice(&stripped_beg_full[..beg_len]);
+    for slot in pad.iter_mut().take(MAGIKA_BEG_SIZE).skip(beg_len) {
+        *slot = true;
+    }
+    let end_start = MAGIKA_BEG_SIZE + (MAGIKA_END_SIZE - end_len);
+    for slot in pad.iter_mut().take(end_start).skip(MAGIKA_BEG_SIZE) {
+        *slot = true;
+    }
+    let end_src = &stripped_end_full[stripped_end_full.len() - end_len..];
+    buf[end_start..end_start + end_len].copy_from_slice(end_src);
+    Some((buf, pad))
 }
 
-#[cfg(all(test, not(miri)))]
-fn predict_class(source: &str) -> Option<(usize, f32, [f32; CLASSES])> {
-    let tokenized = magika_tokens(source)?;
-    let logits = Model::get().logits(&tokenized);
-    let probabilities = softmax(logits);
-    let (class_index, probability) = top_probability(&probabilities)?;
-    Some((class_index, probability, probabilities))
+// ============================================================================
+// Public API
+// ============================================================================
+
+/// Detect the source language for a source string.
+///
+/// Returns `Some(Language)` when the model's top class clearly outranks the
+/// runner-up, otherwise `None`.
+pub fn detect(source: &str) -> Option<Language> {
+    let (bytes, pad) = build_window(source.as_bytes())?;
+    let units = tokenize_v2(&bytes, &pad);
+    let logits = Model::get().logits(&units, units.len());
+    let class_index = reliable_class_from_logits(&logits)?;
+    Some(CLASS_LANGUAGES[class_index])
 }
 
 fn reliable_class_from_logits(logits: &[f32; CLASSES]) -> Option<usize> {
@@ -1119,7 +1030,6 @@ fn reliable_class_from_logits(logits: &[f32; CLASSES]) -> Option<usize> {
     if top - runner_up >= RELIABLE_LOGIT_MARGIN {
         return Some(class_index);
     }
-
     let mut sum = 0.0;
     let mut sum_squares = 0.0;
     for &logit in logits {
@@ -1127,7 +1037,6 @@ fn reliable_class_from_logits(logits: &[f32; CLASSES]) -> Option<usize> {
         sum += value;
         sum_squares += value * value;
     }
-
     let probability = 1.0 / sum;
     let mean = 1.0 / CLASSES as f32;
     let variance = ((sum_squares / (sum * sum)) - mean).max(0.0) / (CLASSES - 1) as f32;
@@ -1138,7 +1047,6 @@ fn top_two_logits(logits: &[f32; CLASSES]) -> Option<(usize, f32, f32)> {
     let mut top = f32::NEG_INFINITY;
     let mut runner_up = f32::NEG_INFINITY;
     let mut class_index = 0;
-
     for (index, &logit) in logits.iter().enumerate() {
         if logit >= top {
             runner_up = top;
@@ -1148,418 +1056,46 @@ fn top_two_logits(logits: &[f32; CLASSES]) -> Option<(usize, f32, f32)> {
             runner_up = logit;
         }
     }
-
     top.is_finite().then_some((class_index, top, runner_up))
-}
-
-#[cfg(test)]
-fn softmax(logits: [f32; CLASSES]) -> [f32; CLASSES] {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
-    let mut probabilities = [0.0; CLASSES];
-    for (probability, logit) in probabilities.iter_mut().zip(logits) {
-        *probability = (logit - max).exp();
-        sum += *probability;
-    }
-    for probability in &mut probabilities {
-        *probability /= sum;
-    }
-    probabilities
-}
-
-#[cfg(test)]
-fn top_probability(probabilities: &[f32; CLASSES]) -> Option<(usize, f32)> {
-    probabilities
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|(_, left), (_, right)| left.total_cmp(right))
-}
-
-#[cfg(all(test, miri))]
-fn is_reliable(probabilities: &[f32; CLASSES], probability: f32) -> bool {
-    let mean = probabilities.iter().sum::<f32>() / CLASSES as f32;
-    let variance = probabilities
-        .iter()
-        .map(|value| {
-            let delta = *value - mean;
-            delta * delta
-        })
-        .sum::<f32>()
-        / (CLASSES - 1) as f32;
-    probability > mean + 2.0 * variance.sqrt()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(not(miri))]
     #[test]
     fn loads_embedded_model() {
         let model = Model::get();
-        assert_eq!(
-            model.conv0_lookup.len(),
-            CONV0_KERNEL * TOKEN_VOCAB_SIZE * CONV0
-        );
-        assert_eq!(model.output_bias.len(), CLASSES);
+        assert_eq!(model.embedding.len(), BINS * EMBED);
+        assert_eq!(model.output_kernel.len(), DENSE * CLASSES);
     }
 
-    #[cfg(not(miri))]
-    #[test]
-    fn predicts_rust_fixture_class() {
-        let (class, probability, _) =
-            predict_class("use std::fmt;\nfn main() { println!(\"hi\"); }").unwrap();
-        assert_eq!(class, 49);
-        assert!(probability.is_finite());
-    }
-
-    #[cfg(not(miri))]
     #[test]
     fn detects_rust_from_source() {
-        assert_eq!(
-            detect("use std::fmt;\nfn main() { println!(\"hi\"); }"),
-            Some(Language::Rust),
-        );
-        assert_eq!(Language::Rust.slug(), "rust");
+        let lang = detect("use std::fmt;\nfn main() { println!(\"hi\"); }");
+        assert_eq!(lang, Some(Language::Rust));
     }
 
-    #[cfg(not(miri))]
     #[test]
-    fn sparse_conv0_pool_matches_full_scan() {
-        let tokenized = magika_tokens(include_str!("../snippets/demo.rs")).unwrap();
-        assert!(!tokenized.is_dense());
-
-        let model = Model::get();
-        let optimized = model.conv0_average_pool(&tokenized);
-        let full_scan = full_scan_sparse_conv0_pool(model, &tokenized.tokens);
-
-        assert_eq!(optimized.row_slots, full_scan.row_slots);
-        assert_eq!(optimized.rows, full_scan.rows);
+    fn detects_python_from_source() {
+        let lang = detect("import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n");
+        assert_eq!(lang, Some(Language::Python));
     }
 
-    #[cfg(not(miri))]
-    fn full_scan_sparse_conv0_pool(model: &Model, tokens: &[Token; TOKEN_LENGTH]) -> Conv0Pooled {
-        let mut rows = Vec::with_capacity(64);
-        let mut row_slots = [u16::MAX; CONV0_POOL_WIDTH];
-
-        for (pooled_index, slot) in row_slots.iter_mut().enumerate() {
-            let position_start = pooled_index * CONV0_POOL;
-            if is_full_padding_conv0_pool(tokens, position_start) {
-                continue;
-            }
-
-            *slot = rows.len() as u16;
-            rows.push(model.conv0_pool_row(tokens, pooled_index));
-        }
-
-        Conv0Pooled { rows, row_slots }
-    }
-
-    #[cfg(all(not(miri), target_arch = "aarch64"))]
     #[test]
-    fn dense_conv1_i8mm_matches_generic_pool() {
-        let mut source = String::new();
-        while source.len() < MAGIKA_BLOCK_SIZE + 512 {
-            source.push_str(include_str!("../snippets/demo.rs"));
-            source.push('\n');
-        }
-
-        let tokenized = magika_tokens(&source).unwrap();
-        assert!(tokenized.is_dense());
-
-        let model = Model::get();
-        let pooled0 = model.conv0_average_pool(&tokenized);
-        let Some(kernel) = model.conv1_i8mm_kernel.as_ref() else {
-            return;
-        };
-
-        let fused = model.conv1_global_pool_dense_i8mm(&pooled0, kernel);
-        let generic = generic_conv1_global_pool(model, &pooled0);
-        for (left, right) in fused.iter().zip(generic) {
-            assert!((left - right).abs() < 0.001, "{left} != {right}");
-        }
+    fn detects_javascript_from_source() {
+        let lang = detect("const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n");
+        assert_eq!(lang, Some(Language::JavaScript));
     }
 
-    #[cfg(all(not(miri), target_arch = "aarch64"))]
     #[test]
-    fn sparse_conv1_i8mm_matches_generic_pool() {
-        let tokenized = magika_tokens(include_str!("../snippets/demo.rs")).unwrap();
-        assert!(!tokenized.is_dense());
-
-        let model = Model::get();
-        if model.conv1_i8mm_kernel.is_none() {
-            return;
-        }
-
-        let pooled0 = model.conv0_average_pool(&tokenized);
-        let sparse_i8mm = model.conv1_global_pool(&pooled0);
-        let generic = generic_conv1_global_pool(model, &pooled0);
-        for (left, right) in sparse_i8mm.iter().zip(generic) {
-            assert!((left - right).abs() < 0.001, "{left} != {right}");
-        }
+    fn empty_input_returns_none() {
+        assert_eq!(detect(""), None);
     }
 
-    #[cfg(all(not(miri), target_arch = "aarch64"))]
-    fn generic_conv1_global_pool(model: &Model, input: &Conv0Pooled) -> [f32; POOLED] {
-        let mut pooled = [0.0; POOLED];
-        pooled[..CONV1].fill(f32::NEG_INFINITY);
-
-        for position in 0..CONV0_POOL_WIDTH {
-            let row = model.conv1_row(input, position);
-            accumulate_conv1_row(&mut pooled, row, 1);
-        }
-
-        for out_channel in 0..CONV1 {
-            pooled[CONV1 + out_channel] /= CONV0_POOL_WIDTH as f32;
-        }
-
-        pooled
-    }
-
-    #[cfg(not(miri))]
     #[test]
-    fn handrolled_fuzz_detect_smoke() {
-        run_handrolled_fuzz(24);
-    }
-
-    #[cfg(not(miri))]
-    #[test]
-    #[ignore = "longer deterministic fuzz pass"]
-    fn handrolled_fuzz_detect_extended() {
-        run_handrolled_fuzz(256);
-    }
-
-    #[cfg(not(miri))]
-    fn run_handrolled_fuzz(cases: usize) {
-        const SEEDS: &[&[u8]] = &[
-            b"",
-            b"       ",
-            b"short",
-            b"fn main() {}",
-            b"#!/usr/bin/env python3\nprint('hello')\n",
-            b"{\"name\":\"dioxus-code\",\"version\":\"0.0.1\"}\n",
-            b"\0\0\0\0\0\0\0\0",
-            b"\xff\xfe\xfd\xfc\xfb\xfa\xf9\xf8",
-            b"        fn main() {}\n",
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ];
-
-        for seed in SEEDS {
-            fuzz_detect_bytes(seed);
-        }
-
-        let mut long = Vec::with_capacity(8 * 1024 + 257);
-        while long.len() < 8 * 1024 + 257 {
-            long.extend_from_slice(b"fn generated_case() { println!(\"hello\"); }\n");
-        }
-        fuzz_detect_bytes(&long);
-
-        long.clear();
-        long.resize(4 * 1024 + 17, b' ');
-        long.extend_from_slice(b"let visible_after_leading_block = true;\n");
-        fuzz_detect_bytes(&long);
-
-        let mut rng = FuzzRng::new(0x9e37_79b9_7f4a_7c15);
-        for case in 0..cases {
-            let len = fuzz_len(&mut rng, case);
-            let mut data = Vec::with_capacity(len);
-            for index in 0..len {
-                data.push(fuzz_byte(&mut rng, case, index));
-            }
-
-            if len > 0 {
-                data[0] = match case % 6 {
-                    0 => b' ',
-                    1 => b'\n',
-                    2 => b'/',
-                    3 => b'{',
-                    4 => 0,
-                    _ => data[0],
-                };
-            }
-            if len > MAGIKA_BLOCK_SIZE {
-                data[MAGIKA_BLOCK_SIZE] = match case % 4 {
-                    0 => b'\t',
-                    1 => b'}',
-                    2 => 0xff,
-                    _ => data[MAGIKA_BLOCK_SIZE],
-                };
-            }
-
-            fuzz_detect_bytes(&data);
-        }
-    }
-
-    #[cfg(not(miri))]
-    fn fuzz_detect_bytes(bytes: &[u8]) {
-        let source = String::from_utf8_lossy(bytes);
-        let detected = detect(source.as_ref());
-
-        if source.trim().is_empty() {
-            assert_eq!(detected, None);
-        }
-        if let Some(language) = detected {
-            assert!(!language.slug().is_empty());
-        }
-        if let Some(tokenized) = magika_tokens(source.as_ref()) {
-            assert!(tokenized.tokens.iter().all(|token| *token <= PADDING_TOKEN));
-            assert_eq!(
-                hashed_bigram_features(&tokenized),
-                scan_hashed_bigram_features(&tokenized.tokens),
-            );
-        }
-    }
-
-    #[cfg(not(miri))]
-    fn scan_hashed_bigram_features(tokens: &[Token; TOKEN_LENGTH]) -> [f32; HASH_BINS] {
-        let mut counts = [0.0; HASH_BINS];
-        let padding_bucket =
-            (PADDING_TOKEN_INDEX * 263 + PADDING_TOKEN_INDEX * 17) & (HASH_BINS - 1);
-        let mut index = 0;
-        while index < TOKEN_LENGTH - 1 {
-            if tokens[index] == PADDING_TOKEN && tokens[index + 1] == PADDING_TOKEN {
-                let run_start = index;
-                while index < TOKEN_LENGTH - 1
-                    && tokens[index] == PADDING_TOKEN
-                    && tokens[index + 1] == PADDING_TOKEN
-                {
-                    index += 1;
-                }
-                counts[padding_bucket] += (index - run_start) as f32;
-                continue;
-            }
-
-            add_bigram_count(&mut counts, tokens[index], tokens[index + 1], 1.0);
-            index += 1;
-        }
-        for count in &mut counts {
-            *count /= (TOKEN_LENGTH - 1) as f32;
-        }
-        counts
-    }
-
-    #[cfg(not(miri))]
-    fn fuzz_len(rng: &mut FuzzRng, case: usize) -> usize {
-        const BOUNDARIES: &[usize] = &[
-            0, 1, 7, 8, 9, 255, 256, 1_023, 1_024, 1_025, 2_047, 2_048, 2_049, 4_095, 4_096, 4_097,
-            8_191, 8_192,
-        ];
-
-        if case.is_multiple_of(3) {
-            return (rng.next_usize() % (8 * 1024 + 1)).min(8 * 1024);
-        }
-
-        let boundary = BOUNDARIES[case % BOUNDARIES.len()];
-        let jitter = (rng.next_usize() % 17) as isize - 8;
-        (boundary as isize + jitter).clamp(0, 8 * 1024) as usize
-    }
-
-    #[cfg(not(miri))]
-    fn fuzz_byte(rng: &mut FuzzRng, case: usize, index: usize) -> u8 {
-        match (case.wrapping_mul(31) ^ index) % 16 {
-            0 => 0,
-            1 => b' ',
-            2 => b'\n',
-            3 => b'\t',
-            4 => b'a' + (rng.next_u8() % 26),
-            5 => b'0' + (rng.next_u8() % 10),
-            6 => [b'{', b'}', b'[', b']', b'(', b')'][rng.next_usize() % 6],
-            7 => [b'#', b'/', b'*', b'=', b';', b'\''][rng.next_usize() % 6],
-            8 => 0x7f,
-            9 => 0x80,
-            10 => 0xc0,
-            11 => 0xe0,
-            12 => 0xf0,
-            13 => 0xff,
-            _ => rng.next_u8(),
-        }
-    }
-
-    #[cfg(not(miri))]
-    struct FuzzRng(u64);
-
-    #[cfg(not(miri))]
-    impl FuzzRng {
-        const fn new(seed: u64) -> Self {
-            Self(seed)
-        }
-
-        fn next_u64(&mut self) -> u64 {
-            let mut value = self.0;
-            value ^= value >> 12;
-            value ^= value << 25;
-            value ^= value >> 27;
-            self.0 = value;
-            value.wrapping_mul(0x2545_f491_4f6c_dd1d)
-        }
-
-        fn next_usize(&mut self) -> usize {
-            self.next_u64() as usize
-        }
-
-        fn next_u8(&mut self) -> u8 {
-            self.next_u64() as u8
-        }
-    }
-
-    #[cfg(miri)]
-    #[test]
-    fn miri_tokenization_handles_boundaries() {
-        assert!(magika_tokens("").is_none());
-        assert!(magika_tokens("        ").is_none());
-        assert!(magika_tokens("short").is_none());
-
-        let tokenized = magika_tokens("        fn main() {}\n").unwrap();
-        assert_eq!(tokenized.tokens[0], b'f' as Token);
-        assert_eq!(tokenized.tokens[1], b'n' as Token);
-        assert!(tokenized.tokens.iter().all(|token| *token <= PADDING_TOKEN));
-
-        let padded = magika_tokens("abcdefgh").unwrap();
-        assert_eq!(padded.tokens[0], b'a' as Token);
-        assert_eq!(padded.tokens[MAGIKA_BEG_SIZE], PADDING_TOKEN);
-        assert_eq!(padded.tokens[TOKEN_LENGTH - 8], b'a' as Token);
-        assert_eq!(padded.tokens[TOKEN_LENGTH - 1], b'h' as Token);
-    }
-
-    #[cfg(miri)]
-    #[test]
-    fn miri_core_math_helpers_are_bounded() {
-        let mut logits = [0.0; CLASSES];
-        logits[3] = 1.0;
-        let probabilities = softmax(logits);
-        let sum = probabilities.iter().sum::<f32>();
-        assert!((sum - 1.0).abs() < 0.0001);
-        assert_eq!(top_probability(&probabilities).unwrap().0, 3);
-        assert!(!is_reliable(&probabilities, probabilities[0]));
-
-        let quantized = quantize_array(&[0.0, 1.0, -1.0, 0.25]);
-        assert_eq!(quantized.values, [0, 127, -127, 32]);
-        assert!(quantized.scale.is_finite());
-
-        let zeroed = quantize_array(&[0.0, f32::INFINITY, f32::NAN, -2.0]);
-        assert_eq!(zeroed.values, [0; 4]);
-        assert_eq!(zeroed.scale, 1.0);
-
-        assert_eq!(dot_i8(&[1, -2, 3], &[4, 5, -6]), -24);
-
-        let mut values = [-3.0, 0.0, 3.0, 6.0];
-        gelu_slice(&mut values);
-        assert!(values.iter().all(|value| value.is_finite()));
-    }
-
-    #[cfg(miri)]
-    #[test]
-    fn miri_matrix_rows_are_bounds_checked() {
-        let matrix = I8Matrix {
-            data: vec![1, 2, 3, 4, 5, 6],
-            input_len: 3,
-            output_len: 2,
-            scale: 0.5,
-        };
-
-        assert_eq!(matrix.row(0, 0, 3), &[1, 2, 3]);
-        assert_eq!(matrix.row(1, 1, 2), &[5, 6]);
-        assert_eq!(matrix.scale, 0.5);
+    fn very_short_input_returns_none() {
+        // < 8 non-whitespace bytes
+        assert_eq!(detect("hi"), None);
     }
 }

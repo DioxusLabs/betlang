@@ -14,6 +14,7 @@ default = []
 wasm-bench = ["dep:wasmtime"]
 
 [dependencies]
+fearless_simd = "0.4"
 wasmtime = { version = "44.0.1", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
 
 [lib]
