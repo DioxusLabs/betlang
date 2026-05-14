@@ -7,13 +7,14 @@ import argparse
 import json
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
 
 from train_magika_source_student import (
+    MAGIKA_BEG_SIZE,
     SPLITS,
     Teacher,
     cache_meta_path,
@@ -40,6 +41,8 @@ class TokenSplit:
     count: int
     hidden: np.memmap | None = None
     self_probabilities: np.memmap | None = None
+    short_slice_probabilities: dict[int, np.memmap] | None = None
+    short_slice_confidences: dict[int, np.memmap] | None = None
 
 
 QAT_ACTIVE = tf.Variable(True, trainable=False, name="qat_active", dtype=tf.bool)
@@ -47,7 +50,16 @@ QAT_ACTIVE = tf.Variable(True, trainable=False, name="qat_active", dtype=tf.bool
 
 def _quantize_for_bits(source: tf.Tensor, bits: int) -> tf.Tensor:
     if bits == 2:
-        scale = tf.reduce_mean(tf.abs(source))
+        # Use mean(abs(nonzero)) so an exported ternary tensor decoded as
+        # {-s,0,+s} is idempotent under QAT, while dense FP warmup weights still
+        # behave like the original mean-abs ternary recipe.
+        abs_source = tf.abs(source)
+        nonzero_abs = tf.boolean_mask(abs_source, abs_source > 0.0)
+        scale = tf.cond(
+            tf.size(nonzero_abs) > 0,
+            lambda: tf.reduce_mean(nonzero_abs),
+            lambda: tf.constant(1e-6, dtype=source.dtype),
+        )
         scale = tf.maximum(scale, tf.constant(1e-6, dtype=source.dtype))
         threshold = 0.7 * scale
         ternary = tf.where(
@@ -56,6 +68,11 @@ def _quantize_for_bits(source: tf.Tensor, bits: int) -> tf.Tensor:
             tf.where(source < -threshold, -scale, tf.zeros_like(source)),
         )
         return source + tf.stop_gradient(ternary - source)
+    if bits == 4:
+        max_abs = tf.maximum(tf.reduce_max(tf.abs(source)), tf.constant(1e-6, dtype=source.dtype))
+        scale = max_abs / tf.constant(7.0, dtype=source.dtype)
+        quantized = tf.clip_by_value(tf.round(source / scale), -7.0, 7.0) * scale
+        return source + tf.stop_gradient(quantized - source)
     max_abs = tf.maximum(tf.reduce_max(tf.abs(source)), tf.constant(1e-6, dtype=source.dtype))
     return tf.quantization.fake_quant_with_min_max_vars(
         source,
@@ -3623,8 +3640,206 @@ def convert_splits_to_word_units(
             count=split.count,
             hidden=split.hidden,
             self_probabilities=split.self_probabilities,
+            short_slice_probabilities=split.short_slice_probabilities,
+            short_slice_confidences=split.short_slice_confidences,
         ))
     return out[0], out[1], out[2]
+
+
+def short_slice_meta_path(cache_dir: Path, split: str) -> Path:
+    return cache_dir / f"{split}.short_slice_targets.json"
+
+
+def short_slice_prob_path(cache_dir: Path, split: str, length: int) -> Path:
+    return cache_dir / f"{split}.short_slice_{length}.probabilities.mmap"
+
+
+def short_slice_conf_path(cache_dir: Path, split: str, length: int) -> Path:
+    return cache_dir / f"{split}.short_slice_{length}.confidence.mmap"
+
+
+def cached_prefix_slice_features(tokens: np.ndarray, length: int) -> list[int] | None:
+    prefix = bytes(int(value) for value in tokens[:MAGIKA_BEG_SIZE] if int(value) < PADDING_TOKEN)
+    if not prefix:
+        return None
+    data = prefix[:length]
+    return magika_features(len(data), data, data)
+
+
+def short_slice_cache_is_current(
+    target_dir: Path,
+    split: str,
+    count: int,
+    classes: int,
+    lengths: tuple[int, ...],
+    labels: tuple[str, ...] | None = None,
+) -> bool:
+    lengths = tuple(sorted(set(int(length) for length in lengths)))
+    meta_path = short_slice_meta_path(target_dir, split)
+    if not meta_path.exists():
+        return False
+    meta = json.loads(meta_path.read_text())
+    if int(meta.get("count", -1)) != count or int(meta.get("classes", -1)) != classes:
+        return False
+    if labels is not None and tuple(str(value) for value in meta.get("labels", [])) != labels:
+        return False
+    if tuple(int(value) for value in meta.get("lengths", [])) != tuple(lengths):
+        return False
+    for length in lengths:
+        prob_path = short_slice_prob_path(target_dir, split, length)
+        conf_path = short_slice_conf_path(target_dir, split, length)
+        if not prob_path.exists() or prob_path.stat().st_size != count * classes * np.dtype(np.float32).itemsize:
+            return False
+        if not conf_path.exists() or conf_path.stat().st_size != count * np.dtype(np.float32).itemsize:
+            return False
+    return True
+
+
+def build_short_slice_target_cache(
+    source_cache_dir: Path,
+    target_dir: Path,
+    split: str,
+    teacher: Teacher,
+    lengths: tuple[int, ...],
+    teacher_batch_size: int,
+    rebuild: bool,
+) -> None:
+    meta = json.loads(cache_meta_path(source_cache_dir, split).read_text())
+    count = int(meta["count"])
+    classes = len(teacher.selected_labels)
+    lengths = tuple(sorted(set(int(length) for length in lengths)))
+    if any(length > MAGIKA_BEG_SIZE for length in lengths):
+        raise ValueError(
+            f"short-slice target lengths must be <= {MAGIKA_BEG_SIZE}; "
+            "the source cache only preserves the first Magika prefix window"
+        )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    labels = tuple(teacher.selected_labels)
+    if not rebuild and short_slice_cache_is_current(target_dir, split, count, classes, lengths, labels):
+        print(f"{split}: using cached short-slice teacher targets lengths={lengths}", flush=True)
+        return
+
+    tokens = np.memmap(source_cache_dir / f"{split}.tokens.mmap", dtype=np.uint16, mode="r", shape=(count, TOKEN_LENGTH))
+    for length in lengths:
+        print(f"{split}: building short-slice teacher targets length={length} ({count} examples)...", flush=True)
+        started = time.perf_counter()
+        probabilities = np.memmap(
+            short_slice_prob_path(target_dir, split, length),
+            dtype=np.float32,
+            mode="w+",
+            shape=(count, classes),
+        )
+        confidences = np.memmap(
+            short_slice_conf_path(target_dir, split, length),
+            dtype=np.float32,
+            mode="w+",
+            shape=(count,),
+        )
+        probabilities.fill(0.0)
+        confidences.fill(0.0)
+        pending_rows: list[int] = []
+        pending_features: list[list[int]] = []
+
+        def flush() -> None:
+            if not pending_rows:
+                return
+            raw = teacher.session.run(["target_label"], {"bytes": pending_features})[0].astype(np.float32)
+            selected = raw[:, teacher.selected_indices]
+            selected_sum = selected.sum(axis=1, keepdims=True)
+            keep = selected_sum[:, 0] > 0.0
+            normalized = np.zeros((len(pending_rows), classes), dtype=np.float32)
+            normalized[keep] = selected[keep] / selected_sum[keep]
+            rows = np.asarray(pending_rows, dtype=np.int64)
+            probabilities[rows] = normalized
+            confidences[rows] = normalized.max(axis=1)
+            pending_rows.clear()
+            pending_features.clear()
+
+        for row in range(count):
+            features = cached_prefix_slice_features(tokens[row], length)
+            if features is None:
+                continue
+            pending_rows.append(row)
+            pending_features.append(features)
+            if len(pending_rows) >= teacher_batch_size:
+                flush()
+            if row > 0 and row % 50000 == 0:
+                print(f"  {split} length={length}: row={row}/{count}", flush=True)
+        flush()
+        probabilities.flush()
+        confidences.flush()
+        print(f"  done in {time.perf_counter() - started:.1f}s", flush=True)
+
+    payload = {
+        "classes": classes,
+        "count": count,
+        "labels": teacher.selected_labels,
+        "lengths": list(lengths),
+        "source_cache_dir": str(source_cache_dir),
+        "type": "magika_prefix_slice_targets",
+        "version": 1,
+    }
+    short_slice_meta_path(target_dir, split).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def ensure_short_slice_target_cache(
+    source_cache_dir: Path,
+    target_dir: Path,
+    teacher: Teacher,
+    lengths: tuple[int, ...],
+    teacher_batch_size: int,
+    rebuild: bool,
+    splits: tuple[str, ...] = ("train",),
+) -> None:
+    for split in splits:
+        build_short_slice_target_cache(
+            source_cache_dir,
+            target_dir,
+            split,
+            teacher,
+            lengths,
+            teacher_batch_size,
+            rebuild,
+        )
+
+
+def attach_short_slice_targets(
+    split_data: TokenSplit,
+    target_dir: Path,
+    split: str,
+    lengths: tuple[int, ...],
+    classes: int,
+    labels: tuple[str, ...] | None = None,
+) -> TokenSplit:
+    if not short_slice_cache_is_current(target_dir, split, split_data.count, classes, lengths, labels):
+        raise FileNotFoundError(
+            f"short-slice target cache missing or stale for {split!r} in {target_dir}; "
+            "run with --build-short-slice-target-cache first"
+        )
+    probabilities = {
+        length: np.memmap(
+            short_slice_prob_path(target_dir, split, length),
+            dtype=np.float32,
+            mode="r",
+            shape=(split_data.count, classes),
+        )
+        for length in lengths
+    }
+    confidences = {
+        length: np.memmap(
+            short_slice_conf_path(target_dir, split, length),
+            dtype=np.float32,
+            mode="r",
+            shape=(split_data.count,),
+        )
+        for length in lengths
+    }
+    print(f"{split}: using short-slice teacher targets from {target_dir}", flush=True)
+    return replace(
+        split_data,
+        short_slice_probabilities=probabilities,
+        short_slice_confidences=confidences,
+    )
 
 
 def open_split(
@@ -3714,6 +3929,82 @@ def _np_cutmix(
     return tokens, probabilities, labels, hidden, self_probs
 
 
+def _np_apply_short_slices(
+    tokens: np.ndarray,
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    self_probs: np.ndarray,
+    indices: np.ndarray,
+    short_slice_prob: float,
+    short_slice_lengths: tuple[int, ...],
+    rng: np.random.Generator,
+    short_slice_probabilities: dict[int, np.memmap] | None = None,
+    short_slice_confidences: dict[int, np.memmap] | None = None,
+    short_slice_target_min_confidence: float = 0.0,
+    short_slice_target_mode: str = "none",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if short_slice_prob <= 0.0 or not short_slice_lengths or tokens.shape[1] == 0:
+        return tokens, probabilities, labels, self_probs
+    apply = rng.random(tokens.shape[0]) < short_slice_prob
+    choices = np.asarray(short_slice_lengths, dtype=np.int32)
+    lengths = choices[rng.integers(0, len(choices), size=tokens.shape[0])]
+    valid_lengths = (tokens >= 0).sum(axis=1)
+    apply &= lengths < valid_lengths
+    if not np.any(apply):
+        return tokens, probabilities, labels, self_probs
+
+    has_targets = short_slice_probabilities is not None and short_slice_confidences is not None
+    use_fs_label_targets = short_slice_target_mode == "fs-label"
+    out_tokens = np.array(tokens, dtype=np.int32, copy=True)
+    out_probabilities = probabilities
+    out_labels = labels
+    out_self_probs = self_probs
+    if has_targets or use_fs_label_targets:
+        out_probabilities = np.asarray(probabilities, dtype=np.float32).copy()
+        out_labels = np.asarray(labels).copy()
+        if self_probs.shape[-1] == out_probabilities.shape[-1]:
+            out_self_probs = np.asarray(self_probs, dtype=np.float32).copy()
+
+    for length_value in np.unique(lengths[apply]):
+        length = int(length_value)
+        rows = np.flatnonzero(apply & (lengths == length))
+        if has_targets:
+            if length not in short_slice_probabilities or length not in short_slice_confidences:
+                raise KeyError(f"short-slice target cache is missing length={length}")
+            row_indices = indices[rows]
+            confidences = np.asarray(short_slice_confidences[length][row_indices], dtype=np.float32)
+            rows = rows[confidences >= short_slice_target_min_confidence]
+            if rows.size == 0:
+                continue
+            row_indices = indices[rows]
+            targets = np.asarray(short_slice_probabilities[length][row_indices], dtype=np.float32)
+            valid_targets = targets.sum(axis=1) > 0.0
+            if not np.any(valid_targets):
+                continue
+            rows = rows[valid_targets]
+            targets = targets[valid_targets]
+            out_probabilities[rows] = targets
+            out_labels[rows] = targets.argmax(axis=1).astype(out_labels.dtype, copy=False)
+            if out_self_probs.shape[-1] == targets.shape[-1]:
+                out_self_probs[rows] = targets
+        elif use_fs_label_targets:
+            target_labels = np.asarray(labels[rows], dtype=np.int64)
+            valid_targets = (0 <= target_labels) & (target_labels < out_probabilities.shape[-1])
+            if not np.any(valid_targets):
+                continue
+            rows = rows[valid_targets]
+            target_labels = target_labels[valid_targets]
+            targets = np.zeros((rows.size, out_probabilities.shape[-1]), dtype=np.float32)
+            targets[np.arange(rows.size), target_labels] = 1.0
+            out_probabilities[rows] = targets
+            out_labels[rows] = target_labels.astype(out_labels.dtype, copy=False)
+            if out_self_probs.shape[-1] == targets.shape[-1]:
+                out_self_probs[rows] = targets
+        out_tokens[rows, length:] = -1
+
+    return out_tokens, out_probabilities, out_labels, out_self_probs
+
+
 _LENGTH_BUCKETS = (128, 256, 384, 512, 768, 1024, 1280, 1536, 1792, 2048)
 
 
@@ -3746,6 +4037,10 @@ def batches(
     hard_oversample_rate: float = 1.0,
     cutmix_prob: float = 0.0,
     unit_lengths: np.ndarray | None = None,
+    short_slice_prob: float = 0.0,
+    short_slice_lengths: tuple[int, ...] = (),
+    short_slice_target_min_confidence: float = 0.0,
+    short_slice_target_mode: str = "none",
 ):
     rng = np.random.default_rng(seed)
     if unit_lengths is not None and shuffle and balance_power == 0.0 and (hard_mask is None or hard_oversample_rate <= 1.0):
@@ -3783,6 +4078,21 @@ def batches(
                 t, p, l, hidden, self_probs = _np_cutmix(
                     t, p, l, hidden, self_probs, cutmix_prob, rng
                 )
+            if shuffle:
+                t, p, l, self_probs = _np_apply_short_slices(
+                    t,
+                    p,
+                    l,
+                    self_probs,
+                    indices,
+                    short_slice_prob,
+                    short_slice_lengths,
+                    rng,
+                    split.short_slice_probabilities,
+                    split.short_slice_confidences,
+                    short_slice_target_min_confidence,
+                    short_slice_target_mode,
+                )
             yield t, p, l, hidden, self_probs
         return
     use_hard = shuffle and hard_mask is not None and hard_oversample_rate > 1.0
@@ -3816,6 +4126,21 @@ def batches(
             )
             if shuffle and cutmix_prob > 0.0:
                 t, p, l, h, s = _np_cutmix(t, p, l, h, s, cutmix_prob, rng)
+            if shuffle:
+                t, p, l, s = _np_apply_short_slices(
+                    t,
+                    p,
+                    l,
+                    s,
+                    indices,
+                    short_slice_prob,
+                    short_slice_lengths,
+                    rng,
+                    split.short_slice_probabilities,
+                    split.short_slice_confidences,
+                    short_slice_target_min_confidence,
+                    short_slice_target_mode,
+                )
             yield t, p, l, h, s
         return
     order = rng.permutation(split.count) if shuffle else np.arange(split.count)
@@ -3840,6 +4165,21 @@ def batches(
         )
         if shuffle and cutmix_prob > 0.0 and len(indices) >= 2:
             t, p, l, h, s = _np_cutmix(t, p, l, h, s, cutmix_prob, rng)
+        if shuffle:
+            t, p, l, s = _np_apply_short_slices(
+                t,
+                p,
+                l,
+                s,
+                indices,
+                short_slice_prob,
+                short_slice_lengths,
+                rng,
+                split.short_slice_probabilities,
+                split.short_slice_confidences,
+                short_slice_target_min_confidence,
+                short_slice_target_mode,
+            )
         yield t, p, l, h, s
 
 
@@ -3910,6 +4250,38 @@ def _cutmix_batch(
     return out_tokens, out_probs, out_labels, out_hidden, out_self
 
 
+def _short_slice_batch(
+    tokens: tf.Tensor,
+    probabilities: tf.Tensor,
+    labels: tf.Tensor,
+    hidden: tf.Tensor,
+    self_probs: tf.Tensor,
+    short_slice_prob: float,
+    short_slice_lengths: tuple[int, ...],
+    short_slice_target_mode: str = "none",
+) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor, tf.Tensor]:
+    if short_slice_prob <= 0.0 or not short_slice_lengths:
+        return tokens, probabilities, labels, hidden, self_probs
+    bs = tf.shape(tokens)[0]
+    L = tf.shape(tokens)[1]
+    lengths = tf.constant(short_slice_lengths, dtype=tf.int32)
+    choice = tf.random.uniform([bs], minval=0, maxval=len(short_slice_lengths), dtype=tf.int32)
+    selected = tf.minimum(tf.gather(lengths, choice), L)
+    keep = tf.range(L, dtype=tf.int32)[None, :] < selected[:, None]
+    sliced = tf.where(keep, tokens, -tf.ones_like(tokens))
+    apply = tf.random.uniform([bs]) < short_slice_prob
+    out_tokens = tf.where(apply[:, None], sliced, tokens)
+    if short_slice_target_mode != "fs-label":
+        return out_tokens, probabilities, labels, hidden, self_probs
+    fs_targets = tf.one_hot(labels, tf.shape(probabilities)[-1], dtype=probabilities.dtype)
+    out_probabilities = tf.where(apply[:, None], fs_targets, probabilities)
+    if self_probs.shape[-1] is not None and self_probs.shape[-1] > 0:
+        out_self_probs = tf.where(apply[:, None], tf.cast(fs_targets, self_probs.dtype), self_probs)
+    else:
+        out_self_probs = self_probs
+    return out_tokens, out_probabilities, labels, hidden, out_self_probs
+
+
 def tensor_batches(
     split: TokenSplit,
     batch_size: int,
@@ -3920,6 +4292,9 @@ def tensor_batches(
     hard_mask: np.ndarray | None = None,
     hard_oversample_rate: float = 1.0,
     cutmix_prob: float = 0.0,
+    short_slice_prob: float = 0.0,
+    short_slice_lengths: tuple[int, ...] = (),
+    short_slice_target_mode: str = "none",
 ) -> tf.data.Dataset:
     tokens, probabilities, labels, hidden, self_probs = materialize_split(split)
     use_hard = shuffle and hard_mask is not None and hard_oversample_rate > 1.0
@@ -3952,6 +4327,13 @@ def tensor_batches(
     if shuffle and cutmix_prob > 0.0:
         dataset = dataset.map(
             lambda t, p, l, h, s: _cutmix_batch(t, p, l, h, s, cutmix_prob),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+    if shuffle and short_slice_prob > 0.0:
+        dataset = dataset.map(
+            lambda t, p, l, h, s: _short_slice_batch(
+                t, p, l, h, s, short_slice_prob, short_slice_lengths, short_slice_target_mode
+            ),
             num_parallel_calls=tf.data.AUTOTUNE,
         )
     return dataset.prefetch(prefetch)
@@ -4402,7 +4784,10 @@ def quantize_weight(weight: np.ndarray, bits: int) -> tuple[bytes, float, str]:
     if not np.all(np.isfinite(weight)):
         raise ValueError("cannot export non-finite weight tensor")
     if bits == 2:
-        scale = max(float(np.mean(np.abs(weight))), 1e-6)
+        # Match _quantize_for_bits(bits=2) and make export->load->export stable.
+        abs_weight = np.abs(weight)
+        nonzero_abs = abs_weight[abs_weight > 0.0]
+        scale = max(float(np.mean(nonzero_abs)) if nonzero_abs.size else 1e-6, 1e-6)
         threshold = 0.7 * scale
         quantized = np.where(weight > threshold, 1, np.where(weight < -threshold, -1, 0)).astype(np.int8)
         return pack_ternary(quantized), scale, "ternary"
@@ -4412,7 +4797,15 @@ def quantize_weight(weight: np.ndarray, bits: int) -> tuple[bytes, float, str]:
     raise ValueError(f"unsupported weight bits: {bits}")
 
 
-def export_model(output: Path, model: tf.keras.Model, labels: list[str], slugs: list[str], bits: int, architecture: str) -> int:
+def export_model(
+    output: Path,
+    model: tf.keras.Model,
+    labels: list[str],
+    slugs: list[str],
+    bits: int,
+    architecture: str,
+    tokenizer_version: int | None = None,
+) -> int:
     metadata = {
         "bits": bits,
         "token_length": TOKEN_LENGTH,
@@ -4421,6 +4814,8 @@ def export_model(output: Path, model: tf.keras.Model, labels: list[str], slugs: 
         "slugs": slugs,
         "layers": [],
     }
+    if tokenizer_version is not None:
+        metadata["tokenizer_version"] = tokenizer_version
     blob = bytearray(QAT_MAGIC)
     for layer in model.layers:
         if isinstance(layer, QEmbedding):
@@ -4917,6 +5312,18 @@ def apply_freeze_policy(
     )
 
 
+def parse_positive_int_csv(value: str) -> tuple[int, ...]:
+    try:
+        parsed = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {value!r}") from exc
+    if not parsed:
+        raise argparse.ArgumentTypeError("at least one integer is required")
+    if any(item <= 0 for item in parsed):
+        raise argparse.ArgumentTypeError("all lengths must be positive")
+    return tuple(sorted(set(parsed)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, required=True)
@@ -4995,6 +5402,11 @@ def main() -> None:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--tf-data-batches", action="store_true")
     parser.add_argument("--eval-every", type=int, default=5)
+    parser.add_argument(
+        "--eval-initial",
+        action="store_true",
+        help="evaluate the initialized model before training and use it as the initial best checkpoint.",
+    )
     parser.add_argument("--early-stop-patience", type=int, default=0)
     parser.add_argument("--confusion-matrix-output", type=Path)
     parser.add_argument("--confusion-matrix-top", type=int, default=20)
@@ -5042,6 +5454,62 @@ def main() -> None:
         help="probability that a given training example is mixed with another via "
              "CutMix (random byte-cut; teacher probs and hidden also mixed linearly). "
              "Magika v3.1+ credits this for accuracy gains. Default 0.0 disables.",
+    )
+    parser.add_argument(
+        "--short-slice-prob",
+        type=float,
+        default=0.0,
+        help="For wordseq/wordwin training only: probability that a training row is "
+             "masked after a sampled short unit length. With --short-slice-target-cache-dir, "
+             "the row also uses the Magika teacher target for that short prefix; otherwise "
+             "it keeps the legacy full-file target. Default 0.0 disables.",
+    )
+    parser.add_argument(
+        "--short-slice-unit-lengths",
+        type=parse_positive_int_csv,
+        default=parse_positive_int_csv("64,128,256,512"),
+        help="Comma-separated unit lengths sampled by --short-slice-prob. Values are "
+             "applied after the unit tokenizer, so this is cheap and works with cached "
+             "units. Default: 64,128,256,512.",
+    )
+    parser.add_argument(
+        "--short-slice-target-cache-dir",
+        type=Path,
+        default=None,
+        help="directory containing short-slice teacher target mmap files. When set with "
+             "--short-slice-prob, sliced rows train against the teacher distribution for "
+             "the sliced prefix instead of the original full-file distribution.",
+    )
+    parser.add_argument(
+        "--short-slice-target-mode",
+        choices=("none", "teacher-cache", "fs-label"),
+        default="none",
+        help="Target used for sliced rows. none keeps the current full-file targets; "
+             "teacher-cache uses --short-slice-target-cache-dir; fs-label uses a "
+             "one-hot filesystem label from --fs-labels-dir.",
+    )
+    parser.add_argument(
+        "--build-short-slice-target-cache",
+        action="store_true",
+        help="build short-slice teacher target mmap files before training. Defaults to "
+             "--cache-dir when --short-slice-target-cache-dir is not set.",
+    )
+    parser.add_argument(
+        "--rebuild-short-slice-target-cache",
+        action="store_true",
+        help="force rebuilding short-slice teacher target mmap files.",
+    )
+    parser.add_argument(
+        "--prepare-short-slice-target-cache-only",
+        action="store_true",
+        help="build the regular cache and the train short-slice target cache, then exit.",
+    )
+    parser.add_argument(
+        "--short-slice-target-min-confidence",
+        type=float,
+        default=0.0,
+        help="minimum top teacher probability required to use a cached short-slice "
+             "target. Rows below this threshold are left unsliced. Default 0.0.",
     )
     parser.add_argument(
         "--fs-labels-dir",
@@ -5100,6 +5568,58 @@ def main() -> None:
         tf.keras.mixed_precision.set_global_policy("mixed_float16")
     if not 0.0 <= args.hard_loss_weight <= 1.0:
         raise ValueError("--hard-loss-weight must be in [0, 1]")
+    if not 0.0 <= args.short_slice_prob <= 1.0:
+        raise ValueError("--short-slice-prob must be in [0, 1]")
+    if not 0.0 <= args.short_slice_target_min_confidence <= 1.0:
+        raise ValueError("--short-slice-target-min-confidence must be in [0, 1]")
+    if args.short_slice_prob > 0.0 and not architecture_uses_word_units(args.architecture):
+        raise ValueError("--short-slice-prob only applies to wordseq/wordwin architectures")
+    if args.short_slice_target_mode == "teacher-cache" and args.short_slice_target_cache_dir is None:
+        raise SystemExit("--short-slice-target-mode=teacher-cache requires --short-slice-target-cache-dir")
+    if args.short_slice_target_mode == "fs-label" and args.fs_labels_dir is None:
+        raise SystemExit("--short-slice-target-mode=fs-label requires --fs-labels-dir")
+    if args.short_slice_target_mode == "none" and args.short_slice_target_cache_dir is not None:
+        raise SystemExit("--short-slice-target-cache-dir requires --short-slice-target-mode=teacher-cache")
+    short_slice_target_dir = args.short_slice_target_cache_dir
+    if args.build_short_slice_target_cache or args.prepare_short_slice_target_cache_only:
+        short_slice_target_dir = short_slice_target_dir or args.cache_dir
+        if args.short_slice_target_mode == "none":
+            args.short_slice_target_mode = "teacher-cache"
+    if (
+        short_slice_target_dir is not None
+        and args.short_slice_prob > 0.0
+        and args.tf_data_batches
+    ):
+        raise SystemExit(
+            "--short-slice-target-cache-dir requires NumPy batches; drop --tf-data-batches"
+        )
+    if (
+        short_slice_target_dir is not None
+        and args.short_slice_prob > 0.0
+        and args.hidden_loss_weight > 0.0
+    ):
+        raise SystemExit(
+            "--short-slice-target-cache-dir cannot be combined with --hidden-loss-weight; "
+            "there are no cached hidden targets for sliced prefixes"
+        )
+    if (
+        args.short_slice_target_mode == "fs-label"
+        and args.short_slice_prob > 0.0
+        and args.hidden_loss_weight > 0.0
+    ):
+        raise SystemExit(
+            "--short-slice-target-mode=fs-label cannot be combined with --hidden-loss-weight; "
+            "there are no hidden targets for sliced prefixes"
+        )
+    if (
+        args.short_slice_target_mode == "fs-label"
+        and args.short_slice_prob > 0.0
+        and args.cutmix_prob > 0.0
+    ):
+        raise SystemExit(
+            "--short-slice-target-mode=fs-label cannot be combined with --cutmix-prob > 0; "
+            "sliced examples need to remain single-file examples"
+        )
 
     tf.keras.utils.set_random_seed(args.seed)
     teacher = load_teacher(args.magika_model, args.magika_config)
@@ -5113,6 +5633,20 @@ def main() -> None:
         args.rebuild_cache,
         args.teacher_hidden_output,
     )
+    if args.build_short_slice_target_cache or args.prepare_short_slice_target_cache_only:
+        assert short_slice_target_dir is not None
+        ensure_short_slice_target_cache(
+            args.cache_dir,
+            short_slice_target_dir,
+            teacher,
+            args.short_slice_unit_lengths,
+            args.teacher_batch_size,
+            args.rebuild_short_slice_target_cache,
+            splits=("train",),
+        )
+    if args.prepare_short_slice_target_cache_only:
+        print("short_slice_target_cache_ready=true")
+        return
     if args.prepare_cache_only:
         print("cache_ready=true")
         return
@@ -5145,10 +5679,34 @@ def main() -> None:
             flush=True,
         )
     train_unit_lengths: np.ndarray | None = None
+    short_slice_lengths: tuple[int, ...] = ()
     if architecture_uses_word_units(args.architecture):
         train, valid, test = convert_splits_to_word_units(
             args.cache_dir, train, valid, test, tokenizer_version=args.unit_tokenizer
         )
+        if args.short_slice_prob > 0.0:
+            short_slice_lengths = tuple(sorted(set(args.short_slice_unit_lengths)))
+            print(
+                f"short_slice_prob={args.short_slice_prob:.3f} "
+                f"short_slice_unit_lengths={','.join(str(v) for v in short_slice_lengths)}",
+                flush=True,
+            )
+            if args.short_slice_target_mode == "teacher-cache":
+                train = attach_short_slice_targets(
+                    train,
+                    short_slice_target_dir,
+                    "train",
+                    short_slice_lengths,
+                    classes,
+                    tuple(teacher.selected_labels),
+                )
+                print(
+                    f"short_slice_target_min_confidence="
+                    f"{args.short_slice_target_min_confidence:.3f}",
+                    flush=True,
+                )
+            elif args.short_slice_target_mode == "fs-label":
+                print("short_slice_target_mode=fs-label", flush=True)
         if args.length_buckets:
             train_unit_lengths = compute_unit_lengths(train.tokens)
             from collections import Counter as _C
@@ -5272,6 +5830,34 @@ def main() -> None:
         print(f"qat_active=False (will enable at epoch {args.qat_start_epoch})", flush=True)
     else:
         QAT_ACTIVE.assign(True)
+    if args.eval_initial:
+        initial_export_phase = args.qat_start_epoch == 0 or args.qat_start_epoch >= args.epochs
+        valid_accuracy, valid_loss, valid_examples_per_sec, _ = evaluate_dataset(
+            model,
+            eval_step,
+            tensor_batches(valid, args.batch_size, shuffle=False, seed=0, prefetch=args.prefetch),
+            valid.count,
+            classes,
+        )
+        print(
+            f"epoch=initial valid_loss={valid_loss:.6f} "
+            f"valid_teacher_parity={valid_accuracy:.6f} "
+            f"valid_examples_per_sec={valid_examples_per_sec:.1f}",
+            flush=True,
+        )
+        if initial_export_phase:
+            best_valid = valid_accuracy
+            best_weights = model.get_weights()
+            size = export_model(
+                args.output,
+                model,
+                teacher.selected_labels,
+                teacher.selected_slugs,
+                args.weight_bits,
+                args.architecture,
+                tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
+            )
+            print(f"best_checkpoint_model_size_bytes={size}", flush=True)
 
     for epoch in range(args.epochs):
         if args.qat_start_epoch > 0 and epoch == args.qat_start_epoch:
@@ -5291,6 +5877,10 @@ def main() -> None:
                 hard_oversample_rate=args.hard_oversample_rate,
                 cutmix_prob=args.cutmix_prob,
                 unit_lengths=train_unit_lengths,
+                short_slice_prob=args.short_slice_prob,
+                short_slice_lengths=short_slice_lengths,
+                short_slice_target_min_confidence=args.short_slice_target_min_confidence,
+                short_slice_target_mode=args.short_slice_target_mode,
             )
         else:
             batch_iterable = tensor_batches(
@@ -5303,6 +5893,9 @@ def main() -> None:
                 hard_mask=hard_mask,
                 hard_oversample_rate=args.hard_oversample_rate,
                 cutmix_prob=args.cutmix_prob,
+                short_slice_prob=args.short_slice_prob,
+                short_slice_lengths=short_slice_lengths,
+                short_slice_target_mode=args.short_slice_target_mode,
             )
         for (
             token_batch,
@@ -5348,11 +5941,20 @@ def main() -> None:
                 flush=True,
             )
             qat_phase = args.qat_start_epoch == 0 or epoch >= args.qat_start_epoch
-            if qat_phase and valid_accuracy > best_valid:
+            export_phase = qat_phase or args.qat_start_epoch >= args.epochs
+            if export_phase and valid_accuracy > best_valid:
                 best_valid = valid_accuracy
                 best_weights = model.get_weights()
                 checks_without_improvement = 0
-                size = export_model(args.output, model, teacher.selected_labels, teacher.selected_slugs, args.weight_bits, args.architecture)
+                size = export_model(
+                    args.output,
+                    model,
+                    teacher.selected_labels,
+                    teacher.selected_slugs,
+                    args.weight_bits,
+                    args.architecture,
+                    tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
+                )
                 print(f"best_checkpoint_model_size_bytes={size}", flush=True)
             elif not qat_phase:
                 pass
@@ -5382,7 +5984,15 @@ def main() -> None:
         classes,
         collect_confusion=args.confusion_matrix_output is not None or args.confusion_matrix_top > 0,
     )
-    size = export_model(args.output, model, teacher.selected_labels, teacher.selected_slugs, args.weight_bits, args.architecture)
+    size = export_model(
+        args.output,
+        model,
+        teacher.selected_labels,
+        teacher.selected_slugs,
+        args.weight_bits,
+        args.architecture,
+        tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
+    )
     print(f"train: {counts['train']} examples")
     print(f"valid: {counts['valid']} examples")
     print(f"test: {counts['test']} examples")
