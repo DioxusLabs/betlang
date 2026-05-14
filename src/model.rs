@@ -148,7 +148,7 @@ impl Model {
         //    Padding positions (unit_id < 0) → gelu(0) = 0.
         let t = len.min(MAX_UNITS);
         let mut embed = vec![0.0f32; t * EMBED];
-        for pos in 0..t {
+        for pos in 0..t.min(units.len()) {
             let id = units[pos];
             if id < 0 {
                 continue;
@@ -196,6 +196,13 @@ impl Model {
         let mut logits = [0.0f32; CLASSES];
         dense_forward(&dense0_out, &self.output_kernel, &self.output_bias, &mut logits);
         logits
+    }
+
+    /// Run inference using the padded 2048-position shape used by the shipped
+    /// Python evaluator. Shorter runtime sequences must not shrink the CNN,
+    /// because pooling/global-average behavior changes materially.
+    fn logits_for_runtime_units(&self, units: &[i32]) -> [f32; CLASSES] {
+        self.logits(units, MAX_UNITS)
     }
 }
 
@@ -1021,7 +1028,7 @@ fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
 pub fn detect(source: &str) -> Option<Language> {
     let (bytes, pad) = build_window(source.as_bytes())?;
     let units = tokenize_v2(&bytes, &pad);
-    let logits = Model::get().logits(&units, units.len());
+    let logits = Model::get().logits_for_runtime_units(&units);
     let class_index = reliable_class_from_logits(&logits)?;
     Some(CLASS_LANGUAGES[class_index])
 }
@@ -1087,6 +1094,25 @@ mod tests {
     fn detects_javascript_from_source() {
         let lang = detect("const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n");
         assert_eq!(lang, Some(Language::JavaScript));
+    }
+
+    #[test]
+    fn runtime_inference_pads_short_sources_to_eval_shape() {
+        let source = "use std::fmt;\nfn main() { println!(\"hi\"); }\n";
+        let (bytes, pad) = build_window(source.as_bytes()).unwrap();
+        let units = tokenize_v2(&bytes, &pad);
+        assert!(units.len() < MAX_UNITS);
+
+        let mut padded = units.clone();
+        padded.resize(MAX_UNITS, -1);
+
+        let model = Model::get();
+        let runtime_logits = model.logits_for_runtime_units(&units);
+        let eval_shape_logits = model.logits(&padded, MAX_UNITS);
+
+        for (runtime, eval_shape) in runtime_logits.iter().zip(eval_shape_logits) {
+            assert_eq!(*runtime, eval_shape);
+        }
     }
 
     #[test]
