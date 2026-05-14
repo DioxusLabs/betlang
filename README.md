@@ -8,6 +8,10 @@ let language = betlang::detect("fn main() { println!(\"hi\"); }");
 assert_eq!(language, Some(betlang::Language::Rust));
 ```
 
+The embedded production model is a ~50 KB quantized wordseq student using the
+v3 tokenizer. On the held-out `bigorig` test split it reaches
+`test_teacher_parity=0.956339` and `test_fs_accuracy=0.951446`.
+
 ## Confusion by file size
 
 The shipped wordseq model is evaluated below on the held-out `bigorig` test

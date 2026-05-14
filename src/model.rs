@@ -1,7 +1,7 @@
-//! Inference for the wordseq v2 student.
+//! Inference for the wordseq student.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (49.92 KB MSQ1 export) and
-//! runs a forward pass: byte-window tokenization → v2 word-unit tokenization
+//! Loads `assets/magika/source-student-q4.bin` (~49.94 KB MSQ1 export) and
+//! runs a forward pass: byte-window tokenization → word-unit tokenization
 //! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
 //! max+avg pool → 2 dense layers → 67-class softmax logits.
 //!
@@ -56,12 +56,23 @@ const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
 
 // v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
 const WORD_MASK: u32 = 0x00FF_FFFF;
+const STYLE_BIT: u32 = 0x0100_0000;
 const PUNCT_FLAG: u32 = 0x1000_0000;
 const INDENT_FLAG: u32 = 0x2000_0000;
 const NUM_FLAG: u32 = 0x4000_0000;
+const BRACKET_FLAG: u32 = 0x5000_0000;
+const STRING_FLAG: u32 = 0x7000_0000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TokenizerVersion {
+    V2,
+    V3,
+    V4,
+}
 
 #[derive(Debug)]
 struct Model {
+    tokenizer_version: TokenizerVersion,
     /// 1024 × 24 dequantized embedding rows.
     embedding: Vec<f32>,
     /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
@@ -88,6 +99,7 @@ impl Model {
             metadata.contains(r#""architecture":"wordseq-b1024-k3-m2048-tiny-3conv-hidden""#),
             "shipped model is not the expected wordseq architecture",
         );
+        let tokenizer_version = parse_tokenizer_version(metadata);
         let scales = parse_scales(metadata);
         // 6 layers, each with 1 weight tensor → 6 scales total.
         assert_eq!(scales.len(), 6, "expected 6 weight scales");
@@ -123,6 +135,7 @@ impl Model {
         assert_eq!(metadata_len as usize, MODEL_BYTES.len() - metadata_start);
 
         Self {
+            tokenizer_version,
             embedding,
             conv0_kernel,
             conv0_bias,
@@ -203,6 +216,14 @@ impl Model {
     /// because pooling/global-average behavior changes materially.
     fn logits_for_runtime_units(&self, units: &[i32]) -> [f32; CLASSES] {
         self.logits(units, MAX_UNITS)
+    }
+
+    fn tokenize_units(&self, bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
+        match self.tokenizer_version {
+            TokenizerVersion::V2 => tokenize_v2(bytes, padding_mask),
+            TokenizerVersion::V3 => tokenize_v3(bytes, padding_mask),
+            TokenizerVersion::V4 => tokenize_v4(bytes, padding_mask),
+        }
     }
 }
 
@@ -809,6 +830,31 @@ fn parse_scales(metadata: &str) -> Vec<f32> {
     scales
 }
 
+fn parse_tokenizer_version(metadata: &str) -> TokenizerVersion {
+    let Some(version) = parse_usize_field(metadata, "tokenizer_version") else {
+        // Legacy exported checkpoints predate tokenizer metadata. The shipped
+        // wordseq asset was trained with v2.
+        return TokenizerVersion::V2;
+    };
+    match version {
+        2 => TokenizerVersion::V2,
+        3 => TokenizerVersion::V3,
+        4 => TokenizerVersion::V4,
+        other => panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4"),
+    }
+}
+
+fn parse_usize_field(metadata: &str, field: &str) -> Option<usize> {
+    let key = format!(r#""{field}""#);
+    let after_key = &metadata[metadata.find(&key)? + key.len()..];
+    let rest = after_key[after_key.find(':')? + 1..].trim_start();
+    let end = rest.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    rest[..end].parse().ok()
+}
+
 // ============================================================================
 // Byte windowing + v2 word-unit tokenization
 // ============================================================================
@@ -971,6 +1017,306 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
     out
 }
 
+fn hash_unit_bytes(bytes: &[u8]) -> u32 {
+    const PRIME: u64 = 2_654_435_761;
+    let mut h: u64 = 0;
+    for &b in bytes {
+        h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+    }
+    h as u32
+}
+
+fn flush_hashed(buffer: &mut Vec<u8>, out: &mut Vec<i32>, flag: u32, extra_bits: u32) {
+    if !buffer.is_empty() && out.len() < MAX_UNITS {
+        out.push(((hash_unit_bytes(buffer) & WORD_MASK) | flag | extra_bits) as i32);
+    }
+    buffer.clear();
+}
+
+fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
+    if indent > 0 && out.len() < MAX_UNITS {
+        out.push((indent.min(63) | INDENT_FLAG) as i32);
+    }
+}
+
+/// v3 tokenizer ported from `numpy_word_units_apply_v3` in the Python trainer.
+///
+/// This keeps v2's digit/punctuation compression, then case-folds word hashes
+/// and isolates unambiguous brackets as stable BRACKET_FLAG tokens.
+fn tokenize_v3(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
+    let mut word: Vec<u8> = Vec::new();
+    let mut number: Vec<u8> = Vec::new();
+    let mut punct: Vec<u8> = Vec::new();
+    let mut at_line_start = true;
+    let mut indent_units: u32 = 0;
+
+    for (col, &raw_value) in bytes.iter().enumerate() {
+        if padding_mask[col] {
+            break;
+        }
+
+        let value = raw_value.to_ascii_lowercase();
+        let is_letter = value.is_ascii_lowercase() || value == b'_';
+        let is_digit = value.is_ascii_digit();
+        let is_newline = value == b'\n';
+        let is_cr = value == b'\r';
+        let is_space = value == b' ' || value == b'\t';
+        let is_bracket = matches!(value, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+
+        if !is_letter {
+            flush_hashed(&mut word, &mut out, 0, 0);
+        }
+        if !(is_digit || value == b'.') {
+            flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
+        }
+        let need_flush_punct =
+            is_letter || is_digit || is_space || is_newline || is_cr || is_bracket || value == b'.';
+        if need_flush_punct {
+            flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
+        }
+
+        if out.len() >= MAX_UNITS {
+            break;
+        }
+
+        if is_letter {
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            word.push(value);
+            continue;
+        }
+        if is_digit || value == b'.' {
+            if value == b'.' && number.is_empty() {
+                if at_line_start {
+                    push_indent_unit(&mut out, indent_units);
+                }
+                at_line_start = false;
+                indent_units = 0;
+                punct.push(value);
+                continue;
+            }
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            number.push(value);
+            continue;
+        }
+        if is_newline {
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            if out.len() < MAX_UNITS {
+                out.push(((b'\n' as u32) | PUNCT_FLAG) as i32);
+            }
+            at_line_start = true;
+            indent_units = 0;
+            continue;
+        }
+        if is_cr {
+            continue;
+        }
+        if at_line_start && is_space {
+            indent_units += if value == b' ' { 1 } else { 4 };
+            continue;
+        }
+        if at_line_start {
+            push_indent_unit(&mut out, indent_units);
+        }
+        at_line_start = false;
+        indent_units = 0;
+        if is_space {
+            let space_token = ((b' ' as u32) | PUNCT_FLAG) as i32;
+            if out.last() != Some(&space_token) && out.len() < MAX_UNITS {
+                out.push(space_token);
+            }
+            continue;
+        }
+        if is_bracket {
+            if out.len() < MAX_UNITS {
+                out.push(((value as u32) | BRACKET_FLAG) as i32);
+            }
+            continue;
+        }
+        punct.push(value);
+    }
+
+    flush_hashed(&mut word, &mut out, 0, 0);
+    flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
+    flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
+
+    out
+}
+
+/// v4 tokenizer ported from `numpy_word_units_apply_v4` in the Python trainer.
+///
+/// This keeps v2's digit/punctuation compression, then case-folds word hashes,
+/// isolates brackets, marks CamelCase-ish identifiers with STYLE_BIT, and
+/// collapses double-quoted string literals to one STRING_FLAG token.
+fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
+    let mut word: Vec<u8> = Vec::new();
+    let mut word_had_upper = false;
+    let mut number: Vec<u8> = Vec::new();
+    let mut punct: Vec<u8> = Vec::new();
+    let mut at_line_start = true;
+    let mut indent_units: u32 = 0;
+    let mut in_string = false;
+    let mut string_escape = false;
+
+    for (col, &raw_value) in bytes.iter().enumerate() {
+        if padding_mask[col] {
+            break;
+        }
+
+        if in_string {
+            if string_escape {
+                string_escape = false;
+            } else if raw_value == b'\\' {
+                string_escape = true;
+            } else if raw_value == b'"' {
+                if out.len() < MAX_UNITS {
+                    out.push((STRING_FLAG | b'"' as u32) as i32);
+                }
+                in_string = false;
+            }
+            continue;
+        }
+
+        let saw_upper_now = raw_value.is_ascii_uppercase();
+        let value = if saw_upper_now {
+            raw_value.to_ascii_lowercase()
+        } else {
+            raw_value
+        };
+        let is_letter = value.is_ascii_lowercase() || value == b'_';
+        let is_digit = value.is_ascii_digit();
+        let is_newline = value == b'\n';
+        let is_cr = value == b'\r';
+        let is_space = value == b' ' || value == b'\t';
+        let is_bracket = matches!(value, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+        let is_dquote = value == b'"';
+
+        if !is_letter && !word.is_empty() {
+            let style = if word_had_upper { STYLE_BIT } else { 0 };
+            flush_hashed(&mut word, &mut out, 0, style);
+            word_had_upper = false;
+        }
+        if !(is_digit || value == b'.') && !number.is_empty() {
+            flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
+        }
+        let need_flush_punct = is_letter
+            || is_digit
+            || is_space
+            || is_newline
+            || is_cr
+            || is_bracket
+            || is_dquote
+            || value == b'.';
+        if need_flush_punct && !punct.is_empty() {
+            flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
+        }
+
+        if out.len() >= MAX_UNITS {
+            break;
+        }
+
+        if is_letter {
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            if saw_upper_now {
+                word_had_upper = true;
+            }
+            word.push(value);
+            continue;
+        }
+        if is_digit || value == b'.' {
+            if value == b'.' && number.is_empty() {
+                if at_line_start {
+                    push_indent_unit(&mut out, indent_units);
+                }
+                at_line_start = false;
+                indent_units = 0;
+                punct.push(value);
+                continue;
+            }
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            number.push(value);
+            continue;
+        }
+        if is_newline {
+            if at_line_start {
+                push_indent_unit(&mut out, indent_units);
+            }
+            if out.len() < MAX_UNITS {
+                out.push(((b'\n' as u32) | PUNCT_FLAG) as i32);
+            }
+            at_line_start = true;
+            indent_units = 0;
+            continue;
+        }
+        if is_cr {
+            continue;
+        }
+        if at_line_start && is_space {
+            indent_units += if value == b' ' { 1 } else { 4 };
+            continue;
+        }
+        if at_line_start {
+            push_indent_unit(&mut out, indent_units);
+        }
+        at_line_start = false;
+        indent_units = 0;
+        if is_space {
+            let space_token = ((b' ' as u32) | PUNCT_FLAG) as i32;
+            if out.last() != Some(&space_token) && out.len() < MAX_UNITS {
+                out.push(space_token);
+            }
+            continue;
+        }
+        if is_bracket {
+            if out.len() < MAX_UNITS {
+                out.push((value as u32 | BRACKET_FLAG) as i32);
+            }
+            continue;
+        }
+        if is_dquote {
+            in_string = true;
+            string_escape = false;
+            continue;
+        }
+        punct.push(value);
+    }
+
+    if in_string && out.len() < MAX_UNITS {
+        out.push((STRING_FLAG | b'"' as u32) as i32);
+    }
+    if !word.is_empty() {
+        let style = if word_had_upper { STYLE_BIT } else { 0 };
+        flush_hashed(&mut word, &mut out, 0, style);
+    }
+    if !number.is_empty() {
+        flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
+    }
+    if !punct.is_empty() {
+        flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
+    }
+
+    out
+}
+
 fn trim_start_ascii(bytes: &[u8]) -> &[u8] {
     let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
     &bytes[start..]
@@ -1027,8 +1373,9 @@ fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
 /// runner-up, otherwise `None`.
 pub fn detect(source: &str) -> Option<Language> {
     let (bytes, pad) = build_window(source.as_bytes())?;
-    let units = tokenize_v2(&bytes, &pad);
-    let logits = Model::get().logits_for_runtime_units(&units);
+    let model = Model::get();
+    let units = model.tokenize_units(&bytes, &pad);
+    let logits = model.logits_for_runtime_units(&units);
     let class_index = reliable_class_from_logits(&logits)?;
     Some(CLASS_LANGUAGES[class_index])
 }
@@ -1074,8 +1421,56 @@ mod tests {
     #[test]
     fn loads_embedded_model() {
         let model = Model::get();
+        assert_eq!(model.tokenizer_version, TokenizerVersion::V3);
         assert_eq!(model.embedding.len(), BINS * EMBED);
         assert_eq!(model.output_kernel.len(), DENSE * CLASSES);
+    }
+
+    #[test]
+    fn tokenizer_version_defaults_legacy_checkpoints_to_v2() {
+        assert_eq!(parse_tokenizer_version(r#"{"bits":4}"#), TokenizerVersion::V2);
+        assert_eq!(
+            parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":3}"#),
+            TokenizerVersion::V3
+        );
+        assert_eq!(
+            parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":4}"#),
+            TokenizerVersion::V4
+        );
+    }
+
+    #[test]
+    fn tokenizer_v3_casefolds_and_isolates_brackets() {
+        let source = b"Foo(foo)\n";
+        let pad = vec![false; source.len()];
+        let units = tokenize_v3(source, &pad);
+
+        assert_eq!(units[0] as u32, hash_unit_bytes(b"foo") & WORD_MASK);
+        assert!(units.contains(&((BRACKET_FLAG | b'(' as u32) as i32)));
+        assert!(units.contains(&((BRACKET_FLAG | b')' as u32) as i32)));
+    }
+
+    #[test]
+    fn tokenizer_v4_casefolds_brackets_and_strings() {
+        let source = b"Foo { \"Bar\\\"Baz\" }\n";
+        let pad = vec![false; source.len()];
+        let units = tokenize_v4(source, &pad);
+        let expected = [
+            16_986_836,
+            268_435_488,
+            1_342_177_403,
+            268_435_488,
+            1_879_048_226,
+            268_435_488,
+            1_342_177_405,
+            268_435_466,
+        ];
+
+        assert_eq!(units[0] as u32, (hash_unit_bytes(b"foo") & WORD_MASK) | STYLE_BIT);
+        assert_eq!(&units[..expected.len()], &expected);
+        assert!(units.contains(&((BRACKET_FLAG | b'{' as u32) as i32)));
+        assert!(units.contains(&((STRING_FLAG | b'"' as u32) as i32)));
+        assert!(units.contains(&((BRACKET_FLAG | b'}' as u32) as i32)));
     }
 
     #[test]
@@ -1100,13 +1495,13 @@ mod tests {
     fn runtime_inference_pads_short_sources_to_eval_shape() {
         let source = "use std::fmt;\nfn main() { println!(\"hi\"); }\n";
         let (bytes, pad) = build_window(source.as_bytes()).unwrap();
-        let units = tokenize_v2(&bytes, &pad);
+        let model = Model::get();
+        let units = model.tokenize_units(&bytes, &pad);
         assert!(units.len() < MAX_UNITS);
 
         let mut padded = units.clone();
         padded.resize(MAX_UNITS, -1);
 
-        let model = Model::get();
         let runtime_logits = model.logits_for_runtime_units(&units);
         let eval_shape_logits = model.logits(&padded, MAX_UNITS);
 

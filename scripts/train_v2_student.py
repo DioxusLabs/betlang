@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Standalone training driver for the betlang v2 source-student model.
+"""Standalone training driver for the current betlang source-student model.
 
 This wraps the canonical recipe that produced `assets/magika/source-student-q4.bin`
-(49.92 KB, ~0.95 fs_accuracy on bigorig-500k 81k test split). It shells out to
+(49.94 KB, ~0.951 fs_accuracy on bigorig-500k 81k test split). It shells out to
 the bigger `train_magika_qat_student.py` trainer with a frozen, well-justified
 hyperparameter set and prints the final metrics.
 
@@ -17,7 +17,7 @@ Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
 
   Cache              /tmp/magika-source-qat-cache-bigorig-500k
                      - 437,778 train / 53,420 valid / 81,744 test
-                     - units_v2.mmap (v2 tokenizer)
+                     - units_v3.mmap (v3 tokenizer)
                      - labels.mmap (big-3conv teacher's argmax)
                      - self_probabilities.mmap (big-3conv teacher's full softmax)
 
@@ -30,13 +30,12 @@ Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
 
   LR schedule        cosine 8e-4 → 5% over 60 epochs (AdamW grad-clip 1.0).
   QAT                4-bit weights from epoch 45; early-stop patience 6.
-  Throughput         length-buckets ~2x; v2 tokenizer ~10% faster; mixed-precision.
+  Throughput         length-buckets ~2x; mixed-precision.
 
 Final results (bigorig-500k):
-  valid_fs_accuracy   0.947
-  test_teacher_parity 0.954 (matching the big-3conv teacher)
-  test_fs_accuracy    0.950 (matching file-extension truth)
-  exported size       49.92 KB
+  test_teacher_parity 0.956339 (matching the big-3conv teacher)
+  test_fs_accuracy    0.951446 (matching file-extension truth)
+  exported size       49.94 KB
 
 Usage:
     python scripts/train_v2_student.py                  # default: bigorig-500k cache
@@ -82,7 +81,7 @@ def build_cmd(a: argparse.Namespace) -> list[str]:
         "--magika-config", a.magika_config,
         "--output", a.output,
         "--architecture", ARCHITECTURE,
-        "--unit-tokenizer", "2",
+        "--unit-tokenizer", str(a.unit_tokenizer),
         "--length-buckets",
         "--epochs", str(a.epochs),
         "--batch-size", str(a.batch_size),
@@ -116,6 +115,7 @@ def main() -> int:
     p.add_argument("--self-probabilities", default=DEFAULTS["self_probabilities"])
     p.add_argument("--output", default=DEFAULTS["output"])
     p.add_argument("--confusion-output", default=DEFAULTS["confusion_output"])
+    p.add_argument("--unit-tokenizer", type=int, default=3)
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--learning-rate", type=float, default=8e-4)

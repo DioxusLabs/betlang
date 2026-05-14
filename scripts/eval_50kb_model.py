@@ -8,8 +8,8 @@ Reports both:
 
 Loads the .bin via load_exported_layer_weights (decodes int4 packing back to fp32
 weights) and sets them on a fresh model built from --architecture. Loads the
-test units_v2.mmap directly without calling convert_splits_to_word_units (which
-would rebuild caches for any split arg passed in).
+matching units_vN.mmap directly without calling convert_splits_to_word_units
+(which would rebuild caches for any split arg passed in).
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from train_magika_qat_student import (  # type: ignore
     architecture_uses_word_units,
     build_word_seq_hashembed_hidden_model,
     load_exported_layer_weights,
+    write_confusion_matrix,
     wordseq_config_for_architecture,
 )
 
@@ -48,9 +49,12 @@ def main() -> int:
     p.add_argument("--architecture", required=True)
     p.add_argument("--split", default="test")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--unit-tokenizer", type=int, default=2,
+    p.add_argument("--unit-tokenizer", type=int, default=None,
                    help="Tokenizer version of the units cache to read "
-                        "({split}.units_v{N}.mmap). Must match training.")
+                        "({split}.units_v{N}.mmap). Defaults to checkpoint "
+                        "metadata, or v2 for older checkpoints.")
+    p.add_argument("--confusion-matrix-output", type=Path)
+    p.add_argument("--confusion-matrix-top", type=int, default=20)
     args = p.parse_args()
 
     classes_meta = json.loads((args.cache_dir / f"{args.split}.json").read_text())
@@ -66,7 +70,14 @@ def main() -> int:
 
     # Load weights from exported MSQ1 .bin.
     layer_weights, metadata = load_exported_layer_weights(args.checkpoint)
-    print(f"checkpoint: bits={metadata.get('bits')} arch={metadata.get('architecture','?')}")
+    metadata_tokenizer = metadata.get("tokenizer_version")
+    unit_tokenizer = args.unit_tokenizer
+    if unit_tokenizer is None:
+        unit_tokenizer = int(metadata_tokenizer or 2)
+    print(
+        f"checkpoint: bits={metadata.get('bits')} arch={metadata.get('architecture','?')} "
+        f"tokenizer_version={metadata_tokenizer or 'legacy-v2'}"
+    )
     loaded = 0
     for layer in model.layers:
         if layer.name in layer_weights:
@@ -88,10 +99,10 @@ def main() -> int:
     print(f"loaded weights into {loaded} layers")
 
     # Load units_v{N} cache (whichever tokenizer the model was trained with).
-    units_path = args.cache_dir / f"{args.split}.units_v{args.unit_tokenizer}.mmap"
+    units_path = args.cache_dir / f"{args.split}.units_v{unit_tokenizer}.mmap"
     if not units_path.exists():
         raise SystemExit(f"missing {units_path} — build it via convert_splits_to_word_units "
-                         f"with --unit-tokenizer {args.unit_tokenizer}, or use a different version")
+                         f"with --unit-tokenizer {unit_tokenizer}, or use a different version")
     units = np.memmap(units_path, dtype=np.int32, mode="r", shape=(n, token_length))
     teacher_labels = np.array(np.memmap(args.cache_dir / f"{args.split}.labels.mmap", dtype=np.int64, mode="r",
                                         shape=(n,)))
@@ -135,6 +146,20 @@ def main() -> int:
             print(f"  on AGREED subset      (fs_label == teacher_label, n={n - strict_mapped}):")
             agreed_mask = ~strict_mapped_mask
             print(f"    model_correct        = {(preds[agreed_mask] == fs_labels[agreed_mask]).mean():.4f}")
+    if args.confusion_matrix_output is not None:
+        target_labels = fs_labels if fs_labels is not None else teacher_labels
+        confusion = np.zeros((classes, classes), dtype=np.int64)
+        np.add.at(confusion, (target_labels, preds), 1)
+        label_names = metadata.get("labels")
+        if not isinstance(label_names, list) or len(label_names) != classes:
+            label_names = [str(i) for i in range(classes)]
+        write_confusion_matrix(
+            args.confusion_matrix_output,
+            confusion,
+            [str(label) for label in label_names],
+            args.confusion_matrix_top,
+        )
+        print(f"confusion_matrix_output={args.confusion_matrix_output}")
     return 0
 
 

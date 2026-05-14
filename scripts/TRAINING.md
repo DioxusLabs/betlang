@@ -1,24 +1,25 @@
-# Training the betlang v2 student model
+# Training the betlang wordseq student model
 
-The model shipped in `assets/magika/source-student-q4.bin` is a 49.92 KB
+The model shipped in `assets/magika/source-student-q4.bin` is a 49.94 KB
 quantized wordseq student trained on the Magika v3.3 teacher's predictions
-over a ~440k-file source-language corpus. It hits **~0.95 fs_accuracy** on
-an 81k held-out test set.
+over a ~440k-file source-language corpus. It uses the v3 word-unit tokenizer
+and hits **0.951446 fs_accuracy** on an 81k held-out test set.
 
 ## Files
 
 | File | Lines | Purpose |
 |---|---:|---|
-| `train_v2_student.py` | 175 | **Standalone driver.** Wraps the trainer with the frozen recipe that produced the shipped model. Run this. |
-| `train_magika_qat_student.py` | 5411 | The QAT trainer. Architecture builders (wordseq + others), v1/v2 tokenizers, distillation loss, training loop, MSQ1 export. |
+| `train_v2_student.py` | 175 | **Standalone driver.** Historical filename; wraps the trainer with the frozen recipe that produced the shipped model. Run this. |
+| `train_magika_qat_student.py` | - | The QAT trainer. Architecture builders (wordseq + others), unit tokenizers, distillation loss, short-slice augmentation, training loop, MSQ1 export. |
 | `train_magika_source_student.py` | 673 | Magika teacher loader, byte-window feature extraction, cache iteration helpers. Imported by the QAT trainer. |
-| `eval_50kb_model.py` | 142 | Loads an exported MSQ1 `.bin`, runs forward pass, reports `_teacher_parity` and `_fs_accuracy` on a chosen split. |
+| `eval_50kb_model.py` | 167 | Loads an exported MSQ1 `.bin`, runs forward pass, reports `_teacher_parity` and `_fs_accuracy` on a chosen split. |
+| `confusion_by_size.py` | - | Evaluates an exported wordseq model, aligns cached rows to raw file sizes, and renders the README confusion-matrix image. |
 
 ## Recipe (frozen in `train_v2_student.py`)
 
 ```
 arch:           wordseq-b1024-k3-m2048-tiny-3conv-hidden
-unit_tokenizer: 2  (collapses punct/digit runs into single hashed units)
+unit_tokenizer: 3  (v2 punct/digit compression + case-folded words + isolated brackets)
 length_buckets: yes
 hard_loss_weight: 0.5    (cache labels.mmap = teacher argmax)
 self_loss_weight: 0.5    (cache self_probabilities.mmap = teacher full softmax)
@@ -60,15 +61,20 @@ Expected runtime on a single 12 GB GPU: ~50 minutes for 60 epochs at
 ## Cache
 
 The trainer expects a pre-built cache directory containing per-split mmap
-files: `tokens.mmap`, `units_v2.mmap`, `labels.mmap`, `probabilities.mmap`,
+files: `tokens.mmap`, `units_v3.mmap`, `labels.mmap`, `probabilities.mmap`,
 `self_probabilities.mmap` (optional), `hidden.mmap` (optional).
 
 `train_magika_qat_student.py` will lazily build `tokens.mmap`,
 `probabilities.mmap`, `labels.mmap`, and `hidden.mmap` from the corpus by
 running the Magika teacher on every file (slow; ~30 min for 500 k files).
 
-`units_v2.mmap` is built lazily on first training run from `tokens.mmap`
-via the v2 tokenizer (~5 min for 500 k files).
+`units_v3.mmap` is built lazily on first training run from `tokens.mmap`
+via the v3 tokenizer (~5 min for 500 k files).
+
+Short-slice training should use `--short-slice-target-mode fs-label` with
+`--fs-labels-dir`. That keeps cropped examples tied to the actual file label
+instead of asking the Magika teacher to guess from an intentionally ambiguous
+prefix.
 
 `self_probabilities.mmap` (the `--self-loss-weight 0.5` term) is the soft
 teacher distribution from a larger capacity student trained as an
@@ -82,14 +88,13 @@ python3 scripts/eval_50kb_model.py \
   --checkpoint assets/magika/source-student-q4.bin \
   --cache-dir /path/to/cache \
   --architecture wordseq-b1024-k3-m2048-tiny-3conv-hidden \
-  --split test \
-  --unit-tokenizer 2
+  --split test
 ```
 
 Expected output:
 ```
-test_teacher_parity=0.954
-test_fs_accuracy=0.950
+test_teacher_parity=0.956339
+test_fs_accuracy=0.951446
 ```
 
 `test_teacher_parity` is fraction matching the cache's `labels.mmap`
@@ -97,3 +102,46 @@ test_fs_accuracy=0.950
 (filesystem-extension labels with teacher fallback for unmapped
 extensions). The two should be close (the corpus has ~99.5%
 teacher-vs-filesystem agreement).
+
+## Short-Slice + Tokenizer Candidate
+
+The next candidate for production should train directly against small/partial
+inputs and test the richer v4 unit tokenizer:
+
+```bash
+python3 scripts/train_magika_qat_student.py \
+  --dataset /path/to/corpus/files \
+  --cache-dir /path/to/cache \
+  --magika-model /path/to/magika/standard_v3_3/model.onnx \
+  --magika-config /path/to/magika/standard_v3_3/config.min.json \
+  --output assets/magika/source-student-q4.bin \
+  --architecture wordseq-b1024-k3-m2048-tiny-3conv-hidden \
+  --unit-tokenizer 4 \
+  --length-buckets \
+  --short-slice-prob 0.5 \
+  --short-slice-unit-lengths 64,128,256,512 \
+  --short-slice-target-mode fs-label \
+  --fs-labels-dir /path/to/cache \
+  --epochs 60 \
+  --batch-size 128 \
+  --learning-rate 8e-4 \
+  --cosine-decay \
+  --min-learning-rate-ratio 0.05 \
+  --weight-bits 4 \
+  --qat-start-epoch 45 \
+  --distill-temperature 3 \
+  --hard-loss-weight 0.5 \
+  --self-probabilities /path/to/cache \
+  --self-loss-weight 0.5 \
+  --label-smoothing 0.05 \
+  --cutmix-prob 0.0 \
+  --early-stop-patience 6 \
+  --seed 2 \
+  --mixed-precision
+```
+
+`--short-slice-prob` masks sampled training rows after one of the configured
+unit lengths. With `--short-slice-target-mode fs-label`, those rows use a
+one-hot filesystem-extension label. Do not combine this mode with CutMix: sliced
+examples need to remain single-file examples. Exported wordseq checkpoints now
+include `tokenizer_version`; older checkpoints are treated as legacy v2.
