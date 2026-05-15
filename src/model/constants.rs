@@ -25,11 +25,7 @@ const POOL0_SCRATCH: usize = (MAX_UNITS / CONV0_POOL) * CONV0;
 const POOL1_SCRATCH: usize = (MAX_UNITS / CONV0_POOL / CONV1_POOL) * CONV1;
 
 const fn max_usize(a: usize, b: usize) -> usize {
-    if a > b {
-        a
-    } else {
-        b
-    }
+    if a > b { a } else { b }
 }
 
 pub(crate) const ACTIVATION_SCRATCH: usize =

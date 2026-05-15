@@ -60,15 +60,15 @@ On the held-out `bigorig` test split it reaches
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
-## Performance And Wasm
+## Performance
 
 Betlang uses a fixed 4096-byte Magika window and pads runtime inference to the
 same 2048-token shape used by evaluation. The model is loaded once per process
 and then reused through a `OnceLock`.
 
 Native CPU inference dispatches through `fearless_simd`. Benchmark entry points
-are available through `cargo bench` for native runs and `scripts/bench-wasm.sh`
-for wasm runs. Current baseline numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md).
+are available through `cargo bench`. Current baseline numbers are tracked in
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## License And Attribution
 

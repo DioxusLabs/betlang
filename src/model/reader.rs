@@ -1,9 +1,5 @@
 use super::embedded::MODEL_BYTES;
 
-// ============================================================================
-// MSQ1 file format readers
-// ============================================================================
-
 pub(crate) fn read_int4_dequant(cursor: &mut usize, count: usize, scale: f32) -> Box<[f32]> {
     let bytes = count.div_ceil(2);
     let payload = &MODEL_BYTES[*cursor..*cursor + bytes];

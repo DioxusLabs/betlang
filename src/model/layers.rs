@@ -2,7 +2,7 @@ use super::{
     activation::gelu_simd,
     constants::{BINS, EMBED},
 };
-use fearless_simd::{dispatch, f32x4, Level, Simd, SimdBase, SimdFloat};
+use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::sync::OnceLock;
 
 /// Detect the best available SIMD level once per process.
