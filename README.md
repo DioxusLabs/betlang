@@ -4,8 +4,7 @@
 [![Downloads](https://img.shields.io/crates/d/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU source-language detection for code, backed by a compact Magika student
-model.
+CPU source-language detection for code with a tiny 100kb model.
 
 ```toml
 [dependencies]
@@ -23,30 +22,6 @@ Use `betlang::detect(source)` for UTF-8 source strings. Use
 and should not reject non-UTF-8 input before classification. Both return a
 `Detection`; call `Detection::language()` to read the top language.
 Call `Detection::top_languages()` when you need ranked probabilities.
-
-## Probabilities
-
-`Detection::language()` returns `None` when Betlang cannot build a useful model
-window. Empty input, whitespace-only input, and inputs with fewer than eight
-non-whitespace bytes are not classified.
-
-Probabilities are computed from the model logits with a softmax. Several
-embedded model classes intentionally map to the same public language, so their
-probabilities are added together before ranking public languages.
-
-```rust
-let detection = betlang::detect("fn main() { println!(\"hi\"); }");
-let (probability, language) = detection.top_languages().next().unwrap();
-
-assert_eq!(language, betlang::Language::Rust);
-assert!(probability > 0.0);
-```
-
-## Stability
-
-Model upgrades may change predictions, probabilities, or ranking in a minor
-release. Removing a language, changing a public slug, or changing when
-`Detection::language()` returns `None` is a breaking change after `1.0`.
 
 ## Supported Languages
 
@@ -69,20 +44,6 @@ Several embedded model classes intentionally map to one public language. For
 example, `erb`, `gemfile`, and `gemspec` map to `ruby`; `jsonl` maps to `json`;
 `shell` maps to `bash`; and project-file classes such as `csproj` and `vcxproj`
 map to `xml`.
-
-## Example CLI
-
-The repository includes an example detector:
-
-```bash
-cargo run --release --example detect -- src/model.rs
-cargo run --release --example detect < snippets/demo.rs
-cargo run --release --example detect -- .
-```
-
-Directory mode respects `.gitignore` and prints a GitHub-style byte breakdown.
-Files that are not valid UTF-8 are reported as unreadable by the example CLI;
-library users can call `detect_bytes` directly.
 
 ## Model
 
