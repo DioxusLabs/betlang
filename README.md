@@ -23,6 +23,7 @@ Use `betlang::detect(source)` for UTF-8 source strings. Use
 `betlang::detect_bytes(bytes)` for scanners that already work with file bytes
 and should not reject non-UTF-8 input before classification. Both return a
 `Detection`; call `Detection::language()` to read the top language.
+Call `Detection::top_languages()` when you need ranked probabilities.
 
 ## Probabilities
 
@@ -32,8 +33,15 @@ non-whitespace bytes are not classified.
 
 Probabilities are computed from the model logits with a softmax. Several
 embedded model classes intentionally map to the same public language, so their
-probabilities are added together before choosing the top public language. Those
-scores are an internal implementation detail.
+probabilities are added together before ranking public languages.
+
+```rust
+let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+let (probability, language) = detection.top_languages().next().unwrap();
+
+assert_eq!(language, betlang::Language::Rust);
+assert!(probability > 0.0);
+```
 
 ## Stability
 
@@ -41,9 +49,9 @@ scores are an internal implementation detail.
 minor-version change after `1.0`, and callers should include a wildcard arm when
 matching on it.
 
-Model upgrades may change predictions in a minor release. Removing a language,
-changing a public slug, or changing when `Detection::language()` returns `None`
-is a breaking change after `1.0`.
+Model upgrades may change predictions, probabilities, or ranking in a minor
+release. Removing a language, changing a public slug, or changing when
+`Detection::language()` returns `None` is a breaking change after `1.0`.
 
 ## Supported Languages
 

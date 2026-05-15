@@ -45,12 +45,15 @@ and `../dioxus-icons`, plus the current `betlang` checks.
     probability/language pairs internally.
   - `Detection::language()` returns the top language, or `None` for empty,
     whitespace-only, and too-short inputs.
+  - `Detection::top_languages()` exposes ranked `(probability, Language)`
+    pairs without exposing struct fields.
 
 ## P1 - Public API Polish
 
 - [x] Keep public detection API minimal.
   - Expose `detect`, `detect_bytes`, `Detection`, `Language::slug`, and
-    `Detection::language`, plus `FromStr` for slug parsing.
+    `Detection::language`/`Detection::top_languages`, plus `FromStr` for slug
+    parsing.
   - Keep thresholds, model labels, and richer helper methods internal until
     there is stronger evidence that callers need them.
 - [x] Add `FromStr` for `Language`.

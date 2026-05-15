@@ -18,10 +18,10 @@ pub use language::{Language, ParseLanguageError};
 
 /// Source-language detection result.
 ///
-/// Internally, this stores language probabilities sorted from most likely to
-/// least likely. Use [`Detection::language`] to read the top language. It
-/// returns [`None`] when the input is empty, effectively whitespace only, or too
-/// short to build the model window.
+/// Use [`Detection::language`] to read the top language and
+/// [`Detection::top_languages`] to iterate over ranked probability/language
+/// pairs. [`Detection::language`] returns [`None`] when the input is empty,
+/// effectively whitespace only, or too short to build the model window.
 ///
 /// ```
 /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
@@ -46,6 +46,23 @@ impl Detection {
     /// ```
     pub fn language(&self) -> Option<Language> {
         self.predictions.first().map(|(_, language)| *language)
+    }
+
+    /// Return detected languages sorted from most likely to least likely.
+    ///
+    /// The iterator yields `(probability, language)` pairs. Probabilities are
+    /// aggregated across embedded model classes that map to the same public
+    /// [`Language`], so each public language appears at most once.
+    ///
+    /// ```
+    /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+    /// let (probability, language) = detection.top_languages().next().unwrap();
+    ///
+    /// assert_eq!(language, betlang::Language::Rust);
+    /// assert!(probability > 0.0);
+    /// ```
+    pub fn top_languages(&self) -> impl Iterator<Item = (f32, Language)> + '_ {
+        self.predictions.iter().copied()
     }
 
     pub(crate) fn from_predictions(predictions: Vec<(f32, Language)>) -> Self {

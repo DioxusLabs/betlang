@@ -1819,7 +1819,7 @@ mod tests {
 
         for (expected, source) in fixtures {
             let detection = crate::detect(source);
-            let (probability, language) = detection.predictions[0];
+            let (probability, language) = detection.top_languages().next().unwrap();
             assert_eq!(language, expected, "{source}");
             assert_eq!(language.slug(), expected.slug());
             assert!(probability > 0.0, "{source}");
@@ -1838,8 +1838,7 @@ mod tests {
     fn probabilities_sum_to_one_across_public_languages() {
         let detection = crate::detect("use std::fmt;\nfn main() { println!(\"hi\"); }\n");
         let sum: f32 = detection
-            .predictions
-            .iter()
+            .top_languages()
             .map(|(probability, _)| probability)
             .sum();
 
@@ -1867,13 +1866,13 @@ mod tests {
 
     #[test]
     fn empty_input_returns_empty_detection() {
-        assert!(crate::detect("").predictions.is_empty());
+        assert!(crate::detect("").top_languages().next().is_none());
     }
 
     #[test]
     fn very_short_input_returns_empty_detection() {
         // < 8 non-whitespace bytes
-        assert!(crate::detect("hi").predictions.is_empty());
+        assert!(crate::detect("hi").top_languages().next().is_none());
     }
 
     fn top_language(detection: &crate::Detection) -> Option<Language> {
