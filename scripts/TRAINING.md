@@ -19,7 +19,7 @@ and hits **0.962517 fs_accuracy** on an 81k held-out test set.
 
 ```
 arch:           wordseq-b1536-k3-m2048-med-3conv-hidden
-unit_tokenizer: 3  (v2 punct/digit compression + case-folded words + isolated brackets)
+unit_tokenizer: 3  (punct/digit compression + case-folded words + isolated brackets)
 length_buckets: yes
 hard_loss_weight: 0.5    (cache labels.mmap = teacher argmax)
 self_loss_weight: 0.5    (cache self_probabilities.mmap = teacher full softmax)

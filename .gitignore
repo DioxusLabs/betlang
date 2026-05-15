@@ -8,4 +8,3 @@ htmlcov/
 *.profdata
 *.pyc
 __pycache__/
-actual_dataset_confusion_by_size.*

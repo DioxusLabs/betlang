@@ -79,7 +79,6 @@ def build_cmd(a: argparse.Namespace) -> list[str]:
         "--magika-config", a.magika_config,
         "--output", a.output,
         "--architecture", ARCHITECTURE,
-        "--unit-tokenizer", str(a.unit_tokenizer),
         "--length-buckets",
         "--epochs", str(a.epochs),
         "--batch-size", str(a.batch_size),
@@ -113,7 +112,6 @@ def main() -> int:
     p.add_argument("--self-probabilities", default=DEFAULTS["self_probabilities"])
     p.add_argument("--output", default=DEFAULTS["output"])
     p.add_argument("--confusion-output", default=DEFAULTS["confusion_output"])
-    p.add_argument("--unit-tokenizer", type=int, default=3, choices=[3])
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--learning-rate", type=float, default=8e-4)

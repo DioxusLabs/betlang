@@ -46,8 +46,8 @@ name = "betlang"
 path = "src/lib.rs"
 
 [[example]]
-name = "wasm_smoke"
-path = "examples/wasm_smoke.rs"
+name = "wasm_bench_guest"
+path = "examples/wasm_bench_guest.rs"
 crate-type = ["cdylib"]
 
 [[example]]

@@ -5,7 +5,7 @@ import { performance } from "node:perf_hooks";
 
 const modulePath =
   process.argv.find((arg) => !arg.startsWith("--") && arg.endsWith(".wasm")) ??
-  "target/wasm32-unknown-unknown/release/examples/wasm_smoke.wasm";
+  "target/wasm32-unknown-unknown/release/examples/wasm_bench_guest.wasm";
 
 const options = {
   samples: optionNumber("--samples", 10),
@@ -18,8 +18,11 @@ const options = {
 const wasm = await WebAssembly.instantiate(await readFile(modulePath), {});
 const exports = wasm.instance.exports;
 
-assert(exports.detect_short_bench(1) === 1, "short smoke failed");
-assert(exports.detect_full_window_bench(1) === 1, "full-window smoke failed");
+assert(exports.detect_short_bench(1) === 1, "short benchmark sanity check failed");
+assert(
+  exports.detect_full_window_bench(1) === 1,
+  "full-window benchmark sanity check failed",
+);
 
 console.log("runtime: node");
 console.log(`module: ${modulePath}`);

@@ -8,7 +8,7 @@ Reports both:
 
 Loads the .bin via load_exported_layer_weights (decodes int4 packing back to fp32
 weights) and sets them on a fresh model built from --architecture. Loads the
-matching units_vN.mmap directly without calling convert_splits_to_word_units
+matching units_v3.mmap directly without calling convert_splits_to_word_units
 (which would rebuild caches for any split arg passed in).
 """
 
@@ -49,10 +49,6 @@ def main() -> int:
     p.add_argument("--architecture", required=True)
     p.add_argument("--split", default="test")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--unit-tokenizer", type=int, default=None,
-                   help="Tokenizer version of the units cache to read "
-                        "({split}.units_v{N}.mmap). Defaults to checkpoint "
-                        "metadata, or v2 when metadata is absent.")
     p.add_argument("--confusion-matrix-output", type=Path)
     p.add_argument("--confusion-matrix-top", type=int, default=20)
     args = p.parse_args()
@@ -71,12 +67,14 @@ def main() -> int:
     # Load weights from exported MSQ1 .bin.
     layer_weights, metadata = load_exported_layer_weights(args.checkpoint)
     metadata_tokenizer = metadata.get("tokenizer_version")
-    unit_tokenizer = args.unit_tokenizer
-    if unit_tokenizer is None:
-        unit_tokenizer = int(metadata_tokenizer or 2)
+    if metadata_tokenizer != 3:
+        raise SystemExit(
+            f"unsupported checkpoint tokenizer_version={metadata_tokenizer!r}; "
+            "this evaluator supports only v3"
+        )
     print(
         f"checkpoint: bits={metadata.get('bits')} arch={metadata.get('architecture','?')} "
-        f"tokenizer_version={metadata_tokenizer or 'legacy-v2'}"
+        f"tokenizer_version={metadata_tokenizer}"
     )
     loaded = 0
     for layer in model.layers:
@@ -98,10 +96,10 @@ def main() -> int:
                 loaded += 1
     print(f"loaded weights into {loaded} layers")
 
-    units_path = args.cache_dir / f"{args.split}.units_v{unit_tokenizer}.mmap"
+    units_path = args.cache_dir / f"{args.split}.units_v3.mmap"
     if not units_path.exists():
         raise SystemExit(f"missing {units_path} — build it via convert_splits_to_word_units "
-                         f"with --unit-tokenizer {unit_tokenizer}, or use a different version")
+                         "with the v3 tokenizer")
     units = np.memmap(units_path, dtype=np.int32, mode="r", shape=(n, token_length))
     teacher_labels = np.array(np.memmap(args.cache_dir / f"{args.split}.labels.mmap", dtype=np.int64, mode="r",
                                         shape=(n,)))

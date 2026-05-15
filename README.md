@@ -66,19 +66,9 @@ Betlang uses a fixed 4096-byte Magika window and pads runtime inference to the
 same 2048-token shape used by evaluation. The model is loaded once per process
 and then reused through a `OnceLock`.
 
-Native CPU inference dispatches through `fearless_simd`. The repository also
-includes wasm smoke tests:
-
-```bash
-rustup target add wasm32-unknown-unknown
-cargo build --example wasm_smoke --target wasm32-unknown-unknown --release
-node scripts/run-wasm-smoke.mjs \
-  target/wasm32-unknown-unknown/release/examples/wasm_smoke.wasm
-```
-
-Benchmark entry points are available through `cargo bench` for native runs and
-`scripts/bench-wasm.sh` for wasm runs. Current baseline numbers are tracked in
-[BENCHMARKS.md](BENCHMARKS.md).
+Native CPU inference dispatches through `fearless_simd`. Benchmark entry points
+are available through `cargo bench` for native runs and `scripts/bench-wasm.sh`
+for wasm runs. Current baseline numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md).
 
 ## License And Attribution
 

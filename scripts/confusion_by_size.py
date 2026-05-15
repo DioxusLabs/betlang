@@ -412,7 +412,6 @@ def main() -> int:
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--unit-tokenizer", type=int)
     parser.add_argument("--csv-output", type=Path, default=Path("actual_dataset_confusion_by_size.csv"))
     parser.add_argument("--markdown-output", type=Path, default=Path("actual_dataset_confusion_by_size.md"))
     parser.add_argument("--png-output", type=Path, default=Path("assets/confusion-by-size.png"))
@@ -425,9 +424,14 @@ def main() -> int:
     print(f"split={args.split} n={n} classes={classes}", flush=True)
 
     model, metadata, _ = load_model(args.checkpoint, args.cache_dir, args.architecture, args.split)
-    tokenizer = args.unit_tokenizer if args.unit_tokenizer is not None else int(metadata.get("tokenizer_version") or 2)
-    print(f"checkpoint tokenizer_version={metadata.get('tokenizer_version', 'legacy-v2')} using units_v{tokenizer}", flush=True)
-    units = np.memmap(args.cache_dir / f"{args.split}.units_v{tokenizer}.mmap", dtype=np.int32, mode="r", shape=(n, TOKEN_LENGTH))
+    tokenizer = metadata.get("tokenizer_version")
+    if tokenizer != 3:
+        raise SystemExit(
+            f"unsupported checkpoint tokenizer_version={tokenizer!r}; "
+            "this report supports only v3"
+        )
+    print("checkpoint tokenizer_version=3 using units_v3", flush=True)
+    units = np.memmap(args.cache_dir / f"{args.split}.units_v3.mmap", dtype=np.int32, mode="r", shape=(n, TOKEN_LENGTH))
     preds = predict(model, units, args.batch_size)
 
     teacher_labels = np.asarray(np.memmap(args.cache_dir / f"{args.split}.labels.mmap", dtype=np.int64, mode="r", shape=(n,)))

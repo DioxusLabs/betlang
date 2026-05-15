@@ -176,7 +176,7 @@ _V3_BRACKET_BYTES = frozenset((40, 41, 91, 93, 123, 125))  # ( ) [ ] { }
 def numpy_word_units_apply_v3(
     tokens_np: np.ndarray, output_length: int = TOKEN_LENGTH
 ) -> np.ndarray:
-    """Production v3 tokenizer: v2 punctuation compression plus case-folding and
+    """Production v3 tokenizer: punctuation compression plus case-folding and
     isolated bracket tokens.
     """
     out = np.full((tokens_np.shape[0], output_length), -1, dtype=np.int32)
@@ -1110,7 +1110,6 @@ def main() -> None:
     parser.add_argument("--self-probabilities", type=Path, default=None)
     parser.add_argument("--self-loss-weight", type=float, default=0.5)
     parser.add_argument("--cutmix-prob", type=float, default=0.5)
-    parser.add_argument("--unit-tokenizer", type=int, default=TOKENIZER_VERSION, choices=[TOKENIZER_VERSION])
     parser.add_argument("--length-buckets", action="store_true")
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
