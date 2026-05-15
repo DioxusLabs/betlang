@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Standalone training driver for the current betlang source-student model.
+"""Training driver for `assets/magika/source-student-q4.bin`.
 
-This wraps the canonical recipe that produced `assets/magika/source-student-q4.bin`
-(102,793 bytes, ~0.963 fs_accuracy on bigorig-500k 81k test split). It shells out to
-the focused `train_magika_qat_student.py` trainer with a frozen, well-justified
-hyperparameter set and prints the final metrics.
+It shells out to `train_magika_qat_student.py` with the shipped architecture,
+cache paths, and hyperparameters.
 
-Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
+Recipe:
 
   Architecture       wordseq-b1536-k3-m2048-med-3conv-hidden (~100 KB exported)
                      - K=3 HashEmbedding (1536 bins x 28 dim, 4-bit) ~21 KB
                      - 3 conv stages (96 → 192 → 192 ch, 2-bit) with
                        MaxPool(4) then MaxPool(2)
                      - Dense 160 (2-bit) → output 67 (4-bit)
-                     - Best accuracy/size tradeoff from the production sweep on bigorig-500k.
+                     - Export budget: 110 KB.
 
   Cache              /tmp/magika-source-qat-cache-bigorig-500k
                      - 437,778 train / 53,420 valid / 81,744 test
@@ -32,7 +30,7 @@ Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
   QAT                4-bit weights from epoch 45; early-stop patience 6.
   Throughput         length-buckets ~2x; mixed-precision.
 
-Final results (bigorig-500k):
+Expected results (bigorig-500k):
   test_teacher_parity 0.967618 (matching the big-3conv teacher)
   test_fs_accuracy    0.962517 (matching file-extension truth)
   exported size       102,793 bytes

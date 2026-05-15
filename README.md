@@ -44,10 +44,6 @@ assert!(probability > 0.0);
 
 ## Stability
 
-`Language` is `#[non_exhaustive]`. Adding a new public language variant is a
-minor-version change after `1.0`, and callers should include a wildcard arm when
-matching on it.
-
 Model upgrades may change predictions, probabilities, or ranking in a minor
 release. Removing a language, changing a public slug, or changing when
 `Detection::language()` returns `None` is a breaking change after `1.0`.

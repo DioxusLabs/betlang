@@ -153,8 +153,7 @@ impl Model {
 
     /// Run the full forward pass on a unit-id sequence (length = `len`).
     fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
-        // 1) HashEmbedding (K=3 hashed rows summed) + GELU, fused per position.
-        //    Padding positions (unit_id < 0) → gelu(0) = 0.
+        // 1) HashEmbedding + GELU.
         let t = len.min(MAX_UNITS);
         let mut embed = vec![0.0f32; t * EMBED];
         for pos in 0..t.min(units.len()) {
@@ -169,8 +168,7 @@ impl Model {
             }
         }
 
-        // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
-        //    ~524 KB intermediate buffer and the second read pass.
+        // 2) Conv0 + GELU + MaxPool(4).
         let (pool0, t1) = conv_gelu_maxpool(
             &embed,
             t,
@@ -182,7 +180,7 @@ impl Model {
             CONV0_POOL,
         );
 
-        // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
+        // 3) Conv1 + GELU + MaxPool(2).
         let (pool1, t2) = conv_gelu_maxpool(
             &pool0,
             t1,
@@ -194,8 +192,7 @@ impl Model {
             CONV1_POOL,
         );
 
-        // 4) Conv2 (k=3, 128→128) + GELU + GlobalMax/AvgPool → 256-dim,
-        //    fused so the conv2 output is never materialized.
+        // 4) Conv2 + GELU + GlobalMax/AvgPool.
         let mut pooled = [0.0f32; POOLED];
         let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
         conv_gelu_global_pool(
@@ -210,7 +207,7 @@ impl Model {
             avg_slice,
         );
 
-        // 5) Dense 384→160 + GELU
+        // 5) Dense + GELU.
         let mut dense0_out = [0.0f32; DENSE];
         dense_forward(
             &pooled,
@@ -222,7 +219,7 @@ impl Model {
             *v = gelu(*v);
         }
 
-        // 6) Dense 160→67 → logits
+        // 6) Output logits.
         let mut logits = [0.0f32; CLASSES];
         dense_forward(
             &dense0_out,
@@ -322,8 +319,7 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
             return;
         }
     }
-    // Edge/partial-block path. Uses the original layout where the inner kernel
-    // row is contiguous.
+    // Edge/partial-block path.
     for s in 0..BLOCK {
         accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
     }
@@ -939,8 +935,6 @@ fn parse_scales(metadata: &str) -> Vec<f32> {
 
 fn parse_tokenizer_version(metadata: &str) -> TokenizerVersion {
     let Some(version) = parse_usize_field(metadata, "tokenizer_version") else {
-        // Legacy exported checkpoints predate tokenizer metadata. The shipped
-        // wordseq asset was trained with v2.
         return TokenizerVersion::V2;
     };
     match version {
@@ -970,7 +964,7 @@ fn parse_usize_field(metadata: &str, field: &str) -> Option<usize> {
 // Byte windowing + v2 word-unit tokenization
 // ============================================================================
 
-/// v2 tokenizer ported from `numpy_word_units_apply_v2` in the Python trainer.
+/// v2 tokenizer.
 ///
 /// Walks the input bytes, treating any value >= 0x80 with the high bit set
 /// as "padding" and stopping at the first such byte (matching the Python
@@ -1144,10 +1138,9 @@ fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
     }
 }
 
-/// v3 tokenizer ported from `numpy_word_units_apply_v3` in the Python trainer.
+/// v3 tokenizer.
 ///
-/// This keeps v2's digit/punctuation compression, then case-folds word hashes
-/// and isolates unambiguous brackets as stable BRACKET_FLAG tokens.
+/// Case-folds word hashes and emits unambiguous brackets as BRACKET_FLAG tokens.
 fn tokenize_v3(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
     let mut word: Vec<u8> = Vec::new();
@@ -1258,11 +1251,11 @@ fn tokenize_v3(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
     out
 }
 
-/// v4 tokenizer ported from `numpy_word_units_apply_v4` in the Python trainer.
+/// v4 tokenizer.
 ///
-/// This keeps v2's digit/punctuation compression, then case-folds word hashes,
-/// isolates brackets, marks CamelCase-ish identifiers with STYLE_BIT, and
-/// collapses double-quoted string literals to one STRING_FLAG token.
+/// Case-folds word hashes, isolates brackets, marks CamelCase-ish identifiers
+/// with STYLE_BIT, and collapses double-quoted string literals to one
+/// STRING_FLAG token.
 fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
     let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
     let mut word: Vec<u8> = Vec::new();

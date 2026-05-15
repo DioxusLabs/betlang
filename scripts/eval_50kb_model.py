@@ -52,7 +52,7 @@ def main() -> int:
     p.add_argument("--unit-tokenizer", type=int, default=None,
                    help="Tokenizer version of the units cache to read "
                         "({split}.units_v{N}.mmap). Defaults to checkpoint "
-                        "metadata, or v2 for older checkpoints.")
+                        "metadata, or v2 when metadata is absent.")
     p.add_argument("--confusion-matrix-output", type=Path)
     p.add_argument("--confusion-matrix-top", type=int, default=20)
     args = p.parse_args()
@@ -98,7 +98,6 @@ def main() -> int:
                 loaded += 1
     print(f"loaded weights into {loaded} layers")
 
-    # Load units_v{N} cache (whichever tokenizer the model was trained with).
     units_path = args.cache_dir / f"{args.split}.units_v{unit_tokenizer}.mmap"
     if not units_path.exists():
         raise SystemExit(f"missing {units_path} — build it via convert_splits_to_word_units "

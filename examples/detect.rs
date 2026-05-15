@@ -118,9 +118,6 @@ fn breakdown_tree(root: &Path) -> ExitCode {
     let mut bytes_by_language: HashMap<Language, u64> = HashMap::new();
     let mut total: u64 = 0;
     let mut undetected: u64 = 0;
-    // (truth, predicted) -> count. `predicted = None` is bucketed under
-    // `Language::Diff`-as-sentinel? No — we use a separate map keyed by
-    // (truth, Option<Language>).
     let mut confusion: HashMap<(Language, Option<Language>), u64> = HashMap::new();
     let mut by_truth: HashMap<Language, LangStat> = HashMap::new();
     let mut graded: u64 = 0;
