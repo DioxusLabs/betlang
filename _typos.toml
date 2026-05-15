@@ -7,4 +7,5 @@ extend-exclude = [
 ]
 
 [default.extend-words]
+cpy = "cpy"
 edn = "edn"

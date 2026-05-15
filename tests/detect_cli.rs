@@ -3,6 +3,7 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -103,6 +104,37 @@ fn detect_command() -> Command {
         return Command::new(path);
     }
 
+    Command::new(detect_example_binary())
+}
+
+fn detect_example_binary() -> PathBuf {
+    static DETECT_EXAMPLE: OnceLock<PathBuf> = OnceLock::new();
+
+    DETECT_EXAMPLE
+        .get_or_init(|| {
+            let path = detect_example_path();
+            if !path.exists() {
+                let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+                let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+                    .expect("CARGO_MANIFEST_DIR must be set for integration tests");
+                let status = Command::new(cargo)
+                    .args(["build", "--quiet", "--example", "detect"])
+                    .current_dir(manifest_dir)
+                    .status()
+                    .expect("failed to run cargo build --example detect");
+                assert!(status.success(), "cargo build --example detect failed");
+                assert!(
+                    path.exists(),
+                    "cargo build --example detect did not create {}",
+                    path.display()
+                );
+            }
+            path
+        })
+        .clone()
+}
+
+fn detect_example_path() -> PathBuf {
     let mut path = std::env::current_exe().unwrap();
     path.pop();
     if path.file_name().is_some_and(|name| name == "deps") {
@@ -110,7 +142,7 @@ fn detect_command() -> Command {
     }
     path.push("examples");
     path.push(format!("detect{}", std::env::consts::EXE_SUFFIX));
-    Command::new(path)
+    path
 }
 
 struct TempDir {
