@@ -10,10 +10,10 @@ and hits **0.962517 fs_accuracy** on an 81k held-out test set.
 | File | Lines | Purpose |
 |---|---:|---|
 | `train_v2_student.py` | 175 | **Standalone driver.** Historical filename; wraps the trainer with the frozen recipe that produced the shipped model. Run this. |
-| `train_magika_qat_student.py` | - | The QAT trainer. Architecture builders (wordseq + others), unit tokenizers, distillation loss, short-slice augmentation, training loop, MSQ1 export. |
+| `train_magika_qat_student.py` | 1372 | Focused QAT trainer for only the shipped `wordseq-b1536-k3-m2048-med-3conv-hidden` model: v3 tokenizer, length buckets, self-distillation, CutMix, training loop, and MSQ1 export. |
 | `train_magika_source_student.py` | 673 | Magika teacher loader, byte-window feature extraction, cache iteration helpers. Imported by the QAT trainer. |
 | `eval_50kb_model.py` | 167 | Loads an exported MSQ1 `.bin`, runs forward pass, reports `_teacher_parity` and `_fs_accuracy` on a chosen split. |
-| `confusion_by_size.py` | - | Evaluates an exported wordseq model, aligns cached rows to raw file sizes, and renders the README confusion-matrix image. |
+| `confusion_by_size.py` | 471 | Evaluates an exported wordseq model, aligns cached rows to raw file sizes, and renders the README confusion-matrix image. |
 
 ## Recipe (frozen in `train_v2_student.py`)
 
@@ -60,21 +60,16 @@ Expected runtime on a single 12 GB GPU: ~50 minutes for 60 epochs at
 
 ## Cache
 
-The trainer expects a pre-built cache directory containing per-split mmap
-files: `tokens.mmap`, `units_v3.mmap`, `labels.mmap`, `probabilities.mmap`,
-`self_probabilities.mmap` (optional), `hidden.mmap` (optional).
+The trainer expects a cache directory containing per-split mmap files:
+`tokens.mmap`, `units_v3.mmap`, `labels.mmap`, `probabilities.mmap`, and
+`self_probabilities.mmap` for the frozen self-distillation recipe.
 
 `train_magika_qat_student.py` will lazily build `tokens.mmap`,
-`probabilities.mmap`, `labels.mmap`, and `hidden.mmap` from the corpus by
-running the Magika teacher on every file (slow; ~30 min for 500 k files).
+`probabilities.mmap`, and `labels.mmap` from the corpus by running the Magika
+teacher on every file (slow; ~30 min for 500 k files).
 
 `units_v3.mmap` is built lazily on first training run from `tokens.mmap`
 via the v3 tokenizer (~5 min for 500 k files).
-
-Short-slice training should use `--short-slice-target-mode fs-label` with
-`--fs-labels-dir`. That keeps cropped examples tied to the actual file label
-instead of asking the Magika teacher to guess from an intentionally ambiguous
-prefix.
 
 `self_probabilities.mmap` (the `--self-loss-weight 0.5` term) is the soft
 teacher distribution from a larger capacity student trained as an
@@ -102,46 +97,3 @@ test_fs_accuracy=0.962517
 (filesystem-extension labels with teacher fallback for unmapped
 extensions). The two should be close (the corpus has ~99.5%
 teacher-vs-filesystem agreement).
-
-## Short-Slice + Tokenizer Candidate
-
-The next candidate for production should train directly against small/partial
-inputs and test the richer v4 unit tokenizer:
-
-```bash
-python3 scripts/train_magika_qat_student.py \
-  --dataset /path/to/corpus/files \
-  --cache-dir /path/to/cache \
-  --magika-model /path/to/magika/standard_v3_3/model.onnx \
-  --magika-config /path/to/magika/standard_v3_3/config.min.json \
-  --output assets/magika/source-student-q4.bin \
-  --architecture wordseq-b1536-k3-m2048-med-3conv-hidden \
-  --unit-tokenizer 4 \
-  --length-buckets \
-  --short-slice-prob 0.5 \
-  --short-slice-unit-lengths 64,128,256,512 \
-  --short-slice-target-mode fs-label \
-  --fs-labels-dir /path/to/cache \
-  --epochs 60 \
-  --batch-size 128 \
-  --learning-rate 8e-4 \
-  --cosine-decay \
-  --min-learning-rate-ratio 0.05 \
-  --weight-bits 4 \
-  --qat-start-epoch 45 \
-  --distill-temperature 3 \
-  --hard-loss-weight 0.5 \
-  --self-probabilities /path/to/cache \
-  --self-loss-weight 0.5 \
-  --label-smoothing 0.05 \
-  --cutmix-prob 0.0 \
-  --early-stop-patience 6 \
-  --seed 2 \
-  --mixed-precision
-```
-
-`--short-slice-prob` masks sampled training rows after one of the configured
-unit lengths. With `--short-slice-target-mode fs-label`, those rows use a
-one-hot filesystem-extension label. Do not combine this mode with CutMix: sliced
-examples need to remain single-file examples. Exported wordseq checkpoints now
-include `tokenizer_version`; older checkpoints are treated as legacy v2.

@@ -3,7 +3,7 @@
 
 This wraps the canonical recipe that produced `assets/magika/source-student-q4.bin`
 (102,793 bytes, ~0.963 fs_accuracy on bigorig-500k 81k test split). It shells out to
-the bigger `train_magika_qat_student.py` trainer with a frozen, well-justified
+the focused `train_magika_qat_student.py` trainer with a frozen, well-justified
 hyperparameter set and prints the final metrics.
 
 Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
@@ -115,7 +115,7 @@ def main() -> int:
     p.add_argument("--self-probabilities", default=DEFAULTS["self_probabilities"])
     p.add_argument("--output", default=DEFAULTS["output"])
     p.add_argument("--confusion-output", default=DEFAULTS["confusion_output"])
-    p.add_argument("--unit-tokenizer", type=int, default=3)
+    p.add_argument("--unit-tokenizer", type=int, default=3, choices=[3])
     p.add_argument("--epochs", type=int, default=60)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--learning-rate", type=float, default=8e-4)
