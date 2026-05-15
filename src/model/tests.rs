@@ -5,6 +5,8 @@ use super::{
     window::build_window,
 };
 use crate::Language;
+use std::collections::HashSet;
+use std::{fs, path::Path};
 
 #[test]
 fn loads_embedded_model() {
@@ -99,6 +101,49 @@ fn golden_predictions_cover_representative_sources() {
 }
 
 #[test]
+fn detects_each_language_fixture_file() {
+    let mut failures = Vec::new();
+
+    for (expected, path) in LANGUAGE_FIXTURES {
+        let source = fs::read(fixture_path(path)).unwrap_or_else(|err| {
+            panic!("failed to read fixture {path}: {err}");
+        });
+        let detection = crate::detect(source);
+        let actual = detection.language();
+
+        if actual != Some(expected) {
+            let top = detection
+                .top_languages()
+                .take(3)
+                .map(|(probability, language)| format!("{}:{probability:.3}", language.slug()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            failures.push(format!(
+                "{path}: expected {}, got {:?}; top [{}]",
+                expected.slug(),
+                actual.map(Language::slug),
+                top
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn language_fixtures_have_unique_expected_languages() {
+    let mut languages = HashSet::new();
+
+    for (language, _) in LANGUAGE_FIXTURES {
+        assert!(
+            languages.insert(language),
+            "duplicate fixture for {}",
+            language.slug()
+        );
+    }
+}
+
+#[test]
 fn detect_accepts_non_utf8_inputs() {
     let mut bytes = b"fn main() {\n    println!(\"hello\");\n}\n".to_vec();
     bytes.extend([0xff, 0xfe]);
@@ -152,3 +197,77 @@ fn very_short_input_returns_empty_detection() {
 fn top_language(detection: &crate::Detection) -> Option<Language> {
     detection.language()
 }
+
+fn fixture_path(path: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
+}
+
+const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
+    (Language::Asm, "tests/fixtures/languages/asm.s"),
+    (Language::Batch, "tests/fixtures/languages/batch.bat"),
+    (Language::Bash, "tests/fixtures/languages/bash.sh"),
+    (Language::C, "tests/fixtures/languages/c.c"),
+    (Language::CSharp, "tests/fixtures/languages/c-sharp.cs"),
+    (Language::Clojure, "tests/fixtures/languages/clojure.clj"),
+    (Language::CMake, "tests/fixtures/languages/cmake.cmake"),
+    (Language::Cobol, "tests/fixtures/languages/cobol.cob"),
+    (
+        Language::CommonLisp,
+        "tests/fixtures/languages/commonlisp.lisp",
+    ),
+    (Language::Cpp, "tests/fixtures/languages/cpp.cpp"),
+    (Language::Css, "tests/fixtures/languages/css.css"),
+    (Language::Diff, "tests/fixtures/languages/diff.diff"),
+    (
+        Language::Dockerfile,
+        "tests/fixtures/languages/dockerfile.Dockerfile",
+    ),
+    (Language::Elixir, "tests/fixtures/languages/elixir.ex"),
+    (Language::Erlang, "tests/fixtures/languages/erlang.erl"),
+    (Language::Go, "tests/fixtures/languages/go.go"),
+    (Language::Groovy, "tests/fixtures/languages/groovy.gradle"),
+    (Language::Haskell, "tests/fixtures/languages/haskell.hs"),
+    (Language::Html, "tests/fixtures/languages/html.html"),
+    (Language::Ini, "tests/fixtures/languages/ini.ini"),
+    (Language::Java, "tests/fixtures/languages/java.java"),
+    (
+        Language::JavaScript,
+        "tests/fixtures/languages/javascript.js",
+    ),
+    (Language::Json, "tests/fixtures/languages/json.json"),
+    (Language::Julia, "tests/fixtures/languages/julia.jl"),
+    (Language::Kotlin, "tests/fixtures/languages/kotlin.kt"),
+    (Language::Lua, "tests/fixtures/languages/lua.lua"),
+    (Language::Markdown, "tests/fixtures/languages/markdown.md"),
+    (Language::ObjectiveC, "tests/fixtures/languages/objc.m"),
+    (Language::Ocaml, "tests/fixtures/languages/ocaml.ml"),
+    (Language::Perl, "tests/fixtures/languages/perl.pl"),
+    (Language::Php, "tests/fixtures/languages/php.php"),
+    (
+        Language::Postscript,
+        "tests/fixtures/languages/postscript.ps",
+    ),
+    (
+        Language::Powershell,
+        "tests/fixtures/languages/powershell.ps1",
+    ),
+    (Language::Python, "tests/fixtures/languages/python.py"),
+    (Language::R, "tests/fixtures/languages/r.R"),
+    (Language::Ruby, "tests/fixtures/languages/ruby.rb"),
+    (Language::Rust, "tests/fixtures/languages/rust.rs"),
+    (Language::Scala, "tests/fixtures/languages/scala.scala"),
+    (Language::Scss, "tests/fixtures/languages/scss.scss"),
+    (Language::Sql, "tests/fixtures/languages/sql.sql"),
+    (Language::Swift, "tests/fixtures/languages/swift.swift"),
+    (Language::Toml, "tests/fixtures/languages/toml.toml"),
+    (
+        Language::TypeScript,
+        "tests/fixtures/languages/typescript.ts",
+    ),
+    (Language::Vb, "tests/fixtures/languages/vb.vb"),
+    (Language::Verilog, "tests/fixtures/languages/verilog.v"),
+    (Language::Vhdl, "tests/fixtures/languages/vhdl.vhd"),
+    (Language::Vue, "tests/fixtures/languages/vue.vue"),
+    (Language::Xml, "tests/fixtures/languages/xml.xml"),
+    (Language::Yaml, "tests/fixtures/languages/yaml.yaml"),
+];

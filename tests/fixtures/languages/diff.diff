@@ -1,0 +1,14 @@
+diff --git a/README.md b/README.md
+index 1111111..2222222 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,8 @@
+ # Project
+
+-Old paragraph with stale instructions.
++New paragraph with current instructions.
++Additional line for the fixture.
+
+ ## Usage
+-run old-command
++run new-command

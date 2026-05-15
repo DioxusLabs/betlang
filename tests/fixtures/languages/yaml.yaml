@@ -1,0 +1,15 @@
+name: betlang-fixture
+version: 0.0.1
+languages:
+  - slug: rust
+    probability: 0.75
+  - slug: python
+    probability: 0.20
+  - slug: javascript
+    probability: 0.05
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test

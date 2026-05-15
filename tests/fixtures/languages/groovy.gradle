@@ -1,0 +1,22 @@
+plugins {
+    id 'java-library'
+    id 'groovy'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation localGroovy()
+    testImplementation 'org.spockframework:spock-core:2.4-M1-groovy-4.0'
+}
+
+tasks.register('printLanguages') {
+    group = 'verification'
+    doLast {
+        ['groovy', 'gradle'].each { name ->
+            println "language=${name}"
+        }
+    }
+}

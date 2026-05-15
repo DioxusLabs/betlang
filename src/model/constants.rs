@@ -20,6 +20,7 @@ pub(crate) const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 pub(crate) const DENSE: usize = 160;
 pub(crate) const CLASSES: usize = 67;
 
+#[allow(clippy::excessive_precision)]
 pub(crate) const MODEL_WEIGHT_SCALES: [f32; 6] = [
     0.162_534_645_625_523_17,
     0.180_766_612_291_336_06,

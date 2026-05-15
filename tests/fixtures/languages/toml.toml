@@ -1,0 +1,16 @@
+[package]
+name = "betlang-fixture"
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+
+[[bin]]
+name = "fixture"
+path = "src/main.rs"
