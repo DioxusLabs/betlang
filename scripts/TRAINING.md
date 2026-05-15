@@ -1,9 +1,9 @@
 # Training the betlang wordseq student model
 
-The model shipped in `assets/magika/source-student-q4.bin` is a 49.94 KB
+The model shipped in `assets/magika/source-student-q4.bin` is a 102,793-byte
 quantized wordseq student trained on the Magika v3.3 teacher's predictions
 over a ~440k-file source-language corpus. It uses the v3 word-unit tokenizer
-and hits **0.951446 fs_accuracy** on an 81k held-out test set.
+and hits **0.962517 fs_accuracy** on an 81k held-out test set.
 
 ## Files
 
@@ -18,7 +18,7 @@ and hits **0.951446 fs_accuracy** on an 81k held-out test set.
 ## Recipe (frozen in `train_v2_student.py`)
 
 ```
-arch:           wordseq-b1024-k3-m2048-tiny-3conv-hidden
+arch:           wordseq-b1536-k3-m2048-med-3conv-hidden
 unit_tokenizer: 3  (v2 punct/digit compression + case-folded words + isolated brackets)
 length_buckets: yes
 hard_loss_weight: 0.5    (cache labels.mmap = teacher argmax)
@@ -87,14 +87,14 @@ weaker but simpler training; expect ~1 pp accuracy hit.
 python3 scripts/eval_50kb_model.py \
   --checkpoint assets/magika/source-student-q4.bin \
   --cache-dir /path/to/cache \
-  --architecture wordseq-b1024-k3-m2048-tiny-3conv-hidden \
+  --architecture wordseq-b1536-k3-m2048-med-3conv-hidden \
   --split test
 ```
 
 Expected output:
 ```
-test_teacher_parity=0.956339
-test_fs_accuracy=0.951446
+test_teacher_parity=0.967618
+test_fs_accuracy=0.962517
 ```
 
 `test_teacher_parity` is fraction matching the cache's `labels.mmap`
@@ -115,7 +115,7 @@ python3 scripts/train_magika_qat_student.py \
   --magika-model /path/to/magika/standard_v3_3/model.onnx \
   --magika-config /path/to/magika/standard_v3_3/config.min.json \
   --output assets/magika/source-student-q4.bin \
-  --architecture wordseq-b1024-k3-m2048-tiny-3conv-hidden \
+  --architecture wordseq-b1536-k3-m2048-med-3conv-hidden \
   --unit-tokenizer 4 \
   --length-buckets \
   --short-slice-prob 0.5 \

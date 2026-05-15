@@ -8,7 +8,10 @@ fn bench_detect(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("detect");
     for (name, source) in [("short", short), ("full_window", full.as_str())] {
-        assert_eq!(betlang::detect(source), Some(betlang::Language::Rust));
+        assert_eq!(
+            betlang::detect(source).language(),
+            Some(betlang::Language::Rust)
+        );
         group.throughput(Throughput::BytesDecimal(source.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), source, |b, source| {
             b.iter(|| black_box(betlang::detect(black_box(source))));

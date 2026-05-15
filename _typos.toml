@@ -1,0 +1,7 @@
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "assets/**",
+    "reports/**",
+    "target/**",
+]

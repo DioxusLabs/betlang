@@ -1,6 +1,6 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-use betlang::{Language, detect};
+use betlang::{Detection, Language, detect};
 use std::sync::OnceLock;
 
 const RUST_SOURCE: &str = include_str!("../snippets/demo.rs");
@@ -8,7 +8,7 @@ const FULL_WINDOW_SIZE: usize = 4_608;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn detect_empty_smoke() -> i32 {
-    i32::from(detect("  \n\t  ").is_some())
+    i32::from(detect("  \n\t  ").language().is_some())
 }
 
 #[unsafe(no_mangle)]
@@ -44,7 +44,7 @@ pub extern "C" fn detect_full_window_bench(iterations: u32) -> u32 {
 fn detect_bench(source: &'static str, iterations: u32) -> u32 {
     let mut detected = 0;
     for _ in 0..iterations {
-        if detect(std::hint::black_box(source)) == Some(Language::Rust) {
+        if top_language(&detect(std::hint::black_box(source))) == Some(Language::Rust) {
             detected += 1;
         }
     }
@@ -65,12 +65,16 @@ fn full_window_source() -> &'static str {
         .as_str()
 }
 
-fn language_status(result: Option<Language>, expected: Language) -> i32 {
-    match result {
+fn language_status(result: Detection, expected: Language) -> i32 {
+    match top_language(&result) {
         Some(language) if language == expected && !language.slug().is_empty() => 0,
         Some(_) => 2,
         None => 1,
     }
+}
+
+fn top_language(result: &Detection) -> Option<Language> {
+    result.language()
 }
 
 #[cfg(not(target_arch = "wasm32"))]

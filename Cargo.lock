@@ -74,6 +74,8 @@ dependencies = [
  "criterion",
  "fearless_simd",
  "ignore",
+ "serde_json",
+ "sha2",
  "wasmtime",
 ]
 

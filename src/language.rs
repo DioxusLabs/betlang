@@ -1,4 +1,36 @@
+use std::{error::Error, fmt, str::FromStr};
+
+/// Error returned when parsing a [`Language`] from an unknown slug.
+///
+/// ```
+/// let error = "not-a-language"
+///     .parse::<betlang::Language>()
+///     .unwrap_err();
+///
+/// assert_eq!(error.to_string(), "unknown betlang language slug");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseLanguageError;
+
+impl fmt::Display for ParseLanguageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown betlang language slug")
+    }
+}
+
+impl Error for ParseLanguageError {}
+
 /// Source language predicted by the embedded Magika student model.
+///
+/// Languages parse from their public slugs with [`str::parse`].
+///
+/// ```
+/// let language = "rust".parse::<betlang::Language>()?;
+///
+/// assert_eq!(language, betlang::Language::Rust);
+/// assert_eq!(language.slug(), "rust");
+/// # Ok::<(), betlang::ParseLanguageError>(())
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Language {
@@ -124,6 +156,10 @@ pub enum Language {
 
 impl Language {
     /// Arborium/tree-sitter language slug for this detected language.
+    ///
+    /// ```
+    /// assert_eq!(betlang::Language::Rust.slug(), "rust");
+    /// ```
     pub const fn slug(self) -> &'static str {
         match self {
             Self::Asm => "asm",
@@ -186,6 +222,81 @@ impl Language {
             Self::Yaml => "yaml",
             Self::Zig => "zig",
         }
+    }
+}
+
+/// Parses a [`Language`] from its public slug.
+///
+/// ```
+/// assert_eq!("rust".parse::<betlang::Language>()?, betlang::Language::Rust);
+/// # Ok::<(), betlang::ParseLanguageError>(())
+/// ```
+impl FromStr for Language {
+    type Err = ParseLanguageError;
+
+    fn from_str(slug: &str) -> Result<Self, Self::Err> {
+        Ok(match slug {
+            "asm" => Self::Asm,
+            "awk" => Self::Awk,
+            "batch" => Self::Batch,
+            "bash" => Self::Bash,
+            "c" => Self::C,
+            "c-sharp" => Self::CSharp,
+            "clojure" => Self::Clojure,
+            "cmake" => Self::CMake,
+            "cobol" => Self::Cobol,
+            "commonlisp" => Self::CommonLisp,
+            "cpp" => Self::Cpp,
+            "css" => Self::Css,
+            "dart" => Self::Dart,
+            "diff" => Self::Diff,
+            "dockerfile" => Self::Dockerfile,
+            "elixir" => Self::Elixir,
+            "erlang" => Self::Erlang,
+            "go" => Self::Go,
+            "groovy" => Self::Groovy,
+            "haskell" => Self::Haskell,
+            "hcl" => Self::Hcl,
+            "html" => Self::Html,
+            "ini" => Self::Ini,
+            "java" => Self::Java,
+            "javascript" => Self::JavaScript,
+            "jinja2" => Self::Jinja2,
+            "json" => Self::Json,
+            "julia" => Self::Julia,
+            "kotlin" => Self::Kotlin,
+            "lua" => Self::Lua,
+            "markdown" => Self::Markdown,
+            "matlab" => Self::Matlab,
+            "objc" => Self::ObjectiveC,
+            "ocaml" => Self::Ocaml,
+            "perl" => Self::Perl,
+            "php" => Self::Php,
+            "postscript" => Self::Postscript,
+            "powershell" => Self::Powershell,
+            "prolog" => Self::Prolog,
+            "python" => Self::Python,
+            "r" => Self::R,
+            "ruby" => Self::Ruby,
+            "rust" => Self::Rust,
+            "scala" => Self::Scala,
+            "scss" => Self::Scss,
+            "solidity" => Self::Solidity,
+            "sql" => Self::Sql,
+            "starlark" => Self::Starlark,
+            "swift" => Self::Swift,
+            "textproto" => Self::TextProto,
+            "toml" => Self::Toml,
+            "typescript" => Self::TypeScript,
+            "vb" => Self::Vb,
+            "verilog" => Self::Verilog,
+            "vhdl" => Self::Vhdl,
+            "vue" => Self::Vue,
+            "xml" => Self::Xml,
+            "yaml" => Self::Yaml,
+            "zig" => Self::Zig,
+            _ => return Err(ParseLanguageError),
+        })
     }
 }
 
@@ -258,3 +369,85 @@ pub(crate) const CLASS_LANGUAGES: [Language; 67] = [
     Language::Yaml,
     Language::Zig,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const PUBLIC_LANGUAGES: [Language; 59] = [
+        Language::Asm,
+        Language::Awk,
+        Language::Batch,
+        Language::Bash,
+        Language::C,
+        Language::CSharp,
+        Language::Clojure,
+        Language::CMake,
+        Language::Cobol,
+        Language::CommonLisp,
+        Language::Cpp,
+        Language::Css,
+        Language::Dart,
+        Language::Diff,
+        Language::Dockerfile,
+        Language::Elixir,
+        Language::Erlang,
+        Language::Go,
+        Language::Groovy,
+        Language::Haskell,
+        Language::Hcl,
+        Language::Html,
+        Language::Ini,
+        Language::Java,
+        Language::JavaScript,
+        Language::Jinja2,
+        Language::Json,
+        Language::Julia,
+        Language::Kotlin,
+        Language::Lua,
+        Language::Markdown,
+        Language::Matlab,
+        Language::ObjectiveC,
+        Language::Ocaml,
+        Language::Perl,
+        Language::Php,
+        Language::Postscript,
+        Language::Powershell,
+        Language::Prolog,
+        Language::Python,
+        Language::R,
+        Language::Ruby,
+        Language::Rust,
+        Language::Scala,
+        Language::Scss,
+        Language::Solidity,
+        Language::Sql,
+        Language::Starlark,
+        Language::Swift,
+        Language::TextProto,
+        Language::Toml,
+        Language::TypeScript,
+        Language::Vb,
+        Language::Verilog,
+        Language::Vhdl,
+        Language::Vue,
+        Language::Xml,
+        Language::Yaml,
+        Language::Zig,
+    ];
+
+    #[test]
+    fn public_languages_have_unique_slugs_and_roundtrip() {
+        let mut slugs = HashSet::new();
+        for language in PUBLIC_LANGUAGES {
+            assert!(
+                slugs.insert(language.slug()),
+                "duplicate slug {}",
+                language.slug()
+            );
+            assert_eq!(language.slug().parse::<Language>(), Ok(language));
+        }
+        assert_eq!("unknown".parse::<Language>(), Err(ParseLanguageError));
+    }
+}

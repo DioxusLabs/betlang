@@ -2,18 +2,18 @@
 """Standalone training driver for the current betlang source-student model.
 
 This wraps the canonical recipe that produced `assets/magika/source-student-q4.bin`
-(49.94 KB, ~0.951 fs_accuracy on bigorig-500k 81k test split). It shells out to
+(102,793 bytes, ~0.963 fs_accuracy on bigorig-500k 81k test split). It shells out to
 the bigger `train_magika_qat_student.py` trainer with a frozen, well-justified
 hyperparameter set and prints the final metrics.
 
 Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
 
-  Architecture       wordseq-b1024-k3-m2048-tiny-3conv-hidden (~50 KB exported)
-                     - K=3 HashEmbedding (1024 bins x 24 dim, 4-bit) ~12 KB
-                     - 3 conv stages (64 → 128 → 128 ch, 2-bit) with
+  Architecture       wordseq-b1536-k3-m2048-med-3conv-hidden (~100 KB exported)
+                     - K=3 HashEmbedding (1536 bins x 28 dim, 4-bit) ~21 KB
+                     - 3 conv stages (96 → 192 → 192 ch, 2-bit) with
                        MaxPool(4) then MaxPool(2)
-                     - Dense 96 (2-bit) → output 67 (4-bit)
-                     - Best 50 KB tier from the from-scratch sweep on bigorig-500k.
+                     - Dense 160 (2-bit) → output 67 (4-bit)
+                     - Best accuracy/size tradeoff from the production sweep on bigorig-500k.
 
   Cache              /tmp/magika-source-qat-cache-bigorig-500k
                      - 437,778 train / 53,420 valid / 81,744 test
@@ -33,9 +33,9 @@ Recipe rationale (sources: docs/wordseq-handoff.md, prior session memory):
   Throughput         length-buckets ~2x; mixed-precision.
 
 Final results (bigorig-500k):
-  test_teacher_parity 0.956339 (matching the big-3conv teacher)
-  test_fs_accuracy    0.951446 (matching file-extension truth)
-  exported size       49.94 KB
+  test_teacher_parity 0.967618 (matching the big-3conv teacher)
+  test_fs_accuracy    0.962517 (matching file-extension truth)
+  exported size       102,793 bytes
 
 Usage:
     python scripts/train_v2_student.py                  # default: bigorig-500k cache
@@ -65,10 +65,10 @@ DEFAULTS = {
     "self_probabilities": "/tmp/magika-source-qat-cache-bigorig-500k",
     "output": str(REPO_ROOT / "assets" / "magika" / "source-student-q4.bin"),
     "confusion_output": str(REPO_ROOT / "assets" / "magika" / "source-student-q4-confusion.json"),
-    "max_export_bytes": 51200,
+    "max_export_bytes": 110000,
 }
 
-ARCHITECTURE = "wordseq-b1024-k3-m2048-tiny-3conv-hidden"
+ARCHITECTURE = "wordseq-b1536-k3-m2048-med-3conv-hidden"
 
 
 def build_cmd(a: argparse.Namespace) -> list[str]:

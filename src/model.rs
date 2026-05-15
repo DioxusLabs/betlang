@@ -3,7 +3,7 @@
 //! Loads `assets/magika/source-student-q4.bin` (~100 KB MSQ1 export) and
 //! runs a forward pass: byte-window tokenization → word-unit tokenization
 //! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
-//! max+avg pool → 2 dense layers → 67-class softmax logits.
+//! max+avg pool → 2 dense layers → 67-class logits.
 //!
 //! Model architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`
 //! - 1536-bin × 28-dim shared HashEmbedding table (4-bit, ~21 KB)
@@ -15,11 +15,8 @@
 //! - GlobalMax ⊕ GlobalAvg → 384-dim
 //! - QDense 384→160 (2-bit) + GELU
 //! - QDense 160→67 (4-bit)
-//!
-//! Convolution hot paths use `fearless_simd` with scalar fallbacks for
-//! edges and out-channel counts not divisible by 16.
 
-use crate::language::{CLASS_LANGUAGES, Language};
+use crate::{Detection, Language, language::CLASS_LANGUAGES};
 use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::sync::OnceLock;
 
@@ -52,7 +49,6 @@ const CONV2: usize = 192;
 const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 const DENSE: usize = 160;
 pub(crate) const CLASSES: usize = 67;
-const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
 
 // v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
 const WORD_MASK: u32 = 0x00FF_FFFF;
@@ -176,15 +172,25 @@ impl Model {
         // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
         //    ~524 KB intermediate buffer and the second read pass.
         let (pool0, t1) = conv_gelu_maxpool(
-            &embed, t, EMBED,
-            &self.conv0_kernel, CONV0_KERNEL, CONV0, &self.conv0_bias,
+            &embed,
+            t,
+            EMBED,
+            &self.conv0_kernel,
+            CONV0_KERNEL,
+            CONV0,
+            &self.conv0_bias,
             CONV0_POOL,
         );
 
         // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
         let (pool1, t2) = conv_gelu_maxpool(
-            &pool0, t1, CONV0,
-            &self.conv1_kernel, CONV1_KERNEL, CONV1, &self.conv1_bias,
+            &pool0,
+            t1,
+            CONV0,
+            &self.conv1_kernel,
+            CONV1_KERNEL,
+            CONV1,
+            &self.conv1_bias,
             CONV1_POOL,
         );
 
@@ -193,21 +199,37 @@ impl Model {
         let mut pooled = [0.0f32; POOLED];
         let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
         conv_gelu_global_pool(
-            &pool1, t2, CONV1,
-            &self.conv2_kernel, CONV2_KERNEL, CONV2, &self.conv2_bias,
-            max_slice, avg_slice,
+            &pool1,
+            t2,
+            CONV1,
+            &self.conv2_kernel,
+            CONV2_KERNEL,
+            CONV2,
+            &self.conv2_bias,
+            max_slice,
+            avg_slice,
         );
 
         // 5) Dense 384→160 + GELU
         let mut dense0_out = [0.0f32; DENSE];
-        dense_forward(&pooled, &self.dense0_kernel, &self.dense0_bias, &mut dense0_out);
+        dense_forward(
+            &pooled,
+            &self.dense0_kernel,
+            &self.dense0_bias,
+            &mut dense0_out,
+        );
         for v in &mut dense0_out {
             *v = gelu(*v);
         }
 
         // 6) Dense 160→67 → logits
         let mut logits = [0.0f32; CLASSES];
-        dense_forward(&dense0_out, &self.output_kernel, &self.output_bias, &mut logits);
+        dense_forward(
+            &dense0_out,
+            &self.output_kernel,
+            &self.output_bias,
+            &mut logits,
+        );
         logits
     }
 
@@ -257,14 +279,15 @@ fn hash_bin(unit: u32, head: usize) -> usize {
 /// starting at `t_base`. Accumulates into `accs` (`BLOCK * out_channels` long).
 ///
 /// `kernel` is `[k][in_c][out_c]` with the inner row contiguous over
-/// out_channels; both scalar and SIMD paths read it directly.
+/// out_channels.
 ///
 /// BLOCK=4 + all positions in-bounds → SIMD fast path. When out_channels
 /// is a multiple of 16, the group-16 kernel keeps 16 `f32x4` accumulators
 /// register-resident across the full (k, in_c) inner loop; otherwise a
 /// chunk-inner SIMD path with 4 named acc rows is used.
-/// Edges / BLOCK != 4 → scalar fallback.
+/// Edges and partial blocks use the plain f32 path in this kernel.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv1d_block<S: Simd, const BLOCK: usize>(
     simd: S,
     input: &[f32],
@@ -278,21 +301,29 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
     accs: &mut [f32],
 ) {
     debug_assert_eq!(accs.len(), BLOCK * out_channels);
-    debug_assert_eq!(out_channels % 4, 0);
+    debug_assert!(out_channels.is_multiple_of(4));
     let pad = (kernel_size - 1) / 2;
     if BLOCK == 4 {
         let all_in_bounds =
             t_base >= pad && t_base + 4 + (kernel_size - 1).saturating_sub(pad) <= seq_len;
         if all_in_bounds {
             conv1d_block4_simd_inner(
-                simd, input, in_channels, kernel, kernel_size,
-                out_channels, bias, t_base, pad, accs,
+                simd,
+                input,
+                in_channels,
+                kernel,
+                kernel_size,
+                out_channels,
+                bias,
+                t_base,
+                pad,
+                accs,
             );
             return;
         }
     }
-    // Scalar fallback (BLOCK != 4 OR sequence edge). Uses the original layout
-    // where the inner kernel row is contiguous.
+    // Edge/partial-block path. Uses the original layout where the inner kernel
+    // row is contiguous.
     for s in 0..BLOCK {
         accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
     }
@@ -334,6 +365,7 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
 /// chunk-inner inner pattern, kernel and input reads stay cache-sequential
 /// while the per-iter accs load/store traffic is eliminated.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv1d_block4_simd_inner<S: Simd>(
     simd: S,
     input: &[f32],
@@ -347,14 +379,22 @@ fn conv1d_block4_simd_inner<S: Simd>(
     accs: &mut [f32],
 ) {
     const GROUP: usize = 16;
-    if out_channels % GROUP == 0 {
+    if out_channels.is_multiple_of(GROUP) {
         conv1d_block4_group16::<S>(
-            simd, input, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, pad, accs,
+            simd,
+            input,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            pad,
+            accs,
         );
         return;
     }
-    // Fallback for out_channels not a multiple of 16: chunk-inner SIMD.
+    // Chunk-inner SIMD path for out_channels not a multiple of 16.
     for s in 0..4 {
         accs[s * out_channels..(s + 1) * out_channels].copy_from_slice(bias);
     }
@@ -374,7 +414,8 @@ fn conv1d_block4_simd_inner<S: Simd>(
             let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
             let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
             let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
-            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow.chunks_exact(4)
+            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow
+                .chunks_exact(4)
                 .zip(a0.chunks_exact_mut(4))
                 .zip(a1.chunks_exact_mut(4))
                 .zip(a2.chunks_exact_mut(4))
@@ -401,6 +442,7 @@ fn conv1d_block4_simd_inner<S: Simd>(
 /// Per (k, in_c) iter: 4 kernel f32x4 loads + 4 broadcast x loads + 16 FMAs.
 /// All 16 accumulators stay register-resident — no per-iter accs load/store.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv1d_block4_group16<S: Simd>(
     simd: S,
     input: &[f32],
@@ -484,6 +526,7 @@ fn conv1d_block4_group16<S: Simd>(
 /// Fused conv1d (SAME pad) + GELU + MaxPool(pool).
 /// Always accumulates BLOCK=4 consecutive conv positions per outer iteration
 /// (max NEON-friendly krow reuse), then applies POOL-wide maxpool over them.
+#[allow(clippy::too_many_arguments)]
 fn conv_gelu_maxpool(
     input: &[f32],
     seq_len: usize,
@@ -505,6 +548,7 @@ fn conv_gelu_maxpool(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv_gelu_maxpool_simd<S: Simd>(
     simd: S,
     input: &[f32],
@@ -520,21 +564,46 @@ fn conv_gelu_maxpool_simd<S: Simd>(
 ) {
     match pool {
         4 => conv_gelu_maxpool_run::<S, 4, 4>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
         2 => conv_gelu_maxpool_run::<S, 4, 2>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
         _ => conv_gelu_maxpool_run::<S, 1, 1>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
     }
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
     simd: S,
     input: &[f32],
@@ -554,8 +623,16 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
     for tb in 0..block_count {
         let t_base = tb * BLOCK;
         conv1d_block::<S, BLOCK>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, &mut accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            &mut accs,
         );
         for op in 0..outs_per_block {
             let pooled_idx = tb * outs_per_block + op;
@@ -584,8 +661,16 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
         for tp in processed..pooled_len {
             let t_base = tp * POOL;
             conv1d_block::<S, POOL>(
-                simd, input, seq_len, in_channels, kernel, kernel_size,
-                out_channels, bias, t_base, &mut tail_accs,
+                simd,
+                input,
+                seq_len,
+                in_channels,
+                kernel,
+                kernel_size,
+                out_channels,
+                bias,
+                t_base,
+                &mut tail_accs,
             );
             let dst = &mut out[tp * out_channels..(tp + 1) * out_channels];
             let first = &tail_accs[..out_channels];
@@ -609,6 +694,7 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
 /// Fused conv1d (SAME pad) + GELU + (GlobalMax || GlobalAvg) pool.
 /// Writes max into `out_max` and average into `out_avg` (each `out_channels` long).
 /// Processes T_BLOCK=4 positions per outer iteration to reuse kernel rows.
+#[allow(clippy::too_many_arguments)]
 fn conv_gelu_global_pool(
     input: &[f32],
     seq_len: usize,
@@ -633,6 +719,7 @@ fn conv_gelu_global_pool(
 }
 
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn conv_gelu_global_pool_simd<S: Simd>(
     simd: S,
     input: &[f32],
@@ -651,8 +738,16 @@ fn conv_gelu_global_pool_simd<S: Simd>(
     for tb in 0..block_count {
         let t_base = tb * T_BLOCK;
         conv1d_block::<S, T_BLOCK>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, &mut accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            &mut accs,
         );
         for s in 0..T_BLOCK {
             let acc = &accs[s * out_channels..(s + 1) * out_channels];
@@ -673,8 +768,16 @@ fn conv_gelu_global_pool_simd<S: Simd>(
     let mut tail_accs = vec![0.0f32; out_channels];
     for t in (block_count * T_BLOCK)..seq_len {
         conv1d_block::<S, 1>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t, &mut tail_accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t,
+            &mut tail_accs,
         );
         for ((mx_c, av_c), a_c) in out_max
             .chunks_exact_mut(4)
@@ -712,7 +815,7 @@ fn dense_forward(input: &[f32], kernel: &[f32], bias: &[f32], out: &mut [f32]) {
 fn gelu(x: f32) -> f32 {
     // Tanh-form GELU (Hendrycks & Gimpel), matching how the student was trained.
     // 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-    0.5 * x * (1.0 + tanh_approx(0.797_884_56 * (x + 0.044_715 * x * x * x)))
+    0.5 * x * (1.0 + tanh_approx(0.797_884_6 * (x + 0.044_715 * x * x * x)))
 }
 
 /// [7/6] Padé approximation of tanh, accurate to ~1e-6 over the clamped range.
@@ -730,7 +833,7 @@ fn tanh_approx(x: f32) -> f32 {
 fn gelu_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
     let half = f32x4::splat(simd, 0.5);
     let one = f32x4::splat(simd, 1.0);
-    let c1 = f32x4::splat(simd, 0.797_884_56);
+    let c1 = f32x4::splat(simd, 0.797_884_6);
     let c2 = f32x4::splat(simd, 0.044_715);
     let x2 = x * x;
     let x3 = x * x2;
@@ -803,16 +906,16 @@ fn read_ternary_dequant(cursor: &mut usize, count: usize, scale: f32) -> Vec<f32
 
 fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
     let mut out = [0.0; N];
-    for i in 0..N {
+    for (i, value) in out.iter_mut().enumerate() {
         let off = *cursor + i * 4;
-        out[i] = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
+        *value = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
     }
     *cursor += N * 4;
     out
 }
 
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle).map(|i| i)
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 fn parse_scales(metadata: &str) -> Vec<f32> {
@@ -824,7 +927,11 @@ fn parse_scales(metadata: &str) -> Vec<f32> {
             .find([',', '}'])
             .map(|e| value_start + e)
             .expect("scale terminator");
-        scales.push(rest[value_start..value_end].parse::<f32>().expect("scale parse"));
+        scales.push(
+            rest[value_start..value_end]
+                .parse::<f32>()
+                .expect("scale parse"),
+        );
         rest = &rest[value_end..];
     }
     scales
@@ -840,7 +947,9 @@ fn parse_tokenizer_version(metadata: &str) -> TokenizerVersion {
         2 => TokenizerVersion::V2,
         3 => TokenizerVersion::V3,
         4 => TokenizerVersion::V4,
-        other => panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4"),
+        other => {
+            panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4")
+        }
     }
 }
 
@@ -848,7 +957,9 @@ fn parse_usize_field(metadata: &str, field: &str) -> Option<usize> {
     let key = format!(r#""{field}""#);
     let after_key = &metadata[metadata.find(&key)? + key.len()..];
     let rest = after_key[after_key.find(':')? + 1..].trim_start();
-    let end = rest.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
@@ -919,10 +1030,8 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             break;
         }
 
-        let is_letter = (b'a'..=b'z').contains(&value)
-            || (b'A'..=b'Z').contains(&value)
-            || value == b'_';
-        let is_digit = (b'0'..=b'9').contains(&value);
+        let is_letter = value.is_ascii_alphabetic() || value == b'_';
+        let is_digit = value.is_ascii_digit();
         let is_newline = value == b'\n';
         let is_cr = value == b'\r';
         let is_space = value == b' ' || value == b'\t';
@@ -933,12 +1042,8 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
         if !(is_digit || value == b'.') {
             flush_number(&mut number, &mut out);
         }
-        let need_flush_punct = is_letter
-            || is_digit
-            || is_space
-            || is_newline
-            || is_cr
-            || value == b'.';
+        let need_flush_punct =
+            is_letter || is_digit || is_space || is_newline || is_cr || value == b'.';
         if need_flush_punct {
             flush_punct(&mut punct, &mut out);
         }
@@ -1207,7 +1312,7 @@ fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             flush_hashed(&mut word, &mut out, 0, style);
             word_had_upper = false;
         }
-        if !(is_digit || value == b'.') && !number.is_empty() {
+        if !(is_digit || value == b'.' || number.is_empty()) {
             flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
         }
         let need_flush_punct = is_letter
@@ -1318,7 +1423,10 @@ fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
 }
 
 fn trim_start_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
     &bytes[start..]
 }
 
@@ -1367,56 +1475,129 @@ fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
 // Public API
 // ============================================================================
 
-/// Detect the source language for a source string.
-///
-/// Returns `Some(Language)` when the model's top class clearly outranks the
-/// runner-up, otherwise `None`.
-pub fn detect(source: &str) -> Option<Language> {
-    let (bytes, pad) = build_window(source.as_bytes())?;
+pub(crate) fn detect_bytes(source: &[u8]) -> Detection {
+    let Some((bytes, pad)) = build_window(source) else {
+        return Detection::from_predictions(Vec::new());
+    };
     let model = Model::get();
     let units = model.tokenize_units(&bytes, &pad);
     let logits = model.logits_for_runtime_units(&units);
-    let class_index = reliable_class_from_logits(&logits)?;
-    Some(CLASS_LANGUAGES[class_index])
+    detection_from_logits(&logits)
 }
 
-fn reliable_class_from_logits(logits: &[f32; CLASSES]) -> Option<usize> {
-    let (class_index, top, runner_up) = top_two_logits(logits)?;
-    if top - runner_up >= RELIABLE_LOGIT_MARGIN {
-        return Some(class_index);
+fn detection_from_logits(logits: &[f32; CLASSES]) -> Detection {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return Detection::from_predictions(Vec::new());
     }
-    let mut sum = 0.0;
-    let mut sum_squares = 0.0;
+
     for &logit in logits {
-        let value = (logit - top).exp();
-        sum += value;
-        sum_squares += value * value;
+        debug_assert!(logit.is_finite());
     }
-    let probability = 1.0 / sum;
-    let mean = 1.0 / CLASSES as f32;
-    let variance = ((sum_squares / (sum * sum)) - mean).max(0.0) / (CLASSES - 1) as f32;
-    (probability > mean + 2.0 * variance.sqrt()).then_some(class_index)
-}
 
-fn top_two_logits(logits: &[f32; CLASSES]) -> Option<(usize, f32, f32)> {
-    let mut top = f32::NEG_INFINITY;
-    let mut runner_up = f32::NEG_INFINITY;
-    let mut class_index = 0;
-    for (index, &logit) in logits.iter().enumerate() {
-        if logit >= top {
-            runner_up = top;
-            top = logit;
-            class_index = index;
-        } else if logit > runner_up {
-            runner_up = logit;
+    let denominator: f32 = logits.iter().map(|logit| (logit - max).exp()).sum();
+    if !denominator.is_finite() || denominator == 0.0 {
+        return Detection::from_predictions(Vec::new());
+    }
+
+    let mut predictions: Vec<(f32, Language)> = Vec::new();
+    for (&logit, &language) in logits.iter().zip(CLASS_LANGUAGES.iter()) {
+        let probability = (logit - max).exp() / denominator;
+        if let Some((existing, _)) = predictions
+            .iter_mut()
+            .find(|(_, existing_language)| *existing_language == language)
+        {
+            *existing += probability;
+        } else {
+            predictions.push((probability, language));
         }
     }
-    top.is_finite().then_some((class_index, top, runner_up))
+
+    predictions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.slug().cmp(b.1.slug())));
+    Detection::from_predictions(predictions)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Language;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    const EXPECTED_MODEL_SHA256: &str =
+        "52be89bef15515aa93ae924e76d17d72b3943f50ceda8aa9e1c3834f27f8e883";
+    const EXPECTED_MODEL_LEN: usize = 102_793;
+    const EXPECTED_METADATA_START: usize = 100_456;
+    const EXPECTED_METADATA_LEN: usize = 2_337;
+    const EXPECTED_LABELS: [&str; CLASSES] = [
+        "asm",
+        "awk",
+        "batch",
+        "bazel",
+        "c",
+        "clojure",
+        "cmake",
+        "cobol",
+        "cpp",
+        "cs",
+        "csproj",
+        "css",
+        "dart",
+        "diff",
+        "dockerfile",
+        "elixir",
+        "erb",
+        "erlang",
+        "gemfile",
+        "gemspec",
+        "go",
+        "gradle",
+        "groovy",
+        "haskell",
+        "hcl",
+        "html",
+        "ini",
+        "ipynb",
+        "java",
+        "javascript",
+        "jinja",
+        "json",
+        "jsonl",
+        "julia",
+        "kotlin",
+        "lisp",
+        "lua",
+        "markdown",
+        "matlab",
+        "objectivec",
+        "ocaml",
+        "perl",
+        "php",
+        "postscript",
+        "powershell",
+        "prolog",
+        "python",
+        "r",
+        "ruby",
+        "rust",
+        "scala",
+        "scss",
+        "shell",
+        "solidity",
+        "sql",
+        "swift",
+        "textproto",
+        "toml",
+        "typescript",
+        "vba",
+        "vcxproj",
+        "verilog",
+        "vhdl",
+        "vue",
+        "xml",
+        "yaml",
+        "zig",
+    ];
 
     #[test]
     fn loads_embedded_model() {
@@ -1427,8 +1608,105 @@ mod tests {
     }
 
     #[test]
+    fn embedded_model_asset_matches_expected_contract() {
+        assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC));
+        assert_eq!(MODEL_BYTES.len(), EXPECTED_MODEL_LEN);
+
+        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).unwrap();
+        assert_eq!(metadata_start, EXPECTED_METADATA_START);
+        let metadata_len = u32::from_le_bytes(
+            MODEL_BYTES[metadata_start - 4..metadata_start]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        assert_eq!(metadata_len, EXPECTED_METADATA_LEN);
+        assert_eq!(metadata_len, MODEL_BYTES.len() - metadata_start);
+
+        let digest = Sha256::digest(MODEL_BYTES);
+        assert_eq!(format!("{digest:x}"), EXPECTED_MODEL_SHA256);
+    }
+
+    #[test]
+    fn embedded_model_metadata_matches_runtime_mapping() {
+        let metadata = model_metadata_json();
+        assert_eq!(metadata["bits"], 4);
+        assert_eq!(metadata["token_length"], MAX_UNITS);
+        assert_eq!(
+            metadata["architecture"],
+            "wordseq-b1536-k3-m2048-med-3conv-hidden"
+        );
+        assert_eq!(metadata["tokenizer_version"], 3);
+
+        let labels = string_array(&metadata["labels"]);
+        assert_eq!(labels, EXPECTED_LABELS);
+
+        let slugs = string_array(&metadata["slugs"]);
+        assert_eq!(slugs.len(), CLASS_LANGUAGES.len());
+        for (slug, language) in slugs.iter().zip(CLASS_LANGUAGES) {
+            assert_eq!(*slug, language.slug());
+        }
+
+        assert_eq!(CLASS_LANGUAGES[3], Language::Starlark); // bazel
+        assert_eq!(CLASS_LANGUAGES[10], Language::Xml); // csproj
+        assert_eq!(CLASS_LANGUAGES[16], Language::Ruby); // erb
+        assert_eq!(CLASS_LANGUAGES[18], Language::Ruby); // gemfile
+        assert_eq!(CLASS_LANGUAGES[19], Language::Ruby); // gemspec
+        assert_eq!(CLASS_LANGUAGES[32], Language::Json); // jsonl
+        assert_eq!(CLASS_LANGUAGES[52], Language::Bash); // shell
+        assert_eq!(CLASS_LANGUAGES[59], Language::Vb); // vba
+        assert_eq!(CLASS_LANGUAGES[60], Language::Xml); // vcxproj
+    }
+
+    #[test]
+    fn embedded_model_tensor_shapes_match_runtime_constants() {
+        let metadata = model_metadata_json();
+        let layers = metadata["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 6);
+
+        assert_layer(&layers[0], "q_hash_embedding", &[BINS, EMBED], 21_504, None);
+        assert_layer(
+            &layers[1],
+            "q_conv_0",
+            &[CONV0_KERNEL, EMBED, CONV0],
+            4_704,
+            Some((&[CONV0][..], CONV0 * 4)),
+        );
+        assert_layer(
+            &layers[2],
+            "q_conv_1",
+            &[CONV1_KERNEL, CONV0, CONV1],
+            23_040,
+            Some((&[CONV1][..], CONV1 * 4)),
+        );
+        assert_layer(
+            &layers[3],
+            "q_conv_2",
+            &[CONV2_KERNEL, CONV1, CONV2],
+            27_648,
+            Some((&[CONV2][..], CONV2 * 4)),
+        );
+        assert_layer(
+            &layers[4],
+            "q_dense_0",
+            &[POOLED, DENSE],
+            15_360,
+            Some((&[DENSE][..], DENSE * 4)),
+        );
+        assert_layer(
+            &layers[5],
+            "q_output",
+            &[DENSE, CLASSES],
+            5_360,
+            Some((&[CLASSES][..], CLASSES * 4)),
+        );
+    }
+
+    #[test]
     fn tokenizer_version_defaults_legacy_checkpoints_to_v2() {
-        assert_eq!(parse_tokenizer_version(r#"{"bits":4}"#), TokenizerVersion::V2);
+        assert_eq!(
+            parse_tokenizer_version(r#"{"bits":4}"#),
+            TokenizerVersion::V2
+        );
         assert_eq!(
             parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":3}"#),
             TokenizerVersion::V3
@@ -1466,7 +1744,10 @@ mod tests {
             268_435_466,
         ];
 
-        assert_eq!(units[0] as u32, (hash_unit_bytes(b"foo") & WORD_MASK) | STYLE_BIT);
+        assert_eq!(
+            units[0] as u32,
+            (hash_unit_bytes(b"foo") & WORD_MASK) | STYLE_BIT
+        );
         assert_eq!(&units[..expected.len()], &expected);
         assert!(units.contains(&((BRACKET_FLAG | b'{' as u32) as i32)));
         assert!(units.contains(&((STRING_FLAG | b'"' as u32) as i32)));
@@ -1475,20 +1756,94 @@ mod tests {
 
     #[test]
     fn detects_rust_from_source() {
-        let lang = detect("use std::fmt;\nfn main() { println!(\"hi\"); }");
-        assert_eq!(lang, Some(Language::Rust));
+        let detection = crate::detect("use std::fmt;\nfn main() { println!(\"hi\"); }");
+        assert_eq!(top_language(&detection), Some(Language::Rust));
     }
 
     #[test]
     fn detects_python_from_source() {
-        let lang = detect("import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n");
-        assert_eq!(lang, Some(Language::Python));
+        let detection = crate::detect(
+            "import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n",
+        );
+        assert_eq!(top_language(&detection), Some(Language::Python));
     }
 
     #[test]
     fn detects_javascript_from_source() {
-        let lang = detect("const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n");
-        assert_eq!(lang, Some(Language::JavaScript));
+        let detection = crate::detect(
+            "const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n",
+        );
+        assert_eq!(top_language(&detection), Some(Language::JavaScript));
+    }
+
+    #[test]
+    fn golden_predictions_cover_representative_sources() {
+        let fixtures = [
+            (
+                Language::Rust,
+                "use std::fmt;\nfn main() { println!(\"hi\"); }\n",
+            ),
+            (
+                Language::Python,
+                "import pathlib\n\ndef main():\n    print(pathlib.Path.cwd())\n\nif __name__ == '__main__':\n    main()\n",
+            ),
+            (
+                Language::JavaScript,
+                "const greet = (name) => {\n  console.log(`hello ${name}`);\n};\ngreet('world');\n",
+            ),
+            (
+                Language::Json,
+                r#"{"name":"betlang","version":"0.0.1","keywords":["language","detection"]}"#,
+            ),
+            (
+                Language::Toml,
+                "[package]\nname = \"betlang\"\nversion = \"0.0.1\"\nedition = \"2024\"\n",
+            ),
+            (
+                Language::Yaml,
+                "name: ci\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n",
+            ),
+            (
+                Language::Html,
+                "<!doctype html><html><head><title>Betlang</title></head><body><main>Hello</main></body></html>\n",
+            ),
+            (
+                Language::Css,
+                "body {\n  display: grid;\n  grid-template-columns: 1fr;\n  color: #222;\n}\n",
+            ),
+            (
+                Language::Sql,
+                "select users.id, users.email from users where users.active = true order by users.id;\n",
+            ),
+        ];
+
+        for (expected, source) in fixtures {
+            let detection = crate::detect(source);
+            let (probability, language) = detection.predictions[0];
+            assert_eq!(language, expected, "{source}");
+            assert_eq!(language.slug(), expected.slug());
+            assert!(probability > 0.0, "{source}");
+        }
+    }
+
+    #[test]
+    fn detect_bytes_accepts_non_utf8_inputs() {
+        let mut bytes = b"fn main() {\n    println!(\"hello\");\n}\n".to_vec();
+        bytes.extend([0xff, 0xfe]);
+        let detection = crate::detect_bytes(&bytes);
+        assert_eq!(top_language(&detection), Some(Language::Rust));
+    }
+
+    #[test]
+    fn probabilities_sum_to_one_across_public_languages() {
+        let detection = crate::detect("use std::fmt;\nfn main() { println!(\"hi\"); }\n");
+        let sum: f32 = detection
+            .predictions
+            .iter()
+            .map(|(probability, _)| probability)
+            .sum();
+
+        assert!((sum - 1.0).abs() < 1e-5, "{sum}");
     }
 
     #[test]
@@ -1511,13 +1866,60 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_returns_none() {
-        assert_eq!(detect(""), None);
+    fn empty_input_returns_empty_detection() {
+        assert!(crate::detect("").predictions.is_empty());
     }
 
     #[test]
-    fn very_short_input_returns_none() {
+    fn very_short_input_returns_empty_detection() {
         // < 8 non-whitespace bytes
-        assert_eq!(detect("hi"), None);
+        assert!(crate::detect("hi").predictions.is_empty());
+    }
+
+    fn top_language(detection: &crate::Detection) -> Option<Language> {
+        detection.language()
+    }
+
+    fn model_metadata_json() -> Value {
+        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).unwrap();
+        serde_json::from_slice(&MODEL_BYTES[metadata_start..]).unwrap()
+    }
+
+    fn string_array(value: &Value) -> Vec<&str> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect()
+    }
+
+    fn assert_layer(
+        layer: &Value,
+        name: &str,
+        weight_shape: &[usize],
+        weight_bytes: usize,
+        bias: Option<(&[usize], usize)>,
+    ) {
+        assert_eq!(layer["name"], name);
+        assert_eq!(usize_array(&layer["weights"][0]["shape"]), weight_shape);
+        assert_eq!(layer["weights"][0]["bytes"], weight_bytes);
+
+        match bias {
+            Some((bias_shape, bias_bytes)) => {
+                assert_eq!(usize_array(&layer["biases"][0]["shape"]), bias_shape);
+                assert_eq!(layer["biases"][0]["bytes"], bias_bytes);
+            }
+            None => assert!(layer["biases"].as_array().unwrap().is_empty()),
+        }
+    }
+
+    fn usize_array(value: &Value) -> Vec<usize> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_u64().unwrap() as usize)
+            .collect()
     }
 }

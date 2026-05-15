@@ -71,14 +71,14 @@ fn detect_file(path: &Path) -> ExitCode {
     report_single(betlang::detect(text))
 }
 
-fn report_single(language: Option<Language>) -> ExitCode {
-    match language {
+fn report_single(detection: betlang::Detection) -> ExitCode {
+    match detection.language() {
         Some(language) => {
             println!("{} ({:?})", language.slug(), language);
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("betlang: no confident match");
+            eprintln!("betlang: no match");
             ExitCode::from(1)
         }
     }
@@ -219,7 +219,8 @@ fn classify_file(path: &Path) -> Option<(Option<Language>, u64)> {
     let bytes = fs::read(path).ok()?;
     let text = std::str::from_utf8(&bytes).ok()?;
     let size = bytes.len() as u64;
-    Some((betlang::detect(text), size))
+    let language = betlang::detect(text).language();
+    Some((language, size))
 }
 
 fn print_tree(nodes: &[Node]) {
@@ -366,7 +367,11 @@ fn print_accuracy(by_truth: &HashMap<Language, LangStat>, graded: u64, correct: 
     println!("Accuracy: {pct:.2}%  ({correct}/{graded} files with known extension)");
 
     let mut rows: Vec<(Language, LangStat)> = by_truth.iter().map(|(l, s)| (*l, *s)).collect();
-    rows.sort_by(|a, b| b.1.total.cmp(&a.1.total).then_with(|| a.0.slug().cmp(b.0.slug())));
+    rows.sort_by(|a, b| {
+        b.1.total
+            .cmp(&a.1.total)
+            .then_with(|| a.0.slug().cmp(b.0.slug()))
+    });
 
     let name_width = rows
         .iter()
@@ -470,7 +475,10 @@ fn ground_truth(path: &Path) -> Option<Language> {
             _ => {}
         }
     }
-    let ext = path.extension().and_then(|s| s.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())?
+        .to_ascii_lowercase();
     Some(match ext.as_str() {
         "asm" | "s" => Language::Asm,
         "awk" => Language::Awk,
