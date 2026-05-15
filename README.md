@@ -1,7 +1,6 @@
 # Betlang
 
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
-[![Downloads](https://img.shields.io/crates/d/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
 CPU source-language detection for code with a tiny 100kb model.
