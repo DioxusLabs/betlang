@@ -3,7 +3,6 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Downloads](https://img.shields.io/crates/d/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
-[![CI](https://github.com/ealmloff/betlang/actions/workflows/ci.yml/badge.svg)](https://github.com/ealmloff/betlang/actions/workflows/ci.yml)
 
 CPU source-language detection for code, backed by a compact Magika student
 model.

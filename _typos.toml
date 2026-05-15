@@ -5,3 +5,6 @@ extend-exclude = [
     "reports/**",
     "target/**",
 ]
+
+[default.extend-words]
+edn = "edn"
