@@ -39,15 +39,15 @@ fn detects_file_path() {
 }
 
 #[test]
-fn rejects_non_utf8_file_path() {
+fn detects_non_utf8_file_path() {
     let temp = TempDir::new("betlang-detect-invalid");
     let file = temp.path().join("invalid.rs");
     fs::write(&file, b"fn main() {\n\xff\xfe\n}\n").unwrap();
 
     let output = detect_command().arg(&file).output().unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("not valid UTF-8"));
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("rust"));
 }
 
 #[test]

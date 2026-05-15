@@ -48,8 +48,8 @@ fn main() -> ExitCode {
 }
 
 fn detect_stdin() -> ExitCode {
-    let mut buf = String::new();
-    if let Err(err) = io::stdin().read_to_string(&mut buf) {
+    let mut buf = Vec::new();
+    if let Err(err) = io::stdin().read_to_end(&mut buf) {
         eprintln!("betlang: failed to read stdin: {err}");
         return ExitCode::from(2);
     }
@@ -64,11 +64,7 @@ fn detect_file(path: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        eprintln!("betlang: {} is not valid UTF-8", path.display());
-        return ExitCode::from(1);
-    };
-    report_single(betlang::detect(text))
+    report_single(betlang::detect(bytes))
 }
 
 fn report_single(detection: betlang::Detection) -> ExitCode {
@@ -214,9 +210,8 @@ fn display_name(path: &Path, root: &Path, depth: usize) -> String {
 
 fn classify_file(path: &Path) -> Option<(Option<Language>, u64)> {
     let bytes = fs::read(path).ok()?;
-    let text = std::str::from_utf8(&bytes).ok()?;
     let size = bytes.len() as u64;
-    let language = betlang::detect(text).language();
+    let language = betlang::detect(bytes).language();
     Some((language, size))
 }
 

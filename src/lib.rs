@@ -1,15 +1,5 @@
 #![warn(missing_docs)]
-
-//! CPU inference for the compact Magika wordseq student.
-//!
-//! Betlang classifies source code into an Arborium/tree-sitter-style language
-//! slug using a small embedded neural model.
-//!
-//! ```
-//! let detection = betlang::detect("fn main() { println!(\"hi\"); }");
-//!
-//! assert_eq!(detection.language(), Some(betlang::Language::Rust));
-//! ```
+#![doc = include_str!("../README.md")]
 
 mod language;
 mod model;
@@ -70,31 +60,19 @@ impl Detection {
     }
 }
 
-/// Detect the source language for a source string.
+/// Detect the source language for bytes-like input.
 ///
 /// Use [`Language::slug`] to map predicted languages to Arborium/tree-sitter
 /// identifiers. [`Detection::language`] returns [`None`] when the input is
 /// empty, effectively whitespace only, or too short to build the model window.
+/// The input may be a UTF-8 string, raw byte slice, or another type that can be
+/// borrowed as bytes.
 ///
 /// ```
 /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
 ///
 /// assert_eq!(detection.language(), Some(betlang::Language::Rust));
 /// ```
-pub fn detect(source: &str) -> Detection {
-    model::detect_bytes(source.as_bytes())
-}
-
-/// Detect the source language for raw bytes.
-///
-/// This uses the same byte-window tokenizer as [`detect`], but does not require
-/// callers to validate UTF-8 before classification.
-///
-/// ```
-/// let detection = betlang::detect_bytes(b"fn main() { println!(\"hi\"); }\n\xff");
-///
-/// assert_eq!(detection.language(), Some(betlang::Language::Rust));
-/// ```
-pub fn detect_bytes(source: &[u8]) -> Detection {
-    model::detect_bytes(source)
+pub fn detect(source: impl AsRef<[u8]>) -> Detection {
+    model::detect(source.as_ref())
 }

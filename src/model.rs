@@ -1468,7 +1468,7 @@ fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
 // Public API
 // ============================================================================
 
-pub(crate) fn detect_bytes(source: &[u8]) -> Detection {
+pub(crate) fn detect(source: &[u8]) -> Detection {
     let Some((bytes, pad)) = build_window(source) else {
         return Detection::from_predictions(Vec::new());
     };
@@ -1820,10 +1820,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_bytes_accepts_non_utf8_inputs() {
+    fn detect_accepts_non_utf8_inputs() {
         let mut bytes = b"fn main() {\n    println!(\"hello\");\n}\n".to_vec();
         bytes.extend([0xff, 0xfe]);
-        let detection = crate::detect_bytes(&bytes);
+        let detection = crate::detect(&bytes);
         assert_eq!(top_language(&detection), Some(Language::Rust));
     }
 
