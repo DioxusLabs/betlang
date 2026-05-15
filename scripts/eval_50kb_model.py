@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate an exported MSQ1 50KB wordseq student against the cached test split.
+"""Evaluate an exported raw wordseq student against the cached test split.
 
 Reports both:
   - test_teacher_parity   — fraction matching cache labels.mmap (teacher argmax)
@@ -64,17 +64,17 @@ def main() -> int:
     cfg = wordseq_config_for_architecture(args.architecture)
     model = build_word_seq_hashembed_hidden_model(classes, bits=4, **cfg)
 
-    # Load weights from exported MSQ1 .bin.
-    layer_weights, metadata = load_exported_layer_weights(args.checkpoint)
-    metadata_tokenizer = metadata.get("tokenizer_version")
-    if metadata_tokenizer != 3:
+    # Load weights from exported raw .bin.
+    layer_weights, model_info = load_exported_layer_weights(args.checkpoint)
+    model_tokenizer = model_info.get("tokenizer_version")
+    if model_tokenizer != 3:
         raise SystemExit(
-            f"unsupported checkpoint tokenizer_version={metadata_tokenizer!r}; "
+            f"unsupported checkpoint tokenizer_version={model_tokenizer!r}; "
             "this evaluator supports only v3"
         )
     print(
-        f"checkpoint: bits={metadata.get('bits')} arch={metadata.get('architecture','?')} "
-        f"tokenizer_version={metadata_tokenizer}"
+        f"checkpoint: bits={model_info.get('bits')} arch={model_info.get('architecture','?')} "
+        f"tokenizer_version={model_tokenizer}"
     )
     loaded = 0
     for layer in model.layers:
@@ -147,7 +147,7 @@ def main() -> int:
         target_labels = fs_labels if fs_labels is not None else teacher_labels
         confusion = np.zeros((classes, classes), dtype=np.int64)
         np.add.at(confusion, (target_labels, preds), 1)
-        label_names = metadata.get("labels")
+        label_names = classes_meta.get("labels")
         if not isinstance(label_names, list) or len(label_names) != classes:
             label_names = [str(i) for i in range(classes)]
         write_confusion_matrix(

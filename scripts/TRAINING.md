@@ -1,7 +1,7 @@
 # Training the betlang wordseq student model
 
-The model shipped in `assets/magika/source-student-q4.bin` is a 102,793-byte
-quantized wordseq student trained on the Magika v3.3 teacher's predictions
+The model shipped in `assets/magika/source-student-q4.bin` is a 100,444-byte
+raw quantized wordseq payload trained on the Magika v3.3 teacher's predictions
 over a ~440k-file source-language corpus. It uses the v3 word-unit tokenizer
 and hits **0.962517 fs_accuracy** on an 81k held-out test set.
 
@@ -10,9 +10,9 @@ and hits **0.962517 fs_accuracy** on an 81k held-out test set.
 | File | Lines | Purpose |
 |---|---:|---|
 | `train_v2_student.py` | 175 | **Standalone driver.** Historical filename; wraps the trainer with the frozen recipe that produced the shipped model. Run this. |
-| `train_magika_qat_student.py` | 1372 | Focused QAT trainer for only the shipped `wordseq-b1536-k3-m2048-med-3conv-hidden` model: v3 tokenizer, length buckets, self-distillation, CutMix, training loop, and MSQ1 export. |
+| `train_magika_qat_student.py` | 1372 | Focused QAT trainer for only the shipped `wordseq-b1536-k3-m2048-med-3conv-hidden` model: v3 tokenizer, length buckets, self-distillation, CutMix, training loop, and raw payload export. |
 | `train_magika_source_student.py` | 673 | Magika teacher loader, byte-window feature extraction, cache iteration helpers. Imported by the QAT trainer. |
-| `eval_50kb_model.py` | 167 | Loads an exported MSQ1 `.bin`, runs forward pass, reports `_teacher_parity` and `_fs_accuracy` on a chosen split. |
+| `eval_50kb_model.py` | 167 | Loads an exported raw `.bin`, runs forward pass, reports `_teacher_parity` and `_fs_accuracy` on a chosen split. |
 | `confusion_by_size.py` | 471 | Evaluates an exported wordseq model, aligns cached rows to raw file sizes, and renders the README confusion-matrix image. |
 
 ## Recipe (frozen in `train_v2_student.py`)

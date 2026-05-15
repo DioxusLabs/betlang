@@ -33,7 +33,7 @@ Recipe:
 Expected results (bigorig-500k):
   test_teacher_parity 0.967618 (matching the big-3conv teacher)
   test_fs_accuracy    0.962517 (matching file-extension truth)
-  exported size       102,793 bytes
+  exported size       100,444 bytes
 
 Usage:
     python scripts/train_v2_student.py                  # default: bigorig-500k cache

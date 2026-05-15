@@ -1,6 +1,6 @@
 //! Inference for the wordseq student.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (~100 KB MSQ1 export) and
+//! Loads `assets/magika/source-student-q4.bin` (~100 KB raw tensor payload) and
 //! runs a forward pass: byte-window tokenization → word-unit tokenization
 //! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
 //! max+avg pool → 2 dense layers → 67-class logits.
@@ -20,7 +20,6 @@ mod activation;
 mod constants;
 mod embedded;
 mod layers;
-mod metadata;
 mod reader;
 mod runtime;
 #[cfg(test)]

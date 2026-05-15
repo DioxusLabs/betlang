@@ -1,8 +1,8 @@
 # Releasing Betlang
 
 1. Update the version in `Cargo.toml`.
-2. Confirm the embedded model hash in `README.md`, `MODEL_CARD.md`, and
-   `src/model.rs` tests if the model artifact changed.
+2. Confirm the embedded model hash in `README.md` and `MODEL_CARD.md` if the
+   model artifact changed.
 3. Run the native release gates:
 
    ```bash

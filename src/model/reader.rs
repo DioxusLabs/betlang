@@ -42,9 +42,10 @@ pub(crate) fn read_ternary_dequant(cursor: &mut usize, count: usize, scale: f32)
 
 pub(crate) fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
     let mut out = [0.0; N];
-    for (i, value) in out.iter_mut().enumerate() {
-        let off = *cursor + i * 4;
-        *value = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
+    let (chunks, remainder) = MODEL_BYTES[*cursor..*cursor + N * 4].as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for (value, bytes) in out.iter_mut().zip(chunks) {
+        *value = f32::from_le_bytes(*bytes);
     }
     *cursor += N * 4;
     out

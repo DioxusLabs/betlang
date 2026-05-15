@@ -3,9 +3,9 @@
 ## Artifact
 
 - File: `assets/magika/source-student-q4.bin`
-- Format: MSQ1 quantized export
-- Size: 102,793 bytes
-- SHA-256: `52be89bef15515aa93ae924e76d17d72b3943f50ceda8aa9e1c3834f27f8e883`
+- Format: raw quantized tensor payload
+- Size: 100,444 bytes
+- SHA-256: `e2498dc23a60cc32ae21a448c3763ee7080a6fbf9f813b63a066ef195e1e44a0`
 - Architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Classes: 67 embedded model classes mapped to 59 public `Language` variants

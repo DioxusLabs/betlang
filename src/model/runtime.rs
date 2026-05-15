@@ -3,7 +3,6 @@ use super::{
     constants::*,
     embedded::MODEL_BYTES,
     layers::{conv_gelu_global_pool, conv_gelu_maxpool, dense_forward, embed_position},
-    metadata::{assert_tokenizer_version, parse_scales, rfind_bytes},
     reader::{read_f32_array, read_int4_dequant, read_ternary_dequant},
     tokenizer::tokenize,
 };
@@ -30,47 +29,50 @@ pub(crate) struct Model {
 
 impl Model {
     fn load() -> Self {
-        assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
-        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).expect("no metadata");
-        let metadata = std::str::from_utf8(&MODEL_BYTES[metadata_start..]).expect("utf-8 meta");
-        assert!(
-            metadata.contains(r#""architecture":"wordseq-b1536-k3-m2048-med-3conv-hidden""#),
-            "shipped model is not the expected wordseq architecture",
+        assert_eq!(
+            MODEL_BYTES.len(),
+            MODEL_PAYLOAD_LEN,
+            "unexpected model payload length"
         );
-        assert_tokenizer_version(metadata);
-        let scales = parse_scales(metadata);
-        // 6 layers, each with 1 weight tensor → 6 scales total.
-        assert_eq!(scales.len(), 6, "expected 6 weight scales");
 
-        let mut cur = MODEL_MAGIC.len();
+        let mut cur = 0;
 
         // q_hash_embedding: weights [(1536, 28)] int4
-        let embedding = read_int4_dequant(&mut cur, BINS * EMBED, scales[0]);
+        let embedding = read_int4_dequant(&mut cur, BINS * EMBED, MODEL_WEIGHT_SCALES[0]);
 
         // q_conv_0: weights [(7, 28, 96)] ternary, bias [(96,)] f32
-        let conv0_kernel = read_ternary_dequant(&mut cur, CONV0_KERNEL * EMBED * CONV0, scales[1]);
+        let conv0_kernel = read_ternary_dequant(
+            &mut cur,
+            CONV0_KERNEL * EMBED * CONV0,
+            MODEL_WEIGHT_SCALES[1],
+        );
         let conv0_bias = read_f32_array::<CONV0>(&mut cur);
 
         // q_conv_1: weights [(5, 96, 192)] ternary, bias [(192,)] f32
-        let conv1_kernel = read_ternary_dequant(&mut cur, CONV1_KERNEL * CONV0 * CONV1, scales[2]);
+        let conv1_kernel = read_ternary_dequant(
+            &mut cur,
+            CONV1_KERNEL * CONV0 * CONV1,
+            MODEL_WEIGHT_SCALES[2],
+        );
         let conv1_bias = read_f32_array::<CONV1>(&mut cur);
 
         // q_conv_2: weights [(3, 192, 192)] ternary, bias [(192,)] f32
-        let conv2_kernel = read_ternary_dequant(&mut cur, CONV2_KERNEL * CONV1 * CONV2, scales[3]);
+        let conv2_kernel = read_ternary_dequant(
+            &mut cur,
+            CONV2_KERNEL * CONV1 * CONV2,
+            MODEL_WEIGHT_SCALES[3],
+        );
         let conv2_bias = read_f32_array::<CONV2>(&mut cur);
 
         // q_dense_0: weights [(384, 160)] ternary, bias [(160,)] f32
-        let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, scales[4]);
+        let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, MODEL_WEIGHT_SCALES[4]);
         let dense0_bias = read_f32_array::<DENSE>(&mut cur);
 
         // q_output: weights [(160, 67)] int4, bias [(67,)] f32
-        let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
+        let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, MODEL_WEIGHT_SCALES[5]);
         let output_bias = read_f32_array::<CLASSES>(&mut cur);
 
-        // Trailing 4-byte LE metadata length (not used for indexing here, just sanity).
-        assert_eq!(cur + 4, metadata_start, "unexpected payload length");
-        let metadata_len = u32::from_le_bytes(MODEL_BYTES[cur..cur + 4].try_into().unwrap());
-        assert_eq!(metadata_len as usize, MODEL_BYTES.len() - metadata_start);
+        assert_eq!(cur, MODEL_BYTES.len(), "unexpected model payload length");
 
         Self {
             embedding,
@@ -107,12 +109,13 @@ impl Model {
             let (embed, pool0_region) = activations.split_at_mut(embed_len);
 
             // 1) HashEmbedding + GELU.
-            for pos in 0..t.min(units.len()) {
+            let (embed_rows, embed_remainder) = embed.as_chunks_mut::<EMBED>();
+            debug_assert!(embed_remainder.is_empty());
+            for (pos, dst) in embed_rows.iter_mut().take(t.min(units.len())).enumerate() {
                 let id = units[pos];
                 if id < 0 {
                     continue;
                 }
-                let dst = &mut embed[pos * EMBED..(pos + 1) * EMBED];
                 embed_position(&self.embedding, id as u32, dst);
                 for v in dst.iter_mut() {
                     *v = gelu(*v);

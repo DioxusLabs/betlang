@@ -1,4 +1,4 @@
-pub(crate) const MODEL_MAGIC: [u8; 8] = [0x4d, 0x53, 0x51, 0x31, 0x01, 0x00, 0x00, 0x00];
+pub(crate) const MODEL_PAYLOAD_LEN: usize = 100_444;
 
 pub(crate) const MAGIKA_BEG_SIZE: usize = 1_024;
 pub(crate) const MAGIKA_END_SIZE: usize = 1_024;
@@ -19,6 +19,15 @@ pub(crate) const CONV2: usize = 192;
 pub(crate) const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 pub(crate) const DENSE: usize = 160;
 pub(crate) const CLASSES: usize = 67;
+
+pub(crate) const MODEL_WEIGHT_SCALES: [f32; 6] = [
+    0.162_534_645_625_523_17,
+    0.180_766_612_291_336_06,
+    0.134_378_731_250_762_94,
+    0.128_200_232_982_635_5,
+    0.155_264_601_111_412_05,
+    0.294_296_571_186_610_6,
+];
 
 const EMBED_SCRATCH: usize = MAX_UNITS * EMBED;
 const POOL0_SCRATCH: usize = (MAX_UNITS / CONV0_POOL) * CONV0;

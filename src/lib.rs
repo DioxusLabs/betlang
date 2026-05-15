@@ -46,7 +46,9 @@ impl Detection {
     ///
     /// ```
     /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
-    /// let (probability, language) = detection.top_languages().next().unwrap();
+    /// let Some((probability, language)) = detection.top_languages().next() else {
+    ///     panic!("expected a language prediction");
+    /// };
     ///
     /// assert_eq!(language, betlang::Language::Rust);
     /// assert!(probability > 0.0);

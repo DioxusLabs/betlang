@@ -171,7 +171,7 @@ def load_model(checkpoint: Path, cache_dir: Path, architecture: str, split: str)
         raise SystemExit("only wordseq architectures are supported")
     cfg = wordseq_config_for_architecture(architecture)
     model = build_word_seq_hashembed_hidden_model(classes, bits=4, **cfg)
-    layer_weights, metadata = load_exported_layer_weights(checkpoint)
+    layer_weights, model_info = load_exported_layer_weights(checkpoint)
     loaded = 0
     for layer in model.layers:
         if layer.name not in layer_weights:
@@ -185,7 +185,7 @@ def load_model(checkpoint: Path, cache_dir: Path, architecture: str, split: str)
         layer.set_weights([tgt.astype(cur.dtype) for cur, tgt in zip(current, target)])
         loaded += 1
     print(f"loaded weights into {loaded} layers", flush=True)
-    return model, metadata, meta
+    return model, model_info, meta
 
 
 def predict(model, units: np.memmap, batch_size: int) -> np.ndarray:
@@ -423,8 +423,8 @@ def main() -> int:
     classes = int(split_meta["classes"])
     print(f"split={args.split} n={n} classes={classes}", flush=True)
 
-    model, metadata, _ = load_model(args.checkpoint, args.cache_dir, args.architecture, args.split)
-    tokenizer = metadata.get("tokenizer_version")
+    model, model_info, _ = load_model(args.checkpoint, args.cache_dir, args.architecture, args.split)
+    tokenizer = model_info.get("tokenizer_version")
     if tokenizer != 3:
         raise SystemExit(
             f"unsupported checkpoint tokenizer_version={tokenizer!r}; "

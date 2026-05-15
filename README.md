@@ -47,11 +47,11 @@ map to `xml`.
 
 ## Model
 
-The embedded model is `assets/magika/source-student-q4.bin`, a 102,793-byte
-MSQ1 export with SHA-256:
+The embedded model is `assets/magika/source-student-q4.bin`, a 100,444-byte
+raw tensor payload with SHA-256:
 
 ```text
-52be89bef15515aa93ae924e76d17d72b3943f50ceda8aa9e1c3834f27f8e883
+e2498dc23a60cc32ae21a448c3763ee7080a6fbf9f813b63a066ef195e1e44a0
 ```
 
 Architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`, tokenizer version 3.

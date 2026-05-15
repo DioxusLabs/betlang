@@ -2,7 +2,7 @@
 """Train the production Betlang wordseq Magika student.
 
 This is intentionally narrow: it only contains the cache, tokenizer, model,
-training loop, and MSQ1 export code for the shipped
+training loop, and raw payload export code for the shipped
 `wordseq-b1536-k3-m2048-med-3conv-hidden` model.
 """
 
@@ -31,7 +31,6 @@ from train_magika_source_student import (
 
 TOKEN_LENGTH = 2048
 PADDING_TOKEN = 256
-QAT_MAGIC = b"MSQ1\x01\0\0\0"
 
 FINAL_ARCHITECTURE = "wordseq-b1536-k3-m2048-med-3conv-hidden"
 TOKENIZER_VERSION = 3
@@ -40,10 +39,24 @@ WORDSEQ_BINS = 1536
 WORDSEQ_HASH_COUNT = 3
 WORDSEQ_MAX_UNITS = 2048
 WORDSEQ_EMBED = 28
+WORDSEQ_CONV0_KERNEL = 7
 WORDSEQ_CONV0 = 96
+WORDSEQ_CONV1_KERNEL = 5
 WORDSEQ_CONV1 = 192
+WORDSEQ_CONV2_KERNEL = 3
 WORDSEQ_CONV2 = 192
+WORDSEQ_POOLED = WORDSEQ_CONV2 * 2
 WORDSEQ_DENSE = 160
+WORDSEQ_CLASSES = 67
+RAW_MODEL_BYTES = 100_444
+MODEL_WEIGHT_SCALES = (
+    0.16253464562552317,
+    0.18076661229133606,
+    0.13437873125076294,
+    0.1282002329826355,
+    0.15526460111141205,
+    0.2942965711866106,
+)
 
 
 @dataclass(frozen=True)
@@ -360,13 +373,13 @@ def build_final_model(classes: int, bits: int) -> tf.keras.Model:
     )([x, valid_mask])
     x = tf.keras.layers.Activation(tf.nn.gelu)(x)
 
-    x = QConv1D(WORDSEQ_CONV0, 7, 2, name="q_conv_0")(x)
+    x = QConv1D(WORDSEQ_CONV0, WORDSEQ_CONV0_KERNEL, 2, name="q_conv_0")(x)
     x = tf.keras.layers.Activation(tf.nn.gelu)(x)
     x = tf.keras.layers.MaxPooling1D(pool_size=4)(x)
-    x = QConv1D(WORDSEQ_CONV1, 5, 2, name="q_conv_1")(x)
+    x = QConv1D(WORDSEQ_CONV1, WORDSEQ_CONV1_KERNEL, 2, name="q_conv_1")(x)
     x = tf.keras.layers.Activation(tf.nn.gelu)(x)
     x = tf.keras.layers.MaxPooling1D(pool_size=2)(x)
-    x = QConv1D(WORDSEQ_CONV2, 3, 2, name="q_conv_2")(x)
+    x = QConv1D(WORDSEQ_CONV2, WORDSEQ_CONV2_KERNEL, 2, name="q_conv_2")(x)
     x = tf.keras.layers.Activation(tf.nn.gelu)(x)
 
     max_pool = tf.keras.layers.GlobalMaxPooling1D()(x)
@@ -1014,23 +1027,121 @@ def quantize_weight(weight: np.ndarray, bits: int) -> tuple[bytes, float, str]:
     raise ValueError(f"unsupported weight bits: {bits}")
 
 
-def export_model(
-    output: Path,
-    model: tf.keras.Model,
-    labels: list[str],
-    slugs: list[str],
-    bits: int,
-) -> int:
-    metadata = {
-        "bits": bits,
+def unpack_int4(payload: bytes, shape: tuple[int, ...], scale: float) -> np.ndarray:
+    count = math.prod(shape)
+    out = np.empty(count, dtype=np.float32)
+    index = 0
+    for packed in payload:
+        if index < count:
+            out[index] = ((packed & 0x0F) - 8) * scale
+            index += 1
+        if index < count:
+            out[index] = ((packed >> 4) - 8) * scale
+            index += 1
+    return out.reshape(shape)
+
+
+def unpack_ternary(payload: bytes, shape: tuple[int, ...], scale: float) -> np.ndarray:
+    count = math.prod(shape)
+    out = np.empty(count, dtype=np.float32)
+    index = 0
+    for packed in payload:
+        for shift in (0, 2, 4, 6):
+            if index >= count:
+                break
+            code = (packed >> shift) & 0x03
+            out[index] = -scale if code == 0 else scale if code == 2 else 0.0
+            index += 1
+    return out.reshape(shape)
+
+
+def load_exported_layer_weights(checkpoint: Path):
+    data = checkpoint.read_bytes()
+    if len(data) != RAW_MODEL_BYTES:
+        raise ValueError(
+            f"unsupported raw model size {len(data)} bytes; expected {RAW_MODEL_BYTES}"
+        )
+
+    cursor = 0
+
+    def take(length: int) -> bytes:
+        nonlocal cursor
+        end = cursor + length
+        if end > len(data):
+            raise ValueError("truncated raw model payload")
+        payload = data[cursor:end]
+        cursor = end
+        return payload
+
+    layer_weights = {
+        "q_hash_embedding": [
+            unpack_int4(
+                take((WORDSEQ_BINS * WORDSEQ_EMBED + 1) // 2),
+                (WORDSEQ_BINS, WORDSEQ_EMBED),
+                MODEL_WEIGHT_SCALES[0],
+            )
+        ],
+        "q_conv_0": [
+            unpack_ternary(
+                take((WORDSEQ_CONV0_KERNEL * WORDSEQ_EMBED * WORDSEQ_CONV0 + 3) // 4),
+                (WORDSEQ_CONV0_KERNEL, WORDSEQ_EMBED, WORDSEQ_CONV0),
+                MODEL_WEIGHT_SCALES[1],
+            ),
+            np.frombuffer(take(WORDSEQ_CONV0 * 4), dtype="<f4").copy(),
+        ],
+        "q_conv_1": [
+            unpack_ternary(
+                take((WORDSEQ_CONV1_KERNEL * WORDSEQ_CONV0 * WORDSEQ_CONV1 + 3) // 4),
+                (WORDSEQ_CONV1_KERNEL, WORDSEQ_CONV0, WORDSEQ_CONV1),
+                MODEL_WEIGHT_SCALES[2],
+            ),
+            np.frombuffer(take(WORDSEQ_CONV1 * 4), dtype="<f4").copy(),
+        ],
+        "q_conv_2": [
+            unpack_ternary(
+                take((WORDSEQ_CONV2_KERNEL * WORDSEQ_CONV1 * WORDSEQ_CONV2 + 3) // 4),
+                (WORDSEQ_CONV2_KERNEL, WORDSEQ_CONV1, WORDSEQ_CONV2),
+                MODEL_WEIGHT_SCALES[3],
+            ),
+            np.frombuffer(take(WORDSEQ_CONV2 * 4), dtype="<f4").copy(),
+        ],
+        "q_dense_0": [
+            unpack_ternary(
+                take((WORDSEQ_POOLED * WORDSEQ_DENSE + 3) // 4),
+                (WORDSEQ_POOLED, WORDSEQ_DENSE),
+                MODEL_WEIGHT_SCALES[4],
+            ),
+            np.frombuffer(take(WORDSEQ_DENSE * 4), dtype="<f4").copy(),
+        ],
+        "q_output": [
+            unpack_int4(
+                take((WORDSEQ_DENSE * WORDSEQ_CLASSES + 1) // 2),
+                (WORDSEQ_DENSE, WORDSEQ_CLASSES),
+                MODEL_WEIGHT_SCALES[5],
+            ),
+            np.frombuffer(take(WORDSEQ_CLASSES * 4), dtype="<f4").copy(),
+        ],
+    }
+    if cursor != len(data):
+        raise ValueError("unexpected trailing bytes in raw model payload")
+
+    model_info = {
+        "bits": 4,
         "token_length": TOKEN_LENGTH,
         "architecture": FINAL_ARCHITECTURE,
         "tokenizer_version": TOKENIZER_VERSION,
-        "labels": labels,
-        "slugs": slugs,
-        "layers": [],
     }
-    blob = bytearray(QAT_MAGIC)
+    return layer_weights, model_info
+
+
+def export_model(
+    output: Path,
+    model: tf.keras.Model,
+    _labels: list[str],
+    _slugs: list[str],
+    bits: int,
+) -> int:
+    blob = bytearray()
     for layer in model.layers:
         if isinstance(layer, QEmbedding):
             weights = [("embedding", layer.embedding.numpy())]
@@ -1046,32 +1157,14 @@ def export_model(
         else:
             continue
 
-        layer_meta = {"name": layer.name, "weights": [], "biases": []}
         layer_bits = getattr(layer, "bits", bits)
-        for name, value in weights:
-            payload, scale, encoding = quantize_weight(value, layer_bits)
-            layer_meta["weights"].append(
-                {
-                    "name": name,
-                    "shape": list(value.shape),
-                    "scale": scale,
-                    "bits": layer_bits,
-                    "encoding": encoding,
-                    "bytes": len(payload),
-                }
-            )
+        for _name, value in weights:
+            payload, _scale, _encoding = quantize_weight(value, layer_bits)
             blob.extend(payload)
-        for name, value in biases:
+        for _name, value in biases:
             data = value.astype("<f4").tobytes()
-            layer_meta["biases"].append(
-                {"name": name, "shape": list(value.shape), "bytes": len(data)}
-            )
             blob.extend(data)
-        metadata["layers"].append(layer_meta)
 
-    metadata_json = json.dumps(metadata, separators=(",", ":")).encode()
-    blob.extend(len(metadata_json).to_bytes(4, "little"))
-    blob.extend(metadata_json)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(blob)
     return len(blob)
