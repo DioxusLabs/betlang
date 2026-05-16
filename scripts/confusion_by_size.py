@@ -353,7 +353,9 @@ def render_png(
     fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160)
     axes_flat = axes.ravel()
     image = None
-    for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
+
+    def plot_panel(ax, title: str, matrix: np.ndarray) -> None:
+        nonlocal image
         row_sums = matrix.sum(axis=1, keepdims=True)
         with np.errstate(divide="ignore", invalid="ignore"):
             normalized = np.divide(
@@ -366,7 +368,7 @@ def render_png(
         image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
         total = int(matrix.sum())
         acc = float(np.trace(matrix) / total) if total else 0.0
-        ax.set_title(f"{bucket[0]}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
+        ax.set_title(f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
         ax.set_xticks(np.arange(len(labels)))
         ax.set_yticks(np.arange(len(labels)))
         ax.set_xticklabels(labels, rotation=90, fontsize=5)
@@ -377,6 +379,13 @@ def render_png(
         ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
         ax.grid(which="minor", color="#eef2f7", linewidth=0.25)
         ax.tick_params(length=0)
+
+    for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
+        plot_panel(ax, bucket[0], matrix)
+    overall_ax = axes_flat[len(BUCKETS)]
+    overall_matrix = np.sum(np.stack(matrices, axis=0), axis=0)
+    plot_panel(overall_ax, "Overall", overall_matrix)
+
     fig.suptitle("Betlang wordseq confusion matrices by file size", fontsize=24, weight="bold", y=0.995)
     fig.text(
         0.01,
@@ -394,12 +403,12 @@ def render_png(
         fontsize=11,
         color="#64748b",
     )
+    fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
     if image is not None:
-        cbar = fig.colorbar(image, cax=axes_flat[-1])
-        cbar.set_label("Share of actual label in bucket", fontsize=10)
+        cbar = fig.colorbar(image, ax=overall_ax, fraction=0.046, pad=0.035)
+        cbar.set_label("Share of actual label", fontsize=10)
         cbar.set_ticks([0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])
         cbar.set_ticklabels(["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"])
-    fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 

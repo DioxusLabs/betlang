@@ -17,8 +17,9 @@ accuracy for rare-label recall.
 ## Confusion by file size
 
 The shipped wordseq model is evaluated below on the held-out `bigorig` test
-split. Each panel is a row-normalized confusion matrix for one file-size
-bucket: actual labels are rows, predicted labels are columns, and the diagonal
-is correct classification.
+split. The first seven panels are row-normalized confusion matrices for each
+file-size bucket, and the final panel is the overall confusion matrix with a
+compact shared scale. Actual labels are rows, predicted labels are columns, and
+the diagonal is correct classification.
 
 ![Betlang wordseq confusion by file size](assets/confusion-by-size.png)
