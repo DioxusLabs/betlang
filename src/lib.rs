@@ -1,4 +1,4 @@
-//! CPU inference for the compact wordseq v2 student.
+//! CPU inference for the compact wordseq v3 student.
 
 mod language;
 mod model;

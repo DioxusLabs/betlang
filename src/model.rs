@@ -1,20 +1,20 @@
 //! Inference for the wordseq student.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (~100 KB MSQ1 export) and
+//! Loads `assets/magika/source-student-q4.bin` (~50 KB MSQ1 export) and
 //! runs a forward pass: byte-window tokenization → word-unit tokenization
 //! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
-//! max+avg pool → 2 dense layers → 67-class softmax logits.
+//! max+avg pool → 2 dense layers → 48-class softmax logits.
 //!
-//! Model architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`
-//! - 1536-bin × 28-dim shared HashEmbedding table (4-bit, ~21 KB)
-//! - QConv1D k=7 28→96ch (2-bit ternary)
+//! Model architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
+//! - 1024-bin × 24-dim shared HashEmbedding table (4-bit, ~12 KB)
+//! - QConv1D k=7 24→64ch (2-bit ternary)
 //! - MaxPool(4)
-//! - QConv1D k=5 96→192ch (2-bit)
+//! - QConv1D k=5 64→128ch (2-bit)
 //! - MaxPool(2)
-//! - QConv1D k=3 192→192ch (2-bit)
-//! - GlobalMax ⊕ GlobalAvg → 384-dim
-//! - QDense 384→160 (2-bit) + GELU
-//! - QDense 160→67 (4-bit)
+//! - QConv1D k=3 128→128ch (2-bit)
+//! - GlobalMax ⊕ GlobalAvg → 256-dim
+//! - QDense 256→96 (2-bit) + GELU
+//! - QDense 96→48 (4-bit)
 //!
 //! Convolution hot paths use `fearless_simd` with scalar fallbacks for
 //! edges and out-channel counts not divisible by 16.
@@ -38,20 +38,20 @@ const MAGIKA_END_SIZE: usize = 1_024;
 const MAGIKA_BLOCK_SIZE: usize = 4_096;
 
 // Wordseq architecture constants. Must match what the model was trained with.
-const BINS: usize = 1_536;
+const BINS: usize = 1_024;
 const MAX_UNITS: usize = 2_048;
-const EMBED: usize = 28;
+const EMBED: usize = 24;
 const CONV0_KERNEL: usize = 7;
-const CONV0: usize = 96;
+const CONV0: usize = 64;
 const CONV0_POOL: usize = 4;
 const CONV1_KERNEL: usize = 5;
-const CONV1: usize = 192;
+const CONV1: usize = 128;
 const CONV1_POOL: usize = 2;
 const CONV2_KERNEL: usize = 3;
-const CONV2: usize = 192;
+const CONV2: usize = 128;
 const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
-const DENSE: usize = 160;
-pub(crate) const CLASSES: usize = 67;
+const DENSE: usize = 96;
+pub(crate) const CLASSES: usize = 48;
 const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
 
 // v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
@@ -73,7 +73,7 @@ enum TokenizerVersion {
 #[derive(Debug)]
 struct Model {
     tokenizer_version: TokenizerVersion,
-    /// 1536 × 28 dequantized embedding rows.
+    /// 1024 × 24 dequantized embedding rows.
     embedding: Vec<f32>,
     /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
     conv0_kernel: Vec<f32>,
@@ -96,7 +96,7 @@ impl Model {
         let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).expect("no metadata");
         let metadata = std::str::from_utf8(&MODEL_BYTES[metadata_start..]).expect("utf-8 meta");
         assert!(
-            metadata.contains(r#""architecture":"wordseq-b1536-k3-m2048-med-3conv-hidden""#),
+            metadata.contains(r#""architecture":"wordseq-b1024-k3-m2048-tiny-3conv-hidden""#),
             "shipped model is not the expected wordseq architecture",
         );
         let tokenizer_version = parse_tokenizer_version(metadata);
@@ -106,26 +106,26 @@ impl Model {
 
         let mut cur = MODEL_MAGIC.len();
 
-        // q_hash_embedding: weights [(1536, 28)] int4
+        // q_hash_embedding: weights [(1024, 24)] int4
         let embedding = read_int4_dequant(&mut cur, BINS * EMBED, scales[0]);
 
-        // q_conv_0: weights [(7, 28, 96)] ternary, bias [(96,)] f32
+        // q_conv_0: weights [(7, 24, 64)] ternary, bias [(64,)] f32
         let conv0_kernel = read_ternary_dequant(&mut cur, CONV0_KERNEL * EMBED * CONV0, scales[1]);
         let conv0_bias = read_f32_array::<CONV0>(&mut cur);
 
-        // q_conv_1: weights [(5, 96, 192)] ternary, bias [(192,)] f32
+        // q_conv_1: weights [(5, 64, 128)] ternary, bias [(128,)] f32
         let conv1_kernel = read_ternary_dequant(&mut cur, CONV1_KERNEL * CONV0 * CONV1, scales[2]);
         let conv1_bias = read_f32_array::<CONV1>(&mut cur);
 
-        // q_conv_2: weights [(3, 192, 192)] ternary, bias [(192,)] f32
+        // q_conv_2: weights [(3, 128, 128)] ternary, bias [(128,)] f32
         let conv2_kernel = read_ternary_dequant(&mut cur, CONV2_KERNEL * CONV1 * CONV2, scales[3]);
         let conv2_bias = read_f32_array::<CONV2>(&mut cur);
 
-        // q_dense_0: weights [(384, 160)] ternary, bias [(160,)] f32
+        // q_dense_0: weights [(256, 96)] ternary, bias [(96,)] f32
         let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, scales[4]);
         let dense0_bias = read_f32_array::<DENSE>(&mut cur);
 
-        // q_output: weights [(160, 67)] int4, bias [(67,)] f32
+        // q_output: weights [(96, 48)] int4, bias [(48,)] f32
         let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
         let output_bias = read_f32_array::<CLASSES>(&mut cur);
 
@@ -176,15 +176,25 @@ impl Model {
         // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
         //    ~524 KB intermediate buffer and the second read pass.
         let (pool0, t1) = conv_gelu_maxpool(
-            &embed, t, EMBED,
-            &self.conv0_kernel, CONV0_KERNEL, CONV0, &self.conv0_bias,
+            &embed,
+            t,
+            EMBED,
+            &self.conv0_kernel,
+            CONV0_KERNEL,
+            CONV0,
+            &self.conv0_bias,
             CONV0_POOL,
         );
 
         // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
         let (pool1, t2) = conv_gelu_maxpool(
-            &pool0, t1, CONV0,
-            &self.conv1_kernel, CONV1_KERNEL, CONV1, &self.conv1_bias,
+            &pool0,
+            t1,
+            CONV0,
+            &self.conv1_kernel,
+            CONV1_KERNEL,
+            CONV1,
+            &self.conv1_bias,
             CONV1_POOL,
         );
 
@@ -193,21 +203,37 @@ impl Model {
         let mut pooled = [0.0f32; POOLED];
         let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
         conv_gelu_global_pool(
-            &pool1, t2, CONV1,
-            &self.conv2_kernel, CONV2_KERNEL, CONV2, &self.conv2_bias,
-            max_slice, avg_slice,
+            &pool1,
+            t2,
+            CONV1,
+            &self.conv2_kernel,
+            CONV2_KERNEL,
+            CONV2,
+            &self.conv2_bias,
+            max_slice,
+            avg_slice,
         );
 
-        // 5) Dense 384→160 + GELU
+        // 5) Dense 256→96 + GELU
         let mut dense0_out = [0.0f32; DENSE];
-        dense_forward(&pooled, &self.dense0_kernel, &self.dense0_bias, &mut dense0_out);
+        dense_forward(
+            &pooled,
+            &self.dense0_kernel,
+            &self.dense0_bias,
+            &mut dense0_out,
+        );
         for v in &mut dense0_out {
             *v = gelu(*v);
         }
 
-        // 6) Dense 160→67 → logits
+        // 6) Dense 96→48 → logits
         let mut logits = [0.0f32; CLASSES];
-        dense_forward(&dense0_out, &self.output_kernel, &self.output_bias, &mut logits);
+        dense_forward(
+            &dense0_out,
+            &self.output_kernel,
+            &self.output_bias,
+            &mut logits,
+        );
         logits
     }
 
@@ -285,8 +311,16 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
             t_base >= pad && t_base + 4 + (kernel_size - 1).saturating_sub(pad) <= seq_len;
         if all_in_bounds {
             conv1d_block4_simd_inner(
-                simd, input, in_channels, kernel, kernel_size,
-                out_channels, bias, t_base, pad, accs,
+                simd,
+                input,
+                in_channels,
+                kernel,
+                kernel_size,
+                out_channels,
+                bias,
+                t_base,
+                pad,
+                accs,
             );
             return;
         }
@@ -349,8 +383,16 @@ fn conv1d_block4_simd_inner<S: Simd>(
     const GROUP: usize = 16;
     if out_channels % GROUP == 0 {
         conv1d_block4_group16::<S>(
-            simd, input, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, pad, accs,
+            simd,
+            input,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            pad,
+            accs,
         );
         return;
     }
@@ -374,7 +416,8 @@ fn conv1d_block4_simd_inner<S: Simd>(
             let xv1 = f32x4::splat(simd, input[row1_off + in_c]);
             let xv2 = f32x4::splat(simd, input[row2_off + in_c]);
             let xv3 = f32x4::splat(simd, input[row3_off + in_c]);
-            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow.chunks_exact(4)
+            for ((((kr_c, a0_c), a1_c), a2_c), a3_c) in krow
+                .chunks_exact(4)
                 .zip(a0.chunks_exact_mut(4))
                 .zip(a1.chunks_exact_mut(4))
                 .zip(a2.chunks_exact_mut(4))
@@ -520,16 +563,40 @@ fn conv_gelu_maxpool_simd<S: Simd>(
 ) {
     match pool {
         4 => conv_gelu_maxpool_run::<S, 4, 4>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
         2 => conv_gelu_maxpool_run::<S, 4, 2>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
         _ => conv_gelu_maxpool_run::<S, 1, 1>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, pooled_len, out,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            pooled_len,
+            out,
         ),
     }
 }
@@ -554,8 +621,16 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
     for tb in 0..block_count {
         let t_base = tb * BLOCK;
         conv1d_block::<S, BLOCK>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, &mut accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            &mut accs,
         );
         for op in 0..outs_per_block {
             let pooled_idx = tb * outs_per_block + op;
@@ -584,8 +659,16 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
         for tp in processed..pooled_len {
             let t_base = tp * POOL;
             conv1d_block::<S, POOL>(
-                simd, input, seq_len, in_channels, kernel, kernel_size,
-                out_channels, bias, t_base, &mut tail_accs,
+                simd,
+                input,
+                seq_len,
+                in_channels,
+                kernel,
+                kernel_size,
+                out_channels,
+                bias,
+                t_base,
+                &mut tail_accs,
             );
             let dst = &mut out[tp * out_channels..(tp + 1) * out_channels];
             let first = &tail_accs[..out_channels];
@@ -651,8 +734,16 @@ fn conv_gelu_global_pool_simd<S: Simd>(
     for tb in 0..block_count {
         let t_base = tb * T_BLOCK;
         conv1d_block::<S, T_BLOCK>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t_base, &mut accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t_base,
+            &mut accs,
         );
         for s in 0..T_BLOCK {
             let acc = &accs[s * out_channels..(s + 1) * out_channels];
@@ -673,8 +764,16 @@ fn conv_gelu_global_pool_simd<S: Simd>(
     let mut tail_accs = vec![0.0f32; out_channels];
     for t in (block_count * T_BLOCK)..seq_len {
         conv1d_block::<S, 1>(
-            simd, input, seq_len, in_channels, kernel, kernel_size,
-            out_channels, bias, t, &mut tail_accs,
+            simd,
+            input,
+            seq_len,
+            in_channels,
+            kernel,
+            kernel_size,
+            out_channels,
+            bias,
+            t,
+            &mut tail_accs,
         );
         for ((mx_c, av_c), a_c) in out_max
             .chunks_exact_mut(4)
@@ -812,7 +911,10 @@ fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
 }
 
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).rposition(|w| w == needle).map(|i| i)
+    haystack
+        .windows(needle.len())
+        .rposition(|w| w == needle)
+        .map(|i| i)
 }
 
 fn parse_scales(metadata: &str) -> Vec<f32> {
@@ -824,7 +926,11 @@ fn parse_scales(metadata: &str) -> Vec<f32> {
             .find([',', '}'])
             .map(|e| value_start + e)
             .expect("scale terminator");
-        scales.push(rest[value_start..value_end].parse::<f32>().expect("scale parse"));
+        scales.push(
+            rest[value_start..value_end]
+                .parse::<f32>()
+                .expect("scale parse"),
+        );
         rest = &rest[value_end..];
     }
     scales
@@ -840,7 +946,9 @@ fn parse_tokenizer_version(metadata: &str) -> TokenizerVersion {
         2 => TokenizerVersion::V2,
         3 => TokenizerVersion::V3,
         4 => TokenizerVersion::V4,
-        other => panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4"),
+        other => {
+            panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4")
+        }
     }
 }
 
@@ -848,7 +956,9 @@ fn parse_usize_field(metadata: &str, field: &str) -> Option<usize> {
     let key = format!(r#""{field}""#);
     let after_key = &metadata[metadata.find(&key)? + key.len()..];
     let rest = after_key[after_key.find(':')? + 1..].trim_start();
-    let end = rest.find(|ch: char| !ch.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
@@ -919,9 +1029,8 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             break;
         }
 
-        let is_letter = (b'a'..=b'z').contains(&value)
-            || (b'A'..=b'Z').contains(&value)
-            || value == b'_';
+        let is_letter =
+            (b'a'..=b'z').contains(&value) || (b'A'..=b'Z').contains(&value) || value == b'_';
         let is_digit = (b'0'..=b'9').contains(&value);
         let is_newline = value == b'\n';
         let is_cr = value == b'\r';
@@ -933,12 +1042,8 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
         if !(is_digit || value == b'.') {
             flush_number(&mut number, &mut out);
         }
-        let need_flush_punct = is_letter
-            || is_digit
-            || is_space
-            || is_newline
-            || is_cr
-            || value == b'.';
+        let need_flush_punct =
+            is_letter || is_digit || is_space || is_newline || is_cr || value == b'.';
         if need_flush_punct {
             flush_punct(&mut punct, &mut out);
         }
@@ -1318,7 +1423,10 @@ fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
 }
 
 fn trim_start_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes.iter().position(|b| !b.is_ascii_whitespace()).unwrap_or(bytes.len());
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
     &bytes[start..]
 }
 
@@ -1428,7 +1536,10 @@ mod tests {
 
     #[test]
     fn tokenizer_version_defaults_legacy_checkpoints_to_v2() {
-        assert_eq!(parse_tokenizer_version(r#"{"bits":4}"#), TokenizerVersion::V2);
+        assert_eq!(
+            parse_tokenizer_version(r#"{"bits":4}"#),
+            TokenizerVersion::V2
+        );
         assert_eq!(
             parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":3}"#),
             TokenizerVersion::V3
@@ -1466,7 +1577,10 @@ mod tests {
             268_435_466,
         ];
 
-        assert_eq!(units[0] as u32, (hash_unit_bytes(b"foo") & WORD_MASK) | STYLE_BIT);
+        assert_eq!(
+            units[0] as u32,
+            (hash_unit_bytes(b"foo") & WORD_MASK) | STYLE_BIT
+        );
         assert_eq!(&units[..expected.len()], &expected);
         assert!(units.contains(&((BRACKET_FLAG | b'{' as u32) as i32)));
         assert!(units.contains(&((STRING_FLAG | b'"' as u32) as i32)));
@@ -1481,13 +1595,17 @@ mod tests {
 
     #[test]
     fn detects_python_from_source() {
-        let lang = detect("import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n");
+        let lang = detect(
+            "import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n",
+        );
         assert_eq!(lang, Some(Language::Python));
     }
 
     #[test]
     fn detects_javascript_from_source() {
-        let lang = detect("const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n");
+        let lang = detect(
+            "const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n",
+        );
         assert_eq!(lang, Some(Language::JavaScript));
     }
 

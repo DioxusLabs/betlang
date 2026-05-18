@@ -8,18 +8,19 @@ let language = betlang::detect("fn main() { println!(\"hi\"); }");
 assert_eq!(language, Some(betlang::Language::Rust));
 ```
 
-The embedded production model is a ~100 KB quantized wordseq student using the
-v3 tokenizer. On the held-out `bigorig` test split it reaches
-`test_teacher_parity=0.932778` and `test_fs_accuracy=0.927934`. This export is
-calibrated to recover underrepresented source labels, trading some full-corpus
-accuracy for rare-label recall.
+The embedded production model is a 49,847-byte quantized wordseq student using
+the v3 tokenizer. It predicts the 48 filesystem-backed source labels present in
+the training corpus; unsupported empty labels such as `jsonl`, `matlab`, and
+`prolog` are not part of the model head or runtime class mapping. On the
+held-out filesystem-label test split it reaches `test_fs_accuracy=0.965473`
+with `macro_recall=0.965813`.
 
-## Confusion by file size
+## Confusion Matrix
 
-The shipped wordseq model is evaluated below on the held-out `bigorig` test
-split. The first seven panels are row-normalized confusion matrices for each
-file-size bucket, and the final panel is the overall confusion matrix with a
-compact shared scale. Actual labels are rows, predicted labels are columns, and
-the diagonal is correct classification.
+The shipped wordseq model is evaluated below on the held-out filesystem-label
+test split. The matrix is row-normalized: actual labels are rows, predicted
+labels are columns, and the diagonal is correct classification. The full count
+matrix is in `actual_dataset_confusion_by_size.csv`, and the top-confusion
+summary is in `actual_dataset_confusion_by_size.md`.
 
-![Betlang wordseq confusion by file size](assets/confusion-by-size.png)
+![Betlang wordseq confusion matrix](assets/confusion-by-size.png)
