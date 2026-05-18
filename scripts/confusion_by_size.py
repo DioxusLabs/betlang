@@ -647,11 +647,15 @@ def plot_confusion_panel(ax, title: str, matrix: np.ndarray, labels: list[str], 
     return image
 
 
-def configure_colorbar(fig, image, axes) -> None:
-    cbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.025)
-    cbar.set_label("Share of actual label", fontsize=10)
-    cbar.set_ticks([0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])
-    cbar.set_ticklabels(["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"])
+COLORBAR_TICKS = [0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
+COLORBAR_TICK_LABELS = ["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"]
+
+
+def configure_colorbar(fig, image, axes=None, *, cax=None, label: str = "Share of actual label") -> None:
+    cbar = fig.colorbar(image, ax=axes, cax=cax)
+    cbar.set_label(label, fontsize=10)
+    cbar.set_ticks(COLORBAR_TICKS)
+    cbar.set_ticklabels(COLORBAR_TICK_LABELS)
 
 
 def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], fs_accuracy: float) -> None:
@@ -663,7 +667,6 @@ def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], f
 
     for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
         image = plot_confusion_panel(ax, bucket[0], matrix, labels, cmap)
-    axes_flat[len(BUCKETS)].axis("off")
 
     fig.suptitle("Betlang wordseq confusion matrices by file size", fontsize=24, weight="bold", y=0.995)
     fig.text(
@@ -684,7 +687,12 @@ def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], f
     )
     fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
     if image is not None:
-        configure_colorbar(fig, image, axes_flat[: len(BUCKETS)])
+        configure_colorbar(
+            fig,
+            image,
+            cax=axes_flat[len(BUCKETS)],
+            label="Share of actual label in bucket",
+        )
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -712,8 +720,9 @@ def render_overall_png(path: Path, matrix: np.ndarray, labels: list[str], fs_acc
         fontsize=11,
         color="#334155",
     )
-    fig.subplots_adjust(left=0.11, right=0.88, top=0.925, bottom=0.12)
-    configure_colorbar(fig, image, ax)
+    fig.subplots_adjust(left=0.11, right=0.84, top=0.925, bottom=0.12)
+    scale_ax = fig.add_axes([0.875, 0.18, 0.05, 0.65])
+    configure_colorbar(fig, image, cax=scale_ax)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
