@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use betlang::Language;
+use rayon::prelude::*;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -90,6 +91,20 @@ enum Kind {
     Unreadable,
 }
 
+enum PendingKind {
+    Dir,
+    File {
+        path: PathBuf,
+        truth: Option<Language>,
+    },
+}
+
+struct PendingNode {
+    depth: usize,
+    name: String,
+    kind: PendingKind,
+}
+
 struct Node {
     depth: usize,
     name: String,
@@ -110,7 +125,7 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         .sort_by_file_path(|a, b| a.cmp(b))
         .build();
 
-    let mut nodes: Vec<Node> = Vec::new();
+    let mut pending_nodes: Vec<PendingNode> = Vec::new();
     let mut bytes_by_language: HashMap<Language, u64> = HashMap::new();
     let mut total: u64 = 0;
     let mut undetected: u64 = 0;
@@ -132,53 +147,56 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         let name = display_name(entry.path(), root, depth);
 
         if is_dir {
-            nodes.push(Node {
+            pending_nodes.push(PendingNode {
                 depth,
                 name,
-                kind: Kind::Dir,
+                kind: PendingKind::Dir,
             });
             continue;
         }
 
-        let truth = ground_truth(entry.path());
-        match classify_file(entry.path()) {
-            Some((language, size)) => {
-                total += size;
-                match language {
-                    Some(language) => *bytes_by_language.entry(language).or_default() += size,
-                    None => undetected += size,
-                }
-                if let Some(truth_lang) = truth {
-                    graded += 1;
-                    let stat = by_truth.entry(truth_lang).or_default();
-                    stat.total += 1;
-                    if language == Some(truth_lang) {
-                        stat.correct += 1;
-                        correct += 1;
-                    }
-                    *confusion.entry((truth_lang, language)).or_default() += 1;
-                }
-                nodes.push(Node {
-                    depth,
-                    name,
-                    kind: Kind::File {
-                        language,
-                        truth,
-                        size,
-                    },
-                });
-            }
-            None => nodes.push(Node {
-                depth,
-                name,
-                kind: Kind::Unreadable,
-            }),
-        }
+        pending_nodes.push(PendingNode {
+            depth,
+            name,
+            kind: PendingKind::File {
+                path: entry.path().to_path_buf(),
+                truth: ground_truth(entry.path()),
+            },
+        });
     }
+
+    let nodes: Vec<Node> = pending_nodes.into_par_iter().map(classify_node).collect();
 
     if nodes.is_empty() {
         eprintln!("betlang: nothing to scan under {}", root.display());
         return ExitCode::from(1);
+    }
+
+    for node in &nodes {
+        let Kind::File {
+            language,
+            truth,
+            size,
+        } = node.kind
+        else {
+            continue;
+        };
+
+        total += size;
+        match language {
+            Some(language) => *bytes_by_language.entry(language).or_default() += size,
+            None => undetected += size,
+        }
+        if let Some(truth_lang) = truth {
+            graded += 1;
+            let stat = by_truth.entry(truth_lang).or_default();
+            stat.total += 1;
+            if language == Some(truth_lang) {
+                stat.correct += 1;
+                correct += 1;
+            }
+            *confusion.entry((truth_lang, language)).or_default() += 1;
+        }
     }
 
     print_tree(&nodes);
@@ -197,6 +215,26 @@ fn breakdown_tree(root: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn classify_node(node: PendingNode) -> Node {
+    let kind = match node.kind {
+        PendingKind::Dir => Kind::Dir,
+        PendingKind::File { path, truth } => match classify_file(&path) {
+            Some((language, size)) => Kind::File {
+                language,
+                truth,
+                size,
+            },
+            None => Kind::Unreadable,
+        },
+    };
+
+    Node {
+        depth: node.depth,
+        name: node.name,
+        kind,
+    }
 }
 
 fn display_name(path: &Path, root: &Path, depth: usize) -> String {
@@ -453,17 +491,16 @@ fn print_confusion(
 }
 
 /// Filename- and extension-based ground truth. Returns `None` for files whose
-/// extension is ambiguous (e.g. `.m`, bare `.pl`, `.h`) or unknown, so those
-/// files are excluded from accuracy and confusion counts.
+/// extension is ambiguous, outside the model output surface, or unknown, so
+/// those files are excluded from accuracy and confusion counts.
 fn ground_truth(path: &Path) -> Option<Language> {
     if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
         match name {
             "Dockerfile" | "Containerfile" | "dockerfile" => return Some(Language::Dockerfile),
             "CMakeLists.txt" => return Some(Language::CMake),
+            "Gemfile" => return Some(Language::Gemfile),
             "Makefile" | "GNUmakefile" | "makefile" => return None, // not a tracked language
-            "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => {
-                return Some(Language::Starlark);
-            }
+            "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => return None,
             _ => {}
         }
     }
@@ -473,30 +510,28 @@ fn ground_truth(path: &Path) -> Option<Language> {
         .to_ascii_lowercase();
     Some(match ext.as_str() {
         "asm" | "s" => Language::Asm,
-        "awk" => Language::Awk,
         "bat" | "cmd" => Language::Batch,
-        "sh" | "bash" | "zsh" | "ksh" => Language::Bash,
+        "sh" | "bash" | "zsh" | "ksh" => Language::Shell,
         "c" => Language::C,
-        "cs" => Language::CSharp,
+        "cs" => Language::Cs,
         "clj" | "cljs" | "cljc" | "edn" => Language::Clojure,
         "cmake" => Language::CMake,
         "cob" | "cbl" | "cpy" => Language::Cobol,
-        "lisp" | "lsp" | "cl" => Language::CommonLisp,
+        "lisp" | "lsp" | "cl" => Language::Lisp,
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
         "css" => Language::Css,
         "dart" => Language::Dart,
-        "diff" | "patch" => Language::Diff,
         "ex" | "exs" => Language::Elixir,
         "erl" | "hrl" => Language::Erlang,
+        "gemspec" => Language::Gemspec,
         "go" => Language::Go,
-        "groovy" | "gvy" | "gradle" => Language::Groovy,
+        "gradle" => Language::Gradle,
+        "groovy" | "gvy" => Language::Groovy,
         "hs" | "lhs" => Language::Haskell,
-        "hcl" | "tf" | "tfvars" => Language::Hcl,
         "html" | "htm" | "xhtml" => Language::Html,
         "ini" | "cfg" => Language::Ini,
         "java" => Language::Java,
         "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
-        "jinja" | "j2" | "jinja2" => Language::Jinja2,
         "json" | "jsonc" | "json5" => Language::Json,
         "jl" => Language::Julia,
         "kt" | "kts" => Language::Kotlin,
@@ -505,32 +540,21 @@ fn ground_truth(path: &Path) -> Option<Language> {
         "mm" => Language::ObjectiveC,
         "ml" | "mli" => Language::Ocaml,
         "php" | "phtml" => Language::Php,
-        "ps" | "eps" => Language::Postscript,
         "ps1" | "psm1" | "psd1" => Language::Powershell,
         "py" | "pyi" | "pyw" => Language::Python,
-        "rb" | "rake" | "gemspec" => Language::Ruby,
+        "rb" | "rake" => Language::Ruby,
         "rs" => Language::Rust,
         "scala" | "sbt" => Language::Scala,
-        "scss" => Language::Scss,
-        "sol" => Language::Solidity,
         "sql" => Language::Sql,
-        "bzl" | "star" => Language::Starlark,
         "swift" => Language::Swift,
-        "textproto" => Language::TextProto,
         "toml" => Language::Toml,
         "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
-        "vb" | "vbs" => Language::Vb,
+        "vb" | "vbs" => Language::Vba,
         "v" | "sv" | "svh" => Language::Verilog,
-        "vhd" | "vhdl" => Language::Vhdl,
-        "vue" => Language::Vue,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => Language::Xml,
         "yaml" | "yml" => Language::Yaml,
-        "zig" | "zon" => Language::Zig,
-        // Ambiguous or out-of-vocab: skip.
-        // .m  → Matlab vs ObjectiveC
-        // .pl → Perl vs Prolog
-        // .h  → C vs Cpp vs ObjectiveC
-        // .r  → R vs Rebol
+        // Ambiguous, unsupported, or out-of-vocabulary: skip.
+        // Examples: .m, .pl, .h, .r.
         _ => return None,
     })
 }

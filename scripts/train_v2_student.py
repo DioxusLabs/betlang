@@ -6,37 +6,36 @@ cache paths, and hyperparameters.
 
 Recipe:
 
-  Architecture       wordseq-b1536-k3-m2048-med-3conv-hidden (~100 KB exported)
-                     - K=3 HashEmbedding (1536 bins x 28 dim, 4-bit) ~21 KB
-                     - 3 conv stages (96 → 192 → 192 ch, 2-bit) with
+  Architecture       wordseq-b1024-k3-m2048-tiny-3conv-hidden (~50 KB exported)
+                     - K=3 HashEmbedding (1024 bins x 24 dim, 4-bit) ~12 KB
+                     - 3 conv stages (64 -> 128 -> 128 ch, 2-bit) with
                        MaxPool(4) then MaxPool(2)
-                     - Dense 160 (2-bit) → output 67 (4-bit)
-                     - Export budget: 110 KB.
+                     - Dense 96 (2-bit) -> output 48 (4-bit)
+                     - Export budget: 50 KB.
 
-  Cache              /tmp/magika-source-qat-cache-bigorig-500k
-                     - 437,778 train / 53,420 valid / 81,744 test
+  Cache              fixed 48-label production cache
                      - units_v3.mmap (v3 tokenizer)
-                     - labels.mmap (big-3conv teacher's argmax)
-                     - self_probabilities.mmap (big-3conv teacher's full softmax)
+                     - labels.mmap / probabilities.mmap in the fixed head order
+                     - self_probabilities.mmap (student self-distillation)
 
-  Soft target (0.5)  big-3conv self_probabilities (test parity 0.968).
-  Hard target (0.5)  cache labels.mmap (teacher argmax).
+  Soft target (0.5)  self_probabilities.mmap.
+  Hard target (0.5)  cache labels.mmap.
   Distill temperature 3.
 
-  Label smoothing    0.05 — combats the train-loss-collapse-and-overfit pattern.
-  CutMix prob        0.5 — Magika v3.1 augmentation; +0.5pp single-model lift.
+  Label smoothing    0.05 - combats the train-loss-collapse-and-overfit pattern.
+  CutMix prob        0.5 - Magika v3.1 augmentation.
 
   LR schedule        cosine 8e-4 → 5% over 60 epochs (AdamW grad-clip 1.0).
   QAT                4-bit weights from epoch 45; early-stop patience 6.
   Throughput         length-buckets ~2x; mixed-precision.
 
-Expected results (bigorig-500k):
-  test_teacher_parity 0.967618 (matching the big-3conv teacher)
-  test_fs_accuracy    0.962517 (matching file-extension truth)
-  exported size       100,444 bytes
+Expected shipped artifact:
+  test_fs_accuracy    0.965238 (manifest-aligned filesystem-label split)
+  macro_recall        0.965411
+  exported size       47,840 bytes
 
 Usage:
-    python scripts/train_v2_student.py                  # default: bigorig-500k cache
+    python scripts/train_v2_student.py                  # uses local cache defaults
     python scripts/train_v2_student.py --output other.bin
     python scripts/train_v2_student.py --dry-run
 """
@@ -57,16 +56,16 @@ TRAINER = REPO_ROOT / "scripts" / "train_magika_qat_student.py"
 DEFAULTS = {
     "python": os.environ.get("PY", "python3"),
     "dataset": "/tmp/magika-source-corpus-bigorig/files",
-    "cache_dir": "/tmp/magika-source-qat-cache-bigorig-500k",
+    "cache_dir": "/tmp/magika-source-qat-cache-guesslang-direct-fs-pruned48",
     "magika_model": "/tmp/magika/assets/models/standard_v3_3/model.onnx",
-    "magika_config": "/tmp/magika/assets/models/standard_v3_3/config.min.json",
-    "self_probabilities": "/tmp/magika-source-qat-cache-bigorig-500k",
+    "magika_config": "/tmp/magika/assets/models/standard_v3_3/config.pruned48.min.json",
+    "self_probabilities": "/tmp/magika-source-qat-cache-guesslang-direct-fs-pruned48",
     "output": str(REPO_ROOT / "assets" / "magika" / "source-student-q4.bin"),
     "confusion_output": str(REPO_ROOT / "assets" / "magika" / "source-student-q4-confusion.json"),
-    "max_export_bytes": 110000,
+    "max_export_bytes": 50000,
 }
 
-ARCHITECTURE = "wordseq-b1536-k3-m2048-med-3conv-hidden"
+ARCHITECTURE = "wordseq-b1024-k3-m2048-tiny-3conv-hidden"
 
 
 def build_cmd(a: argparse.Namespace) -> list[str]:

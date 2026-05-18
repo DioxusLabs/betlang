@@ -40,9 +40,8 @@ impl Detection {
 
     /// Return detected languages sorted from most likely to least likely.
     ///
-    /// The iterator yields `(probability, language)` pairs. Probabilities are
-    /// aggregated across embedded model classes that map to the same public
-    /// [`Language`], so each public language appears at most once.
+    /// The iterator yields `(probability, language)` pairs, one per model
+    /// output language.
     ///
     /// ```
     /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
@@ -64,11 +63,10 @@ impl Detection {
 
 /// Detect the source language for bytes-like input.
 ///
-/// Use [`Language::slug`] to map predicted languages to Arborium/tree-sitter
-/// identifiers. [`Detection::language`] returns [`None`] when the input is
-/// empty, effectively whitespace only, or too short to build the model window.
-/// The input may be a UTF-8 string, raw byte slice, or another type that can be
-/// borrowed as bytes.
+/// Use [`Language::slug`] to read the model label slug. [`Detection::language`]
+/// returns [`None`] when the input is empty, effectively whitespace only, or too
+/// short to build the model window. The input may be a UTF-8 string, raw byte
+/// slice, or another type that can be borrowed as bytes.
 ///
 /// ```
 /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");

@@ -15,39 +15,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  docs-hygiene:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check spelling
-        uses: crate-ci/typos@master
-      - name: Check links
-        uses: lycheeverse/lychee-action@v2
-        with:
-          args: >-
-            --no-progress
-            --exclude https://docs.rs/betlang
-            --exclude https://crates.io/crates/betlang
-            README.md
-            MODEL_CARD.md
-            RELEASING.md
-            scripts/TRAINING.md
+  check:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/check.yml@v0.1.0
 
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets --all-features
-      - name: Docs
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -Dwarnings
-      - name: Package
-        run: cargo package --locked
+  test:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/test.yml@v0.1.0
+
+  fmt:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/fmt.yml@v0.1.0
+
+  docs:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/docs.yml@v0.1.0
+
+  clippy:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/clippy.yml@v0.1.0

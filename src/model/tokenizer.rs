@@ -1,19 +1,15 @@
-use super::constants::{BRACKET_FLAG, INDENT_FLAG, MAX_UNITS, NUM_FLAG, PUNCT_FLAG, WORD_MASK};
+use super::{
+    constants::{BRACKET_FLAG, INDENT_FLAG, MAX_UNITS, NUM_FLAG, PUNCT_FLAG, WORD_MASK},
+    window::TokenWindow,
+};
 
 pub(crate) fn hash_unit_bytes(bytes: &[u8]) -> u32 {
-    const PRIME: u64 = 2_654_435_761;
-    let mut h: u64 = 0;
+    const PRIME: u32 = 2_654_435_761;
+    let mut h = 0u32;
     for &b in bytes {
-        h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+        h = h.wrapping_mul(PRIME).wrapping_add(b as u32);
     }
-    h as u32
-}
-
-fn flush_hashed(buffer: &mut Vec<u8>, out: &mut Vec<i32>, flag: u32, extra_bits: u32) {
-    if !buffer.is_empty() && out.len() < MAX_UNITS {
-        out.push(((hash_unit_bytes(buffer) & WORD_MASK) | flag | extra_bits) as i32);
-    }
-    buffer.clear();
+    h
 }
 
 fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
@@ -22,22 +18,60 @@ fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
     }
 }
 
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    #[default]
+    Empty,
+    Word,
+    Number,
+    Punct,
+}
+
+#[derive(Default)]
+struct TokenBuffer {
+    kind: TokenKind,
+    bytes: Vec<u8>,
+}
+
+impl TokenBuffer {
+    fn is_number(&self) -> bool {
+        self.kind == TokenKind::Number
+    }
+
+    fn flush(&mut self, out: &mut Vec<i32>) {
+        let flag = match self.kind {
+            TokenKind::Empty => return,
+            TokenKind::Word => 0,
+            TokenKind::Number => NUM_FLAG,
+            TokenKind::Punct => PUNCT_FLAG,
+        };
+        if out.len() < MAX_UNITS {
+            out.push(((hash_unit_bytes(&self.bytes) & WORD_MASK) | flag) as i32);
+        }
+        self.bytes.clear();
+        self.kind = TokenKind::Empty;
+    }
+
+    fn push(&mut self, kind: TokenKind, value: u8, out: &mut Vec<i32>) {
+        if self.kind != kind {
+            self.flush(out);
+            self.kind = kind;
+        }
+        self.bytes.push(value);
+    }
+}
+
 /// Production word-unit tokenizer version 3.
 ///
 /// Case-folds word hashes and emits unambiguous brackets as BRACKET_FLAG tokens.
-pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
+pub(crate) fn tokenize(window: &TokenWindow) -> Vec<i32> {
+    let bytes = window.bytes();
     let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
-    let mut word: Vec<u8> = Vec::new();
-    let mut number: Vec<u8> = Vec::new();
-    let mut punct: Vec<u8> = Vec::new();
+    let mut current = TokenBuffer::default();
     let mut at_line_start = true;
     let mut indent_units: u32 = 0;
 
-    for (col, &raw_value) in bytes.iter().enumerate() {
-        if padding_mask[col] {
-            break;
-        }
-
+    for &raw_value in bytes {
         let value = raw_value.to_ascii_lowercase();
         let is_letter = value.is_ascii_lowercase() || value == b'_';
         let is_digit = value.is_ascii_digit();
@@ -45,18 +79,6 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
         let is_cr = value == b'\r';
         let is_space = value == b' ' || value == b'\t';
         let is_bracket = matches!(value, b'(' | b')' | b'[' | b']' | b'{' | b'}');
-
-        if !is_letter {
-            flush_hashed(&mut word, &mut out, 0, 0);
-        }
-        if !(is_digit || value == b'.') {
-            flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
-        }
-        let need_flush_punct =
-            is_letter || is_digit || is_space || is_newline || is_cr || is_bracket || value == b'.';
-        if need_flush_punct {
-            flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
-        }
 
         if out.len() >= MAX_UNITS {
             break;
@@ -68,17 +90,18 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             }
             at_line_start = false;
             indent_units = 0;
-            word.push(value);
+            current.push(TokenKind::Word, value, &mut out);
             continue;
         }
         if is_digit || value == b'.' {
-            if value == b'.' && number.is_empty() {
+            if value == b'.' && !current.is_number() {
                 if at_line_start {
                     push_indent_unit(&mut out, indent_units);
                 }
                 at_line_start = false;
                 indent_units = 0;
-                punct.push(value);
+                current.flush(&mut out);
+                current.push(TokenKind::Punct, value, &mut out);
                 continue;
             }
             if at_line_start {
@@ -86,10 +109,11 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             }
             at_line_start = false;
             indent_units = 0;
-            number.push(value);
+            current.push(TokenKind::Number, value, &mut out);
             continue;
         }
         if is_newline {
+            current.flush(&mut out);
             if at_line_start {
                 push_indent_unit(&mut out, indent_units);
             }
@@ -101,6 +125,7 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             continue;
         }
         if is_cr {
+            current.flush(&mut out);
             continue;
         }
         if at_line_start && is_space {
@@ -113,6 +138,7 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
         at_line_start = false;
         indent_units = 0;
         if is_space {
+            current.flush(&mut out);
             let space_token = ((b' ' as u32) | PUNCT_FLAG) as i32;
             if out.last() != Some(&space_token) && out.len() < MAX_UNITS {
                 out.push(space_token);
@@ -120,17 +146,16 @@ pub(crate) fn tokenize(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             continue;
         }
         if is_bracket {
+            current.flush(&mut out);
             if out.len() < MAX_UNITS {
                 out.push(((value as u32) | BRACKET_FLAG) as i32);
             }
             continue;
         }
-        punct.push(value);
+        current.push(TokenKind::Punct, value, &mut out);
     }
 
-    flush_hashed(&mut word, &mut out, 0, 0);
-    flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
-    flush_hashed(&mut punct, &mut out, PUNCT_FLAG, 0);
+    current.flush(&mut out);
 
     out
 }

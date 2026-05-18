@@ -8,7 +8,10 @@ import csv
 import hashlib
 import json
 import os
+import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +53,11 @@ BUCKETS = [
 ]
 
 
+@dataclass(frozen=True)
+class BlobRecord:
+    oid: str
+
+
 def token_hash(values: np.ndarray | list[int]) -> bytes:
     arr = np.asarray(values, dtype="<u2")
     return hashlib.blake2b(arr.tobytes(), digest_size=16).digest()
@@ -62,18 +70,7 @@ def source_paths(split_dir: Path):
             yield Path(root) / filename
 
 
-def read_window_tokens(path: Path) -> tuple[np.ndarray, int] | None:
-    try:
-        size = path.stat().st_size
-        with path.open("rb") as file:
-            prefix = file.read(MAGIKA_BLOCK_SIZE)
-            if size <= MAGIKA_BLOCK_SIZE:
-                suffix = prefix
-            else:
-                file.seek(max(0, size - MAGIKA_BLOCK_SIZE))
-                suffix = file.read(MAGIKA_BLOCK_SIZE)
-    except OSError:
-        return None
+def window_tokens(size: int, prefix: bytes, suffix: bytes) -> np.ndarray | None:
     if size == 0:
         return None
 
@@ -88,7 +85,25 @@ def read_window_tokens(path: Path) -> tuple[np.ndarray, int] | None:
     end_data = stripped_end[-MAGIKA_END_SIZE:]
     end = [MAGIKA_PADDING_TOKEN] * (MAGIKA_END_SIZE - len(end_data))
     end.extend(end_data)
-    return np.asarray(beg + end, dtype=np.uint16), size
+    return np.asarray(beg + end, dtype=np.uint16)
+
+
+def read_window_tokens(path: Path) -> tuple[np.ndarray, int] | None:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as file:
+            prefix = file.read(MAGIKA_BLOCK_SIZE)
+            if size <= MAGIKA_BLOCK_SIZE:
+                suffix = prefix
+            else:
+                file.seek(max(0, size - MAGIKA_BLOCK_SIZE))
+                suffix = file.read(MAGIKA_BLOCK_SIZE)
+    except OSError:
+        return None
+    tokens = window_tokens(size, prefix, suffix)
+    if tokens is None:
+        return None
+    return tokens, size
 
 
 def align_file_sizes(dataset: Path, cache_dir: Path, split: str, n: int) -> tuple[np.ndarray, dict[str, int]]:
@@ -164,14 +179,211 @@ def align_file_sizes(dataset: Path, cache_dir: Path, split: str, n: int) -> tupl
     }
 
 
-def load_model(checkpoint: Path, cache_dir: Path, architecture: str, split: str):
-    meta = json.loads((cache_dir / f"{split}.json").read_text())
-    classes = int(meta["classes"])
+def read_batch_object(stdout, oid: str) -> bytes | None:
+    header = stdout.readline()
+    if not header:
+        return None
+    try:
+        decoded = header.decode("utf-8", "replace").rstrip("\n")
+        parts = decoded.split()
+        if len(parts) < 2 or parts[0] != oid:
+            return None
+        if parts[1] == "missing":
+            return None
+        if len(parts) < 3 or parts[1] != "blob":
+            return None
+        size = int(parts[2])
+        content = stdout.read(size)
+        stdout.read(1)
+        return content
+    except Exception:
+        return None
+
+
+def load_manifest_records(manifest: Path, split: str) -> dict[str, list[BlobRecord]]:
+    records: dict[str, list[BlobRecord]] = {}
+    with manifest.open(newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            if row.get("usage") != split:
+                continue
+            repo = str(row["repository_dirname"])
+            records.setdefault(repo, []).append(BlobRecord(oid=str(row["oid"])))
+    return records
+
+
+def process_blob_repo(repo: str, records: list[BlobRecord], repositories_dir: Path) -> tuple[list[tuple[bytes, int]], dict[str, int]]:
+    repo_path = repositories_dir / repo
+    stats = {"seen": 0, "missing": 0, "skipped": 0, "kept": 0}
+    output: list[tuple[bytes, int]] = []
+    try:
+        proc = subprocess.Popen(
+            ["timeout", "900", "git", "cat-file", "--batch"],
+            cwd=repo_path,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        stats["missing"] += len(records)
+        return output, stats
+
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    try:
+        try:
+            proc.stdin.write(("".join(record.oid + "\n" for record in records)).encode("ascii"))
+            proc.stdin.close()
+        except BrokenPipeError:
+            stats["missing"] += len(records)
+            return output, stats
+        for record in records:
+            stats["seen"] += 1
+            content = read_batch_object(proc.stdout, record.oid)
+            if content is None:
+                stats["missing"] += 1
+                continue
+            size = len(content)
+            prefix = content[:MAGIKA_BLOCK_SIZE]
+            suffix = content if size <= MAGIKA_BLOCK_SIZE else content[-MAGIKA_BLOCK_SIZE:]
+            tokens = window_tokens(size, prefix, suffix)
+            if tokens is None:
+                stats["skipped"] += 1
+                continue
+            output.append((token_hash(tokens), size))
+            stats["kept"] += 1
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    return output, stats
+
+
+def align_git_blob_sizes(
+    manifest: Path,
+    repositories_dir: Path,
+    cache_dir: Path,
+    split: str,
+    n: int,
+    workers: int,
+) -> tuple[np.ndarray, dict[str, int]]:
+    sizes_cache = cache_dir / f"{split}.sizes.mmap"
+    if sizes_cache.exists() and sizes_cache.stat().st_size == n * np.dtype(np.int64).itemsize:
+        sizes = np.asarray(np.memmap(sizes_cache, dtype=np.int64, mode="r", shape=(n,))).copy()
+        if np.any(sizes < 0):
+            raise SystemExit(f"{sizes_cache} contains negative size rows")
+        return sizes, {
+            "source": 1,
+            "loaded_sizes_cache": 1,
+            "seen_records": 0,
+            "missing_records": 0,
+            "skipped_records": 0,
+            "kept_records": 0,
+            "matched_hash_rows": n,
+            "ambiguous_size_keys": 0,
+            "extra_full_window_matches": 0,
+            "missing_full_window_rows": 0,
+            "prefix_fallback_rows": 0,
+            "size_collisions": 0,
+        }
+
+    tokens = np.memmap(cache_dir / f"{split}.tokens.mmap", dtype=np.uint16, mode="r", shape=(n, TOKEN_LENGTH))
+    full_rows: dict[bytes, list[int]] = {}
+    for row in range(n):
+        full_rows.setdefault(token_hash(tokens[row]), []).append(row)
+
+    records = load_manifest_records(manifest, split)
+    raw_sizes_by_full: dict[bytes, list[int]] = {}
+    total_stats = {"seen": 0, "missing": 0, "skipped": 0, "kept": 0}
+    worker_count = max(1, workers)
+    completed = 0
+    print(
+        f"aligning sizes from git manifest repos={len(records)} workers={worker_count}",
+        flush=True,
+    )
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(process_blob_repo, repo, repo_records, repositories_dir)
+            for repo, repo_records in records.items()
+        ]
+        for future in as_completed(futures):
+            completed += 1
+            pairs, stats = future.result()
+            for key, value in stats.items():
+                total_stats[key] += value
+            for key, size in pairs:
+                if key in full_rows:
+                    raw_sizes_by_full.setdefault(key, []).append(size)
+            if completed % 1000 == 0:
+                print(
+                    "size_alignment_progress="
+                    f"{completed}/{len(futures)} stats={json.dumps(total_stats, sort_keys=True)}",
+                    flush=True,
+                )
+
+    sizes = np.full(n, -1, dtype=np.int64)
+    matched_hash_rows = 0
+    ambiguous_size_keys = 0
+    extra_full_window_matches = 0
+    missing_full_window_rows = 0
+    for key, rows in full_rows.items():
+        raw_sizes = raw_sizes_by_full.get(key, [])
+        if not raw_sizes:
+            missing_full_window_rows += len(rows)
+            continue
+        if len(raw_sizes) != len(rows) or len(set(raw_sizes)) > 1:
+            ambiguous_size_keys += 1
+        if len(raw_sizes) > len(rows):
+            extra_full_window_matches += len(raw_sizes) - len(rows)
+        for row, size in zip(rows, raw_sizes):
+            sizes[row] = size
+            matched_hash_rows += 1
+
+    missing_rows = int((sizes < 0).sum())
+    if missing_rows:
+        raise SystemExit(f"could not align sizes for {missing_rows} cache rows from git manifest")
+
+    sizes_out = np.memmap(sizes_cache, dtype=np.int64, mode="w+", shape=(n,))
+    sizes_out[:] = sizes
+    sizes_out.flush()
+    del sizes_out
+
+    return sizes, {
+        "source": 2,
+        "loaded_sizes_cache": 0,
+        "seen_records": total_stats["seen"],
+        "missing_records": total_stats["missing"],
+        "skipped_records": total_stats["skipped"],
+        "kept_records": total_stats["kept"],
+        "matched_hash_rows": matched_hash_rows,
+        "ambiguous_size_keys": ambiguous_size_keys,
+        "extra_full_window_matches": extra_full_window_matches,
+        "missing_full_window_rows": missing_full_window_rows,
+        "prefix_fallback_rows": 0,
+        "size_collisions": 0,
+    }
+
+
+def load_model(checkpoint: Path, architecture: str):
+    layer_weights, metadata = load_exported_layer_weights(checkpoint)
+    labels = [str(label) for label in metadata.get("labels", [])]
+    classes = len(labels)
+    if classes == 0:
+        raise SystemExit(f"{checkpoint} metadata does not contain exported labels")
     if not architecture_uses_word_units(architecture):
         raise SystemExit("only wordseq architectures are supported")
     cfg = wordseq_config_for_architecture(architecture)
     model = build_word_seq_hashembed_hidden_model(classes, bits=4, **cfg)
-    layer_weights, model_info = load_exported_layer_weights(checkpoint)
     loaded = 0
     for layer in model.layers:
         if layer.name not in layer_weights:
@@ -185,7 +397,37 @@ def load_model(checkpoint: Path, cache_dir: Path, architecture: str, split: str)
         layer.set_weights([tgt.astype(cur.dtype) for cur, tgt in zip(current, target)])
         loaded += 1
     print(f"loaded weights into {loaded} layers", flush=True)
-    return model, model_info, meta
+    return model, metadata
+
+
+def label_remap(cache_labels: list[str], model_labels: list[str]) -> np.ndarray:
+    cache_index = {label: index for index, label in enumerate(cache_labels)}
+    missing = [label for label in model_labels if label not in cache_index]
+    if missing:
+        raise SystemExit(f"model labels are missing from cache metadata: {', '.join(missing)}")
+
+    old_to_new = np.full(len(cache_labels), -1, dtype=np.int64)
+    for new_index, label in enumerate(model_labels):
+        old_to_new[cache_index[label]] = new_index
+    return old_to_new
+
+
+def remap_labels(
+    labels: np.ndarray,
+    old_to_new: np.ndarray,
+    cache_labels: list[str],
+    name: str,
+    *,
+    allow_missing: bool = False,
+) -> np.ndarray:
+    if labels.size and (labels.min() < 0 or labels.max() >= old_to_new.shape[0]):
+        raise SystemExit(f"{name} contains label ids outside cache metadata bounds")
+    mapped = old_to_new[labels]
+    if np.any(mapped < 0) and not allow_missing:
+        missing_ids = sorted(set(int(value) for value in labels[mapped < 0]))
+        missing_names = [cache_labels[index] for index in missing_ids]
+        raise SystemExit(f"{name} contains labels absent from model head: {', '.join(missing_names)}")
+    return mapped.astype(np.int64, copy=False)
 
 
 def predict(model, units: np.memmap, batch_size: int) -> np.ndarray:
@@ -242,7 +484,7 @@ def top_confusions(matrix: np.ndarray, label_names: list[str], limit: int = 6) -
 
 def write_csv(path: Path, split: str, matrices: list[np.ndarray], byte_matrices: list[np.ndarray], labels: list[str]) -> None:
     with path.open("w", newline="") as file:
-        writer = csv.writer(file)
+        writer = csv.writer(file, lineterminator="\n")
         writer.writerow(["split", "bucket", "actual", "predicted", "count", "bytes"])
         for bucket, matrix in zip(BUCKETS, matrices):
             bucket_name = bucket[0]
@@ -262,30 +504,66 @@ def write_markdown(
     checkpoint: Path,
     cache_dir: Path,
     dataset: Path,
+    manifest: Path | None,
+    repositories_dir: Path | None,
     split: str,
     matrices: list[np.ndarray],
     byte_matrices: list[np.ndarray],
     labels: list[str],
     alignment: dict[str, int],
     teacher_parity: float,
+    teacher_parity_rows: int,
     fs_accuracy: float,
+    dropped_labels: list[str],
 ) -> None:
+    teacher_text = "n/a"
+    if np.isfinite(teacher_parity):
+        teacher_text = f"{teacher_parity * 100:.3f}% over {teacher_parity_rows:,} active-teacher rows"
+    dropped_text = "none"
+    if dropped_labels:
+        dropped_text = ", ".join(f"`{label}`" for label in dropped_labels)
+    if "seen_files" in alignment:
+        alignment_text = (
+            f"Cached test rows: {sum(int(m.sum()) for m in matrices):,}. "
+            f"Raw files scanned for alignment: {alignment['seen_files']:,}. "
+            f"Full-window matched rows: {alignment['matched_hash_rows']:,}. "
+            f"Prefix fallback rows: {alignment['prefix_fallback_rows']:,}."
+        )
+    elif alignment.get("loaded_sizes_cache"):
+        alignment_text = (
+            f"Cached test rows: {sum(int(m.sum()) for m in matrices):,}. "
+            "File sizes were loaded from the cached size mmap."
+        )
+    else:
+        alignment_text = (
+            f"Cached test rows: {sum(int(m.sum()) for m in matrices):,}. "
+            f"Manifest blob records scanned for alignment: {alignment['seen_records']:,}. "
+            f"Full-window matched rows: {alignment['matched_hash_rows']:,}. "
+            f"Skipped blob records: {alignment['skipped_records']:,}."
+        )
+    source_lines = [
+        f"Source cache: `{cache_dir}`",
+        f"Checkpoint: `{checkpoint}`",
+    ]
+    if manifest is not None:
+        source_lines.extend([
+            f"Alignment manifest: `{manifest}`",
+            f"Repositories: `{repositories_dir}`",
+        ])
+    else:
+        source_lines.append(f"Raw corpus split: `{dataset / split}`")
     lines = [
         "# Actual Dataset Confusion By File Size",
         "",
-        f"Source cache: `{cache_dir}`",
-        f"Raw corpus split: `{dataset / split}`",
-        f"Checkpoint: `{checkpoint}`",
+        *source_lines,
         "",
-        f"Cached test rows: {sum(int(m.sum()) for m in matrices):,}. "
-        f"Raw files scanned for alignment: {alignment['seen_files']:,}. "
-        f"Full-window matched rows: {alignment['matched_hash_rows']:,}. "
-        f"Prefix fallback rows: {alignment['prefix_fallback_rows']:,}.",
-        f"Overall test fs accuracy: {fs_accuracy * 100:.3f}%. Teacher parity: {teacher_parity * 100:.3f}%.",
+        alignment_text,
+        f"Overall test fs accuracy: {fs_accuracy * 100:.3f}%. Teacher parity: {teacher_text}.",
         "",
-        "Labels are the 67 Magika source labels from `test.json`. Actual labels use "
-        "`test.fs_labels.mmap`, which is filesystem-extension labels where mapped "
-        "and teacher fallback where unmapped.",
+        f"Labels are the {len(labels)} exported model labels. Cache labels absent "
+        f"from this model head are not evaluated or predicted: {dropped_text}. "
+        "Actual labels use `test.fs_labels.mmap`, which is filesystem-extension "
+        "labels where mapped and teacher fallback where unmapped.",
         "",
         "## Summary",
         "",
@@ -342,65 +620,145 @@ def format_bytes(value: int) -> str:
     raise AssertionError
 
 
-def render_png(
-    path: Path,
-    matrices: list[np.ndarray],
-    labels: list[str],
-    fs_accuracy: float,
-) -> None:
-    cmap = plt.get_cmap("magma_r").copy()
-    cmap.set_bad("white")
-    fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160)
+FIGURE_BACKGROUND = "#000000"
+PRIMARY_TEXT = "#f8fafc"
+SECONDARY_TEXT = "#cbd5e1"
+GRID_COLOR = "#1f2937"
+
+
+def plot_confusion_panel(ax, title: str, matrix: np.ndarray, labels: list[str], cmap) -> object:
+    ax.set_facecolor(FIGURE_BACKGROUND)
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized = np.divide(
+            matrix,
+            row_sums,
+            out=np.zeros_like(matrix, dtype=np.float64),
+            where=row_sums != 0,
+        )
+    masked = np.ma.masked_where(normalized <= 0, normalized)
+    image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
+    total = int(matrix.sum())
+    acc = float(np.trace(matrix) / total) if total else 0.0
+    ax.set_title(
+        f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%",
+        fontsize=13,
+        weight="bold",
+        color=PRIMARY_TEXT,
+    )
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=90, fontsize=5)
+    ax.set_yticklabels(labels, fontsize=5)
+    ax.set_xlabel("Predicted", fontsize=10, color=PRIMARY_TEXT)
+    ax.set_ylabel("Actual", fontsize=10, color=PRIMARY_TEXT)
+    ax.set_xticks(np.arange(-0.5, len(labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
+    ax.grid(which="minor", color=GRID_COLOR, linewidth=0.25)
+    ax.tick_params(length=0, colors=SECONDARY_TEXT)
+    for spine in ax.spines.values():
+        spine.set_color(SECONDARY_TEXT)
+    return image
+
+
+COLORBAR_TICKS = [0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0]
+COLORBAR_TICK_LABELS = ["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"]
+
+
+def configure_colorbar(fig, image, axes=None, *, cax=None, label: str = "Share of actual label") -> None:
+    if cax is None:
+        cbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.025)
+    else:
+        cbar = fig.colorbar(image, cax=cax)
+    cbar.ax.set_facecolor(FIGURE_BACKGROUND)
+    cbar.outline.set_edgecolor(SECONDARY_TEXT)
+    cbar.ax.tick_params(colors=PRIMARY_TEXT)
+    cbar.set_label(label, fontsize=10, color=PRIMARY_TEXT)
+    cbar.set_ticks(COLORBAR_TICKS)
+    cbar.set_ticklabels(COLORBAR_TICK_LABELS)
+
+
+def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], fs_accuracy: float) -> None:
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad(FIGURE_BACKGROUND)
+    fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160, facecolor=FIGURE_BACKGROUND)
     axes_flat = axes.ravel()
     image = None
+
     for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
-        row_sums = matrix.sum(axis=1, keepdims=True)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            normalized = np.divide(
-                matrix,
-                row_sums,
-                out=np.zeros_like(matrix, dtype=np.float64),
-                where=row_sums != 0,
-            )
-        masked = np.ma.masked_where(normalized <= 0, normalized)
-        image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
-        total = int(matrix.sum())
-        acc = float(np.trace(matrix) / total) if total else 0.0
-        ax.set_title(f"{bucket[0]}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
-        ax.set_xticks(np.arange(len(labels)))
-        ax.set_yticks(np.arange(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=5)
-        ax.set_yticklabels(labels, fontsize=5)
-        ax.set_xlabel("Predicted", fontsize=10)
-        ax.set_ylabel("Actual", fontsize=10)
-        ax.set_xticks(np.arange(-0.5, len(labels), 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
-        ax.grid(which="minor", color="#eef2f7", linewidth=0.25)
-        ax.tick_params(length=0)
-    fig.suptitle("Betlang wordseq confusion matrices by file size", fontsize=24, weight="bold", y=0.995)
+        image = plot_confusion_panel(ax, bucket[0], matrix, labels, cmap)
+    axes_flat[len(BUCKETS)].set_facecolor(FIGURE_BACKGROUND)
+    axes_flat[len(BUCKETS)].axis("off")
+
+    fig.suptitle(
+        "Betlang wordseq confusion matrices by file size",
+        fontsize=24,
+        weight="bold",
+        y=0.995,
+        color=PRIMARY_TEXT,
+    )
     fig.text(
         0.01,
         0.972,
         "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
-        f"for the held-out bigorig test split. Overall file accuracy: {fs_accuracy * 100:.2f}%.",
+        f"for each held-out filesystem-label size bucket. Overall file accuracy: {fs_accuracy * 100:.2f}%.",
         fontsize=11,
-        color="#334155",
+        color=PRIMARY_TEXT,
     )
     fig.text(
         0.01,
         0.956,
         "Off-diagonal cells show where each actual language is confused within that size bucket. "
-        "Full raw counts and byte totals are in actual_dataset_confusion_by_size.csv.",
+        "The overall matrix is split out in assets/confusion-overall.png.",
         fontsize=11,
-        color="#64748b",
+        color=SECONDARY_TEXT,
     )
-    if image is not None:
-        cbar = fig.colorbar(image, cax=axes_flat[-1])
-        cbar.set_label("Share of actual label in bucket", fontsize=10)
-        cbar.set_ticks([0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])
-        cbar.set_ticklabels(["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"])
     fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
-    fig.savefig(path, bbox_inches="tight")
+    if image is not None:
+        configure_colorbar(
+            fig,
+            image,
+            axes=axes_flat[: len(BUCKETS)],
+            label="Share of actual label in bucket",
+        )
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+
+
+def render_overall_png(path: Path, matrix: np.ndarray, labels: list[str], fs_accuracy: float) -> None:
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad(FIGURE_BACKGROUND)
+    fig, ax = plt.subplots(figsize=(18, 17), dpi=180, facecolor=FIGURE_BACKGROUND)
+    image = plot_confusion_panel(ax, "Overall", matrix, labels, cmap)
+    ax.set_title(
+        f"Overall  |  n={int(matrix.sum()):,}  |  acc={fs_accuracy * 100:.2f}%",
+        fontsize=16,
+        weight="bold",
+        color=PRIMARY_TEXT,
+    )
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Predicted", fontsize=12, color=PRIMARY_TEXT)
+    ax.set_ylabel("Actual", fontsize=12, color=PRIMARY_TEXT)
+    fig.suptitle(
+        "Betlang wordseq overall confusion matrix",
+        fontsize=24,
+        weight="bold",
+        y=0.995,
+        color=PRIMARY_TEXT,
+    )
+    fig.text(
+        0.01,
+        0.962,
+        "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
+        "for the held-out filesystem-label test split.",
+        fontsize=11,
+        color=PRIMARY_TEXT,
+    )
+    fig.subplots_adjust(left=0.11, right=0.84, top=0.925, bottom=0.12)
+    scale_ax = fig.add_axes([0.875, 0.18, 0.05, 0.65])
+    configure_colorbar(fig, image, cax=scale_ax)
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
@@ -409,29 +767,39 @@ def main() -> int:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--repositories-dir", type=Path)
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--size-workers", type=int, default=32)
+    parser.add_argument("--unit-tokenizer", type=int)
     parser.add_argument("--csv-output", type=Path, default=Path("actual_dataset_confusion_by_size.csv"))
     parser.add_argument("--markdown-output", type=Path, default=Path("actual_dataset_confusion_by_size.md"))
     parser.add_argument("--png-output", type=Path, default=Path("assets/confusion-by-size.png"))
+    parser.add_argument("--overall-png-output", type=Path, default=Path("assets/confusion-overall.png"))
     args = parser.parse_args()
 
     split_meta = json.loads((args.cache_dir / f"{args.split}.json").read_text())
     n = int(split_meta["count"])
-    labels = [str(label) for label in split_meta["labels"]]
-    classes = int(split_meta["classes"])
-    print(f"split={args.split} n={n} classes={classes}", flush=True)
+    cache_labels = [str(label) for label in split_meta["labels"]]
+    cache_classes = int(split_meta["classes"])
 
-    model, model_info, _ = load_model(args.checkpoint, args.cache_dir, args.architecture, args.split)
-    tokenizer = model_info.get("tokenizer_version")
-    if tokenizer != 3:
-        raise SystemExit(
-            f"unsupported checkpoint tokenizer_version={tokenizer!r}; "
-            "this report supports only v3"
-        )
-    print("checkpoint tokenizer_version=3 using units_v3", flush=True)
-    units = np.memmap(args.cache_dir / f"{args.split}.units_v3.mmap", dtype=np.int32, mode="r", shape=(n, TOKEN_LENGTH))
+    model, metadata = load_model(args.checkpoint, args.architecture)
+    labels = [str(label) for label in metadata["labels"]]
+    classes = len(labels)
+    old_to_new = label_remap(cache_labels, labels)
+    label_set = set(labels)
+    dropped_labels = [label for label in cache_labels if label not in label_set]
+    print(
+        f"split={args.split} n={n} cache_classes={cache_classes} model_classes={classes}",
+        flush=True,
+    )
+    if dropped_labels:
+        print(f"dropped_cache_labels={','.join(dropped_labels)}", flush=True)
+    tokenizer = args.unit_tokenizer if args.unit_tokenizer is not None else int(metadata.get("tokenizer_version") or 2)
+    print(f"checkpoint tokenizer_version={metadata.get('tokenizer_version', 'legacy-v2')} using units_v{tokenizer}", flush=True)
+    units = np.memmap(args.cache_dir / f"{args.split}.units_v{tokenizer}.mmap", dtype=np.int32, mode="r", shape=(n, TOKEN_LENGTH))
     preds = predict(model, units, args.batch_size)
 
     teacher_labels = np.asarray(np.memmap(args.cache_dir / f"{args.split}.labels.mmap", dtype=np.int64, mode="r", shape=(n,)))
@@ -441,12 +809,32 @@ def main() -> int:
         if fs_labels_path.exists()
         else teacher_labels
     )
-    teacher_parity = float((preds == teacher_labels).mean())
+    teacher_labels = remap_labels(teacher_labels, old_to_new, cache_labels, "teacher labels", allow_missing=True)
+    target_labels = remap_labels(target_labels, old_to_new, cache_labels, "target labels")
+    active_teacher_rows = teacher_labels >= 0
+    teacher_parity_rows = int(active_teacher_rows.sum())
+    teacher_parity = (
+        float((preds[active_teacher_rows] == teacher_labels[active_teacher_rows]).mean())
+        if teacher_parity_rows
+        else float("nan")
+    )
     fs_accuracy = float((preds == target_labels).mean())
     print(f"{args.split}_teacher_parity={teacher_parity:.6f}", flush=True)
     print(f"{args.split}_fs_accuracy={fs_accuracy:.6f}", flush=True)
 
-    sizes, alignment = align_file_sizes(args.dataset, args.cache_dir, args.split, n)
+    if args.manifest is not None:
+        if args.repositories_dir is None:
+            raise SystemExit("--repositories-dir is required with --manifest")
+        sizes, alignment = align_git_blob_sizes(
+            args.manifest,
+            args.repositories_dir,
+            args.cache_dir,
+            args.split,
+            n,
+            args.size_workers,
+        )
+    else:
+        sizes, alignment = align_file_sizes(args.dataset, args.cache_dir, args.split, n)
     print(f"size_alignment={json.dumps(alignment, sort_keys=True)}", flush=True)
 
     matrices, byte_matrices, _ = build_bucket_matrices(target_labels, preds, sizes, classes)
@@ -456,18 +844,25 @@ def main() -> int:
         args.checkpoint,
         args.cache_dir,
         args.dataset,
+        args.manifest,
+        args.repositories_dir,
         args.split,
         matrices,
         byte_matrices,
         labels,
         alignment,
         teacher_parity,
+        teacher_parity_rows,
         fs_accuracy,
+        dropped_labels,
     )
-    render_png(args.png_output, matrices, labels, fs_accuracy)
+    overall_matrix = np.sum(np.stack(matrices, axis=0), axis=0)
+    render_size_png(args.png_output, matrices, labels, fs_accuracy)
+    render_overall_png(args.overall_png_output, overall_matrix, labels, fs_accuracy)
     print(f"csv_output={args.csv_output}", flush=True)
     print(f"markdown_output={args.markdown_output}", flush=True)
     print(f"png_output={args.png_output}", flush=True)
+    print(f"overall_png_output={args.overall_png_output}", flush=True)
     return 0
 
 

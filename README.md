@@ -3,11 +3,11 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU source-language detection for code with a tiny 100kb model.
+CPU source-language detection for code with a tiny 50kb model.
 
 ```toml
 [dependencies]
-betlang = "0.0.1"
+betlang = "0.1.0"
 ```
 
 ```rust
@@ -16,10 +16,8 @@ let detection = betlang::detect("fn main() { println!(\"hi\"); }");
 assert_eq!(detection.language(), Some(betlang::Language::Rust));
 ```
 
-Use `betlang::detect(source)` for UTF-8 source strings. Use
-`betlang::detect_bytes(bytes)` for scanners that already work with file bytes
-and should not reject non-UTF-8 input before classification. Both return a
-`Detection`; call `Detection::language()` to read the top language.
+Use `betlang::detect(source)` for UTF-8 source strings or byte slices. It
+returns a `Detection`; call `Detection::language()` to read the top language.
 Call `Detection::top_languages()` when you need ranked probabilities.
 
 ## Supported Languages
@@ -30,32 +28,32 @@ Slugs parse through the standard `FromStr` implementation:
 assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
 ```
 
-`asm`, `awk`, `batch`, `bash`, `c`, `c-sharp`, `clojure`, `cmake`, `cobol`,
-`commonlisp`, `cpp`, `css`, `dart`, `diff`, `dockerfile`, `elixir`, `erlang`,
-`go`, `groovy`, `haskell`, `hcl`, `html`, `ini`, `java`, `javascript`,
-`jinja2`, `json`, `julia`, `kotlin`, `lua`, `markdown`, `matlab`, `objc`,
-`ocaml`, `perl`, `php`, `postscript`, `powershell`, `prolog`, `python`, `r`,
-`ruby`, `rust`, `scala`, `scss`, `solidity`, `sql`, `starlark`, `swift`,
-`textproto`, `toml`, `typescript`, `vb`, `verilog`, `vhdl`, `vue`, `xml`,
-`yaml`, `zig`.
+`asm`, `batch`, `c`, `clojure`, `cmake`, `cobol`, `cpp`, `cs`, `css`, `dart`,
+`dockerfile`, `elixir`, `erlang`, `gemfile`, `gemspec`, `go`, `gradle`,
+`groovy`, `haskell`, `html`, `ini`, `java`, `javascript`, `json`, `julia`,
+`kotlin`, `lisp`, `lua`, `markdown`, `objectivec`, `ocaml`, `perl`, `php`,
+`powershell`, `python`, `r`, `ruby`, `rust`, `scala`, `shell`, `sql`, `swift`,
+`toml`, `typescript`, `vba`, `verilog`, `xml`, `yaml`.
 
-Several embedded model classes intentionally map to one public language. For
-example, `erb`, `gemfile`, and `gemspec` map to `ruby`; `jsonl` maps to `json`;
-`shell` maps to `bash`; and project-file classes such as `csproj` and `vcxproj`
-map to `xml`.
+These are the model's 48 output labels. Runtime detections expose them
+one-to-one with no label aggregation.
+
+The confusion matrix uses the same labels:
+
+![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/v0.1.0/assets/confusion-overall.png)
 
 ## Model
 
-The embedded model is `assets/magika/source-student-q4.bin`, a 100,444-byte
-raw tensor payload with SHA-256:
+The embedded model is `assets/magika/source-student-q4.bin`, a 47,840-byte
+weights-only MSQ1 payload with SHA-256:
 
 ```text
-e2498dc23a60cc32ae21a448c3763ee7080a6fbf9f813b63a066ef195e1e44a0
+59ef24167bddd1364eb9c1650add8a67e1a542b5155fac67f5e1cda07df0c0f0
 ```
 
-Architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`, tokenizer version 3.
-On the held-out `bigorig` test split it reaches
-`test_teacher_parity=0.967618` and `test_fs_accuracy=0.962517`.
+Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`, tokenizer version 3.
+On the manifest-aligned held-out filesystem-label test split it reaches
+`test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
@@ -82,4 +80,4 @@ split. Each panel is a row-normalized confusion matrix for one file-size
 bucket: actual labels are rows, predicted labels are columns, and the diagonal
 is correct classification.
 
-![Betlang wordseq confusion by file size](assets/confusion-by-size.png)
+![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/v0.1.0/assets/confusion-by-size.png)
