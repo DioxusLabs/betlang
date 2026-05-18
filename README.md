@@ -12,8 +12,8 @@ The embedded production model is a 49,847-byte quantized wordseq student using
 the v3 tokenizer. It predicts the 48 filesystem-backed source labels present in
 the training corpus; unsupported empty labels such as `jsonl`, `matlab`, and
 `prolog` are not part of the model head or runtime class mapping. On the
-held-out filesystem-label test split it reaches `test_fs_accuracy=0.965473`
-with `macro_recall=0.965813`.
+manifest-aligned held-out filesystem-label test split, the exported model
+reaches `test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
 
 ## Confusion By File Size
 
