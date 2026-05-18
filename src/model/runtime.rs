@@ -2,16 +2,14 @@ use super::{
     activation::gelu,
     constants::*,
     embedded::MODEL_BYTES,
-    layers::{conv_gelu_global_pool, conv_gelu_maxpool, dense_forward, embed_position},
+    layers::{
+        Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_tensor, dense_forward,
+        embed_position,
+    },
     reader::{read_f32_array, read_int4_dequant, read_ternary_dequant},
     tokenizer::tokenize,
 };
-use std::{cell::RefCell, sync::OnceLock};
-
-thread_local! {
-    static INFERENCE_SCRATCH_BUF: RefCell<Box<[f32]>> =
-        RefCell::new(vec![0.0f32; INFERENCE_SCRATCH].into_boxed_slice());
-}
+use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub(crate) struct Model {
@@ -85,10 +83,8 @@ impl Model {
 
     /// Run the full forward pass on a unit-id sequence (length = `len`).
     pub(crate) fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
-        INFERENCE_SCRATCH_BUF.with(|scratch| {
-            let mut scratch = scratch.borrow_mut();
-            self.logits_with_scratch(units, len, &mut scratch)
-        })
+        let mut scratch = [0.0f32; INFERENCE_SCRATCH];
+        self.logits_with_scratch(units, len, &mut scratch)
     }
 
     fn logits_with_scratch(
@@ -104,15 +100,16 @@ impl Model {
         let embed_len = t * EMBED;
         let pool0_len = t1 * CONV0;
         let pool1_len = t2 * CONV1;
+        let const_tail_start = constant_tail_start(units, t);
         let (activations, conv_scratch) = scratch.split_at_mut(ACTIVATION_SCRATCH);
 
         {
-            let (embed, pool0_region) = activations.split_at_mut(embed_len);
+            let (embed, pool0_storage) = activations.split_at_mut(embed_len);
 
             // 1) HashEmbedding + GELU.
             let (embed_rows, embed_remainder) = embed.as_chunks_mut::<EMBED>();
             debug_assert!(embed_remainder.is_empty());
-            for (pos, dst) in embed_rows.iter_mut().take(t).enumerate() {
+            for (pos, dst) in embed_rows.iter_mut().take(const_tail_start).enumerate() {
                 if let Some(&id) = units.get(pos)
                     && id >= 0
                 {
@@ -124,13 +121,15 @@ impl Model {
                     dst.fill(0.0);
                 }
             }
+            for dst in embed_rows.iter_mut().take(t).skip(const_tail_start) {
+                dst.fill(0.0);
+            }
 
             // 2) Conv0 + GELU + MaxPool(4).
-            let pool0 = &mut pool0_region[..pool0_len];
-            conv_gelu_maxpool(
-                embed,
-                t,
-                EMBED,
+            let pool0 = &mut pool0_storage[..pool0_len];
+            let embed_tensor = Tensor::with_repeated_tail(embed, t, EMBED, const_tail_start);
+            let pool0_tensor = conv_gelu_maxpool_tensor(
+                embed_tensor,
                 &self.conv0_kernel,
                 CONV0_KERNEL,
                 CONV0,
@@ -139,17 +138,11 @@ impl Model {
                 pool0,
                 &mut *conv_scratch,
             );
-        }
 
-        // 3) Conv1 + GELU + MaxPool(2).
-        {
-            let (pool1_region, pool0_region) = activations.split_at_mut(embed_len);
-            let pool0 = &pool0_region[..pool0_len];
-            let pool1 = &mut pool1_region[..pool1_len];
-            conv_gelu_maxpool(
-                pool0,
-                t1,
-                CONV0,
+            // 3) Conv1 + GELU + MaxPool(2).
+            let pool1 = &mut embed[..pool1_len];
+            let pool1_tensor = conv_gelu_maxpool_tensor(
+                pool0_tensor,
                 &self.conv1_kernel,
                 CONV1_KERNEL,
                 CONV1,
@@ -158,46 +151,44 @@ impl Model {
                 pool1,
                 &mut *conv_scratch,
             );
+
+            // 4) Conv2 + GELU + GlobalMax/AvgPool.
+            let mut pooled = [0.0f32; POOLED];
+            let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
+            conv_gelu_global_pool_tensor(
+                pool1_tensor,
+                &self.conv2_kernel,
+                CONV2_KERNEL,
+                CONV2,
+                &self.conv2_bias,
+                max_slice,
+                avg_slice,
+                pool0_storage,
+                &mut *conv_scratch,
+            );
+
+            // 5) Dense + GELU.
+            let mut dense0_out = [0.0f32; DENSE];
+            dense_forward(
+                &pooled,
+                &self.dense0_kernel,
+                &self.dense0_bias,
+                &mut dense0_out,
+            );
+            for v in &mut dense0_out {
+                *v = gelu(*v);
+            }
+
+            // 6) Output logits.
+            let mut logits = [0.0f32; CLASSES];
+            dense_forward(
+                &dense0_out,
+                &self.output_kernel,
+                &self.output_bias,
+                &mut logits,
+            );
+            logits
         }
-
-        // 4) Conv2 + GELU + GlobalMax/AvgPool.
-        let pool1 = &activations[..pool1_len];
-        let mut pooled = [0.0f32; POOLED];
-        let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
-        conv_gelu_global_pool(
-            pool1,
-            t2,
-            CONV1,
-            &self.conv2_kernel,
-            CONV2_KERNEL,
-            CONV2,
-            &self.conv2_bias,
-            max_slice,
-            avg_slice,
-            &mut *conv_scratch,
-        );
-
-        // 5) Dense + GELU.
-        let mut dense0_out = [0.0f32; DENSE];
-        dense_forward(
-            &pooled,
-            &self.dense0_kernel,
-            &self.dense0_bias,
-            &mut dense0_out,
-        );
-        for v in &mut dense0_out {
-            *v = gelu(*v);
-        }
-
-        // 6) Output logits.
-        let mut logits = [0.0f32; CLASSES];
-        dense_forward(
-            &dense0_out,
-            &self.output_kernel,
-            &self.output_bias,
-            &mut logits,
-        );
-        logits
     }
 
     /// Run inference using the padded 2048-position shape used by the shipped
@@ -210,4 +201,12 @@ impl Model {
     pub(crate) fn tokenize_units(&self, bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
         tokenize(bytes, padding_mask)
     }
+}
+
+fn constant_tail_start(units: &[i32], len: usize) -> usize {
+    units
+        .iter()
+        .take(len)
+        .rposition(|&id| id >= 0)
+        .map_or(0, |pos| pos + 1)
 }

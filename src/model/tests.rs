@@ -1,10 +1,14 @@
 use super::{
     constants::*,
+    layers::{
+        Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_dense, conv_gelu_maxpool_tensor,
+    },
     runtime::Model,
     tokenizer::{hash_unit_bytes, tokenize},
     window::build_window,
 };
 use crate::Language;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::{fs, path::Path};
 
@@ -180,6 +184,114 @@ fn runtime_inference_pads_short_sources_to_eval_shape() {
 
     for (runtime, eval_shape) in runtime_logits.iter().zip(eval_shape_logits) {
         assert_eq!(*runtime, eval_shape);
+    }
+}
+
+#[test]
+fn repeated_tensor_layers_match_full_convolution() {
+    for seed in 0..32 {
+        check_repeated_tensor_layers(seed);
+    }
+}
+
+fn check_repeated_tensor_layers(seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let seq_len = 128;
+    let in_channels = 8;
+    let mid_channels = 16;
+    let out_channels = 12;
+    let tail_start = rng.gen_range(8..seq_len - 8);
+
+    let mut input = random_f32s(&mut rng, seq_len * in_channels);
+    for value in &mut input[tail_start * in_channels..] {
+        *value = 0.0;
+    }
+    let input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, tail_start);
+
+    let kernel0 = random_f32s(&mut rng, 5 * in_channels * mid_channels);
+    let bias0 = random_f32s(&mut rng, mid_channels);
+    let mut full_pool = vec![0.0; (seq_len / 4) * mid_channels];
+    let mut const_pool = vec![0.0; full_pool.len()];
+    let mut scratch = vec![0.0; 4 * mid_channels.max(out_channels)];
+    conv_gelu_maxpool_dense(
+        &input,
+        seq_len,
+        in_channels,
+        &kernel0,
+        5,
+        mid_channels,
+        &bias0,
+        4,
+        &mut full_pool,
+        &mut scratch,
+    );
+    let pool_tensor = conv_gelu_maxpool_tensor(
+        input_tensor,
+        &kernel0,
+        5,
+        mid_channels,
+        &bias0,
+        4,
+        &mut const_pool,
+        &mut scratch,
+    );
+    let mut materialized_pool = vec![0.0; full_pool.len()];
+    pool_tensor.copy_to_dense(&mut materialized_pool);
+    assert_f32s_eq(&materialized_pool, &full_pool);
+
+    let kernel1 = random_f32s(&mut rng, 3 * mid_channels * out_channels);
+    let bias1 = random_f32s(&mut rng, out_channels);
+    let mut full_rows = vec![0.0; (seq_len / 4) * out_channels];
+    conv_gelu_maxpool_dense(
+        &full_pool,
+        seq_len / 4,
+        mid_channels,
+        &kernel1,
+        3,
+        out_channels,
+        &bias1,
+        1,
+        &mut full_rows,
+        &mut scratch,
+    );
+    let mut full_max = vec![f32::NEG_INFINITY; out_channels];
+    let mut full_avg = vec![0.0; out_channels];
+    for row in full_rows.chunks_exact(out_channels) {
+        for ((mx, avg), &v) in full_max.iter_mut().zip(full_avg.iter_mut()).zip(row) {
+            *mx = mx.max(v);
+            *avg += v;
+        }
+    }
+    for avg in &mut full_avg {
+        *avg /= (seq_len / 4) as f32;
+    }
+
+    let mut const_max = vec![0.0; out_channels];
+    let mut const_avg = vec![0.0; out_channels];
+    let mut tmp = vec![0.0; (seq_len / 4) * out_channels];
+    conv_gelu_global_pool_tensor(
+        pool_tensor,
+        &kernel1,
+        3,
+        out_channels,
+        &bias1,
+        &mut const_max,
+        &mut const_avg,
+        &mut tmp,
+        &mut scratch,
+    );
+    assert_f32s_eq(&const_max, &full_max);
+    assert_f32s_eq(&const_avg, &full_avg);
+}
+
+fn random_f32s(rng: &mut StdRng, len: usize) -> Vec<f32> {
+    (0..len).map(|_| rng.gen_range(-0.25..0.25)).collect()
+}
+
+fn assert_f32s_eq(actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len());
+    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual.to_bits(), expected.to_bits(), "index {index}");
     }
 }
 
