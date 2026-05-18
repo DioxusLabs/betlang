@@ -1,0 +1,22 @@
+%!PS-Adobe-3.0
+%%Title: Betlang PostScript Fixture
+%%Pages: 1
+%%BoundingBox: 0 0 300 300
+
+/inch { 72 mul } bind def
+/box {
+    newpath
+    moveto
+    1 inch 0 rlineto
+    0 1 inch rlineto
+    -1 inch 0 rlineto
+    closepath
+    stroke
+} bind def
+
+/Helvetica findfont 12 scalefont setfont
+72 220 moveto
+(hello postscript) show
+72 144 box
+showpage
+%%EOF

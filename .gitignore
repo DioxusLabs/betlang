@@ -1,1 +1,10 @@
 /target
+.claude/scheduled_tasks.lock
+.DS_Store
+.coverage
+coverage/
+htmlcov/
+*.profraw
+*.profdata
+*.pyc
+__pycache__/

@@ -1,33 +1,84 @@
 # Betlang
 
-CPU source-language detection for code, backed by the compact Magika student
-model.
+[![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
+[![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-```rust
-let language = betlang::detect("fn main() { println!(\"hi\"); }");
-assert_eq!(language, Some(betlang::Language::Rust));
+CPU source-language detection for code with a tiny 50kb model.
+
+```toml
+[dependencies]
+betlang = "0.0.1"
 ```
 
-The embedded production model is a 47,840-byte weights-only quantized wordseq
-student using the v3 tokenizer. It predicts the 48 filesystem-backed source
-labels present in the training corpus; unsupported empty labels such as `jsonl`,
-`matlab`, and `prolog` are not part of the model head or runtime class mapping.
-On the manifest-aligned held-out filesystem-label test split, the exported
-model reaches `test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
+```rust
+let detection = betlang::detect("fn main() { println!(\"hi\"); }");
 
-## Overall Confusion Matrix
+assert_eq!(detection.language(), Some(betlang::Language::Rust));
+```
 
-The shipped wordseq model is evaluated below on the held-out filesystem-label
-test split. The matrix is row-normalized: actual labels are rows, predicted
-labels are columns, and the diagonal is correct classification.
+Use `betlang::detect(source)` for UTF-8 source strings or byte slices. It
+returns a `Detection`; call `Detection::language()` to read the top language.
+Call `Detection::top_languages()` when you need ranked probabilities.
 
-![Betlang wordseq overall confusion matrix](assets/confusion-overall.png)
+## Supported Languages
+
+Slugs parse through the standard `FromStr` implementation:
+
+```rust
+assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
+```
+
+`asm`, `awk`, `batch`, `bash`, `c`, `c-sharp`, `clojure`, `cmake`, `cobol`,
+`commonlisp`, `cpp`, `css`, `dart`, `diff`, `dockerfile`, `elixir`, `erlang`,
+`go`, `groovy`, `haskell`, `hcl`, `html`, `ini`, `java`, `javascript`,
+`jinja2`, `json`, `julia`, `kotlin`, `lua`, `markdown`, `matlab`, `objc`,
+`ocaml`, `perl`, `php`, `postscript`, `powershell`, `prolog`, `python`, `r`,
+`ruby`, `rust`, `scala`, `scss`, `solidity`, `sql`, `starlark`, `swift`,
+`textproto`, `toml`, `typescript`, `vb`, `verilog`, `vhdl`, `vue`, `xml`,
+`yaml`, `zig`.
+
+Several embedded model classes intentionally map to one public language. For
+example, `gemfile` and `gemspec` map to `ruby`, `gradle` maps to `groovy`,
+`shell` maps to `bash`, and `vba` maps to `vb`. Some public languages are
+available for slug parsing and file-tree reporting but are not direct classes in
+the embedded 48-label model head.
+
+## Model
+
+The embedded model is `assets/magika/source-student-q4.bin`, a 47,840-byte
+weights-only MSQ1 payload with SHA-256:
+
+```text
+59ef24167bddd1364eb9c1650add8a67e1a542b5155fac67f5e1cda07df0c0f0
+```
+
+Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`, tokenizer version 3.
+On the manifest-aligned held-out filesystem-label test split it reaches
+`test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
+
+See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
+
+## Performance
+
+Betlang uses a fixed 4096-byte Magika window and pads runtime inference to the
+same 2048-token shape used by evaluation. The model is loaded once per process
+and then reused through a `OnceLock`.
+
+Native CPU inference dispatches through `fearless_simd`. Benchmark entry points
+are available through `cargo bench`. Current baseline numbers are tracked in
+[BENCHMARKS.md](BENCHMARKS.md).
+
+## License And Attribution
+
+Betlang is licensed under MIT. The embedded student model was trained from
+outputs of Google's Magika teacher model; Magika is published by Google under
+Apache-2.0. Keep this attribution with redistributed model artifacts.
 
 ## Confusion By File Size
 
-The same held-out filesystem-label test split is bucketed by file size below.
-Each panel is row-normalized with the same axes as the overall matrix. The full
-count and byte totals are in `actual_dataset_confusion_by_size.csv`, and the
-per-bucket summary is in `actual_dataset_confusion_by_size.md`.
+The shipped wordseq model is evaluated below on the held-out `bigorig` test
+split. Each panel is a row-normalized confusion matrix for one file-size
+bucket: actual labels are rows, predicted labels are columns, and the diagonal
+is correct classification.
 
-![Betlang wordseq confusion matrices by file size](assets/confusion-by-size.png)
+![Betlang wordseq confusion by file size](assets/confusion-by-size.png)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate an exported MSQ1 50KB wordseq student against the cached test split.
+"""Evaluate an exported raw wordseq student against the cached test split.
 
 Reports both:
   - test_teacher_parity   — fraction matching cache labels.mmap (teacher argmax)
@@ -8,7 +8,7 @@ Reports both:
 
 Loads the .bin via load_exported_layer_weights (decodes int4 packing back to fp32
 weights) and sets them on a fresh model built from --architecture. Loads the
-matching units_vN.mmap directly without calling convert_splits_to_word_units
+matching units_v3.mmap directly without calling convert_splits_to_word_units
 (which would rebuild caches for any split arg passed in).
 """
 
@@ -49,10 +49,6 @@ def main() -> int:
     p.add_argument("--architecture", required=True)
     p.add_argument("--split", default="test")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--unit-tokenizer", type=int, default=None,
-                   help="Tokenizer version of the units cache to read "
-                        "({split}.units_v{N}.mmap). Defaults to checkpoint "
-                        "metadata, or v2 for older checkpoints.")
     p.add_argument("--confusion-matrix-output", type=Path)
     p.add_argument("--confusion-matrix-top", type=int, default=20)
     args = p.parse_args()
@@ -68,15 +64,17 @@ def main() -> int:
     cfg = wordseq_config_for_architecture(args.architecture)
     model = build_word_seq_hashembed_hidden_model(classes, bits=4, **cfg)
 
-    # Load weights from exported MSQ1 .bin.
-    layer_weights, metadata = load_exported_layer_weights(args.checkpoint)
-    metadata_tokenizer = metadata.get("tokenizer_version")
-    unit_tokenizer = args.unit_tokenizer
-    if unit_tokenizer is None:
-        unit_tokenizer = int(metadata_tokenizer or 2)
+    # Load weights from exported raw .bin.
+    layer_weights, model_info = load_exported_layer_weights(args.checkpoint)
+    model_tokenizer = model_info.get("tokenizer_version")
+    if model_tokenizer != 3:
+        raise SystemExit(
+            f"unsupported checkpoint tokenizer_version={model_tokenizer!r}; "
+            "this evaluator supports only v3"
+        )
     print(
-        f"checkpoint: bits={metadata.get('bits')} arch={metadata.get('architecture','?')} "
-        f"tokenizer_version={metadata_tokenizer or 'legacy-v2'}"
+        f"checkpoint: bits={model_info.get('bits')} arch={model_info.get('architecture','?')} "
+        f"tokenizer_version={model_tokenizer}"
     )
     loaded = 0
     for layer in model.layers:
@@ -98,11 +96,10 @@ def main() -> int:
                 loaded += 1
     print(f"loaded weights into {loaded} layers")
 
-    # Load units_v{N} cache (whichever tokenizer the model was trained with).
-    units_path = args.cache_dir / f"{args.split}.units_v{unit_tokenizer}.mmap"
+    units_path = args.cache_dir / f"{args.split}.units_v3.mmap"
     if not units_path.exists():
         raise SystemExit(f"missing {units_path} — build it via convert_splits_to_word_units "
-                         f"with --unit-tokenizer {unit_tokenizer}, or use a different version")
+                         "with the v3 tokenizer")
     units = np.memmap(units_path, dtype=np.int32, mode="r", shape=(n, token_length))
     teacher_labels = np.array(np.memmap(args.cache_dir / f"{args.split}.labels.mmap", dtype=np.int64, mode="r",
                                         shape=(n,)))
@@ -150,7 +147,7 @@ def main() -> int:
         target_labels = fs_labels if fs_labels is not None else teacher_labels
         confusion = np.zeros((classes, classes), dtype=np.int64)
         np.add.at(confusion, (target_labels, preds), 1)
-        label_names = metadata.get("labels")
+        label_names = classes_meta.get("labels")
         if not isinstance(label_names, list) or len(label_names) != classes:
             label_names = [str(i) for i in range(classes)]
         write_confusion_matrix(

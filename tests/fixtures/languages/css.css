@@ -1,0 +1,21 @@
+:root {
+  color-scheme: light dark;
+  --accent: #2563eb;
+  --surface: #ffffff;
+  --text: #111827;
+}
+
+.language-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 1rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid color-mix(in srgb, var(--accent), transparent 70%);
+}
+
+.language-card:hover {
+  border-color: var(--accent);
+}

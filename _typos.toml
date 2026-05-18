@@ -1,0 +1,11 @@
+[files]
+extend-exclude = [
+    "Cargo.lock",
+    "assets/**",
+    "reports/**",
+    "target/**",
+]
+
+[default.extend-words]
+cpy = "cpy"
+edn = "edn"

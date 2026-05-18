@@ -2,40 +2,50 @@
 name = "betlang"
 version = "0.0.1"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
-description = "Magika source-language detection for code."
+description = "Tiny source-language detection for code."
+readme = "README.md"
 repository = "https://github.com/ealmloff/betlang"
 homepage = "https://github.com/ealmloff/betlang"
+documentation = "https://docs.rs/betlang"
 keywords = ["language", "detection", "code", "magika"]
 categories = ["development-tools", "text-processing"]
-
-[features]
-default = []
-wasm-bench = ["dep:wasmtime"]
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/BENCHMARKS.md",
+    "/MODEL_CARD.md",
+    "/README.md",
+    "/RELEASING.md",
+    "/assets/confusion-by-size.png",
+    "/assets/magika/source-student-q4.bin",
+    "/benches/detect.rs",
+    "/examples/*.rs",
+    "/snippets/demo.rs",
+    "/src/**",
+    "/tests/**",
+]
 
 [dependencies]
 fearless_simd = "0.4"
-wasmtime = { version = "44.0.1", optional = true, default-features = false, features = ["cranelift", "runtime", "std"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+ignore = "0.4.25"
 
 [lib]
 name = "betlang"
 path = "src/lib.rs"
 
-[[example]]
-name = "wasm_smoke"
-path = "examples/wasm_smoke.rs"
-crate-type = ["cdylib"]
-
-[[example]]
-name = "wasm_bench"
-path = "examples/wasm_bench.rs"
-required-features = ["wasm-bench"]
-
 [[bench]]
 name = "detect"
 harness = false
 
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-criterion = "0.5"
-
 [workspace]
+resolver = "3"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

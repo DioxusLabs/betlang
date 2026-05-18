@@ -15,42 +15,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  docs-hygiene:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Test
-        run: cargo test
-
-  handrolled-fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run handrolled fuzz tests
-        run: cargo test handrolled_fuzz -- --include-ignored
-
-  wasm-smoke:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Check spelling
+        uses: crate-ci/typos@master
+      - name: Check links
+        uses: lycheeverse/lychee-action@v2
         with:
-          node-version: '24'
-      - name: Install wasm target
-        run: rustup target add wasm32-unknown-unknown
-      - name: Build scalar wasm smoke
-        run: cargo build --example wasm_smoke --target wasm32-unknown-unknown --release
-      - name: Run scalar wasm smoke
-        run: node scripts/run-wasm-smoke.mjs target/wasm32-unknown-unknown/release/examples/wasm_smoke.wasm
-      - name: Build SIMD wasm smoke
-        run: cargo build --example wasm_smoke --target wasm32-unknown-unknown --release
+          args: >-
+            --no-progress
+            --exclude https://docs.rs/betlang
+            --exclude https://crates.io/crates/betlang
+            README.md
+            MODEL_CARD.md
+            RELEASING.md
+            scripts/TRAINING.md
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --all-features
+      - name: Docs
+        run: cargo doc --no-deps --all-features
         env:
-          RUSTFLAGS: -Ctarget-feature=+simd128
-      - name: Run SIMD wasm smoke
-        run: node scripts/run-wasm-smoke.mjs target/wasm32-unknown-unknown/release/examples/wasm_smoke.wasm
-      - name: Build relaxed SIMD wasm smoke
-        run: cargo build --example wasm_smoke --target wasm32-unknown-unknown --release
-        env:
-          RUSTFLAGS: -Ctarget-feature=+simd128,+relaxed-simd
-      - name: Run relaxed SIMD wasm smoke
-        run: node scripts/run-wasm-smoke.mjs target/wasm32-unknown-unknown/release/examples/wasm_smoke.wasm
+          RUSTDOCFLAGS: -Dwarnings
+      - name: Package
+        run: cargo package --locked

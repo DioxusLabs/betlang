@@ -1,0 +1,14 @@
+{
+  "name": "betlang",
+  "version": "0.0.1",
+  "private": false,
+  "keywords": ["language", "detection", "source"],
+  "repository": {
+    "type": "git",
+    "url": "https://example.invalid/betlang.git"
+  },
+  "scripts": {
+    "test": "cargo test",
+    "bench": "cargo bench"
+  }
+}

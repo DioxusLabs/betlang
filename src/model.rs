@@ -19,7 +19,7 @@
 //! Convolution hot paths use `fearless_simd` with scalar fallbacks for
 //! edges and out-channel counts not divisible by 16.
 
-use crate::language::{Language, CLASS_LABELS, CLASS_LANGUAGES};
+use crate::{Detection, Language, language::CLASS_LANGUAGES};
 use fearless_simd::{dispatch, f32x4, Level, Simd, SimdBase, SimdFloat};
 use std::sync::OnceLock;
 
@@ -53,7 +53,6 @@ const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 const DENSE: usize = 96;
 pub(crate) const CLASSES: usize = 48;
 const SCALE_COUNT: usize = 6;
-const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
 
 // v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
 const WORD_MASK: u32 = 0x00FF_FFFF;
@@ -95,7 +94,6 @@ struct Model {
 impl Model {
     fn load() -> Self {
         assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
-        debug_assert_eq!(CLASS_LABELS.len(), CLASSES);
         let mut cur = MODEL_MAGIC.len();
         let scales = read_f32_array::<SCALE_COUNT>(&mut cur);
         let tokenizer_version = TokenizerVersion::V3;
@@ -1411,51 +1409,46 @@ fn build_window(source: &[u8]) -> Option<(Vec<u8>, Vec<bool>)> {
 // Public API
 // ============================================================================
 
-/// Detect the source language for a source string.
-///
-/// Returns `Some(Language)` when the model's top class clearly outranks the
-/// runner-up, otherwise `None`.
-pub fn detect(source: &str) -> Option<Language> {
-    let (bytes, pad) = build_window(source.as_bytes())?;
+pub(crate) fn detect(source: &[u8]) -> Detection {
+    let Some((bytes, pad)) = build_window(source) else {
+        return Detection::from_predictions(Vec::new());
+    };
     let model = Model::get();
     let units = model.tokenize_units(&bytes, &pad);
     let logits = model.logits_for_runtime_units(&units);
-    let class_index = reliable_class_from_logits(&logits)?;
-    Some(CLASS_LANGUAGES[class_index])
+    detection_from_logits(&logits)
 }
 
-fn reliable_class_from_logits(logits: &[f32; CLASSES]) -> Option<usize> {
-    let (class_index, top, runner_up) = top_two_logits(logits)?;
-    if top - runner_up >= RELIABLE_LOGIT_MARGIN {
-        return Some(class_index);
+fn detection_from_logits(logits: &[f32; CLASSES]) -> Detection {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return Detection::from_predictions(Vec::new());
     }
-    let mut sum = 0.0;
-    let mut sum_squares = 0.0;
+
     for &logit in logits {
-        let value = (logit - top).exp();
-        sum += value;
-        sum_squares += value * value;
+        debug_assert!(logit.is_finite());
     }
-    let probability = 1.0 / sum;
-    let mean = 1.0 / CLASSES as f32;
-    let variance = ((sum_squares / (sum * sum)) - mean).max(0.0) / (CLASSES - 1) as f32;
-    (probability > mean + 2.0 * variance.sqrt()).then_some(class_index)
-}
 
-fn top_two_logits(logits: &[f32; CLASSES]) -> Option<(usize, f32, f32)> {
-    let mut top = f32::NEG_INFINITY;
-    let mut runner_up = f32::NEG_INFINITY;
-    let mut class_index = 0;
-    for (index, &logit) in logits.iter().enumerate() {
-        if logit >= top {
-            runner_up = top;
-            top = logit;
-            class_index = index;
-        } else if logit > runner_up {
-            runner_up = logit;
+    let denominator: f32 = logits.iter().map(|logit| (logit - max).exp()).sum();
+    if !denominator.is_finite() || denominator == 0.0 {
+        return Detection::from_predictions(Vec::new());
+    }
+
+    let mut predictions: Vec<(f32, Language)> = Vec::new();
+    for (&logit, &language) in logits.iter().zip(CLASS_LANGUAGES.iter()) {
+        let probability = (logit - max).exp() / denominator;
+        if let Some((existing, _)) = predictions
+            .iter_mut()
+            .find(|(_, existing_language)| *existing_language == language)
+        {
+            *existing += probability;
+        } else {
+            predictions.push((probability, language));
         }
     }
-    top.is_finite().then_some((class_index, top, runner_up))
+
+    predictions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.slug().cmp(b.1.slug())));
+    Detection::from_predictions(predictions)
 }
 
 #[cfg(test)]
@@ -1509,24 +1502,24 @@ mod tests {
 
     #[test]
     fn detects_rust_from_source() {
-        let lang = detect("use std::fmt;\nfn main() { println!(\"hi\"); }");
-        assert_eq!(lang, Some(Language::Rust));
+        let detection = detect(b"use std::fmt;\nfn main() { println!(\"hi\"); }");
+        assert_eq!(detection.language(), Some(Language::Rust));
     }
 
     #[test]
     fn detects_python_from_source() {
-        let lang = detect(
-            "import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n",
+        let detection = detect(
+            b"import os\n\ndef main():\n    print('hello world')\n\nif __name__ == '__main__':\n    main()\n",
         );
-        assert_eq!(lang, Some(Language::Python));
+        assert_eq!(detection.language(), Some(Language::Python));
     }
 
     #[test]
     fn detects_javascript_from_source() {
-        let lang = detect(
-            "const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n",
+        let detection = detect(
+            b"const greet = (name) => { console.log(`Hello, ${name}!`); };\ngreet('world');\n",
         );
-        assert_eq!(lang, Some(Language::JavaScript));
+        assert_eq!(detection.language(), Some(Language::JavaScript));
     }
 
     #[test]
@@ -1550,12 +1543,12 @@ mod tests {
 
     #[test]
     fn empty_input_returns_none() {
-        assert_eq!(detect(""), None);
+        assert_eq!(detect(b"").language(), None);
     }
 
     #[test]
     fn very_short_input_returns_none() {
         // < 8 non-whitespace bytes
-        assert_eq!(detect("hi"), None);
+        assert_eq!(detect(b"hi").language(), None);
     }
 }
