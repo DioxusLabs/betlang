@@ -202,7 +202,7 @@ fn fixture_path(path: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
-const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
+const LANGUAGE_FIXTURES: [(Language, &str); 44] = [
     (Language::Asm, "tests/fixtures/languages/asm.s"),
     (Language::Batch, "tests/fixtures/languages/batch.bat"),
     (Language::Bash, "tests/fixtures/languages/bash.sh"),
@@ -217,7 +217,6 @@ const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
     ),
     (Language::Cpp, "tests/fixtures/languages/cpp.cpp"),
     (Language::Css, "tests/fixtures/languages/css.css"),
-    (Language::Diff, "tests/fixtures/languages/diff.diff"),
     (
         Language::Dockerfile,
         "tests/fixtures/languages/dockerfile.Dockerfile",
@@ -244,10 +243,6 @@ const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
     (Language::Perl, "tests/fixtures/languages/perl.pl"),
     (Language::Php, "tests/fixtures/languages/php.php"),
     (
-        Language::Postscript,
-        "tests/fixtures/languages/postscript.ps",
-    ),
-    (
         Language::Powershell,
         "tests/fixtures/languages/powershell.ps1",
     ),
@@ -256,7 +251,6 @@ const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
     (Language::Ruby, "tests/fixtures/languages/ruby.rb"),
     (Language::Rust, "tests/fixtures/languages/rust.rs"),
     (Language::Scala, "tests/fixtures/languages/scala.scala"),
-    (Language::Scss, "tests/fixtures/languages/scss.scss"),
     (Language::Sql, "tests/fixtures/languages/sql.sql"),
     (Language::Swift, "tests/fixtures/languages/swift.swift"),
     (Language::Toml, "tests/fixtures/languages/toml.toml"),
@@ -266,8 +260,6 @@ const LANGUAGE_FIXTURES: [(Language, &str); 49] = [
     ),
     (Language::Vb, "tests/fixtures/languages/vb.vb"),
     (Language::Verilog, "tests/fixtures/languages/verilog.v"),
-    (Language::Vhdl, "tests/fixtures/languages/vhdl.vhd"),
-    (Language::Vue, "tests/fixtures/languages/vue.vue"),
     (Language::Xml, "tests/fixtures/languages/xml.xml"),
     (Language::Yaml, "tests/fixtures/languages/yaml.yaml"),
 ];

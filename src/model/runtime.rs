@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 #[derive(Debug)]
 pub(crate) struct Model {
-    /// 1536 × 28 dequantized embedding rows.
+    /// 1024 × 24 dequantized embedding rows.
     pub(crate) embedding: Box<[f32]>,
     /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
     conv0_kernel: Box<[f32]>,
@@ -29,47 +29,31 @@ pub(crate) struct Model {
 
 impl Model {
     fn load() -> Self {
-        assert_eq!(
-            MODEL_BYTES.len(),
-            MODEL_PAYLOAD_LEN,
-            "unexpected model payload length"
-        );
+        assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
+        let mut cur = MODEL_MAGIC.len();
+        let scales = read_f32_array::<SCALE_COUNT>(&mut cur);
 
-        let mut cur = 0;
+        // q_hash_embedding: weights [(1024, 24)] int4
+        let embedding = read_int4_dequant(&mut cur, BINS * EMBED, scales[0]);
 
-        // q_hash_embedding: weights [(1536, 28)] int4
-        let embedding = read_int4_dequant(&mut cur, BINS * EMBED, MODEL_WEIGHT_SCALES[0]);
-
-        // q_conv_0: weights [(7, 28, 96)] ternary, bias [(96,)] f32
-        let conv0_kernel = read_ternary_dequant(
-            &mut cur,
-            CONV0_KERNEL * EMBED * CONV0,
-            MODEL_WEIGHT_SCALES[1],
-        );
+        // q_conv_0: weights [(7, 24, 64)] ternary, bias [(64,)] f32
+        let conv0_kernel = read_ternary_dequant(&mut cur, CONV0_KERNEL * EMBED * CONV0, scales[1]);
         let conv0_bias = read_f32_array::<CONV0>(&mut cur);
 
-        // q_conv_1: weights [(5, 96, 192)] ternary, bias [(192,)] f32
-        let conv1_kernel = read_ternary_dequant(
-            &mut cur,
-            CONV1_KERNEL * CONV0 * CONV1,
-            MODEL_WEIGHT_SCALES[2],
-        );
+        // q_conv_1: weights [(5, 64, 128)] ternary, bias [(128,)] f32
+        let conv1_kernel = read_ternary_dequant(&mut cur, CONV1_KERNEL * CONV0 * CONV1, scales[2]);
         let conv1_bias = read_f32_array::<CONV1>(&mut cur);
 
-        // q_conv_2: weights [(3, 192, 192)] ternary, bias [(192,)] f32
-        let conv2_kernel = read_ternary_dequant(
-            &mut cur,
-            CONV2_KERNEL * CONV1 * CONV2,
-            MODEL_WEIGHT_SCALES[3],
-        );
+        // q_conv_2: weights [(3, 128, 128)] ternary, bias [(128,)] f32
+        let conv2_kernel = read_ternary_dequant(&mut cur, CONV2_KERNEL * CONV1 * CONV2, scales[3]);
         let conv2_bias = read_f32_array::<CONV2>(&mut cur);
 
-        // q_dense_0: weights [(384, 160)] ternary, bias [(160,)] f32
-        let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, MODEL_WEIGHT_SCALES[4]);
+        // q_dense_0: weights [(256, 96)] ternary, bias [(96,)] f32
+        let dense0_kernel = read_ternary_dequant(&mut cur, POOLED * DENSE, scales[4]);
         let dense0_bias = read_f32_array::<DENSE>(&mut cur);
 
-        // q_output: weights [(160, 67)] int4, bias [(67,)] f32
-        let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, MODEL_WEIGHT_SCALES[5]);
+        // q_output: weights [(96, 48)] int4, bias [(48,)] f32
+        let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
         let output_bias = read_f32_array::<CLASSES>(&mut cur);
 
         assert_eq!(cur, MODEL_BYTES.len(), "unexpected model payload length");
