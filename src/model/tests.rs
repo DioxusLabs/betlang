@@ -33,7 +33,7 @@ fn tokenizer_matches_legacy_buffer_model_on_fuzzed_windows() {
     let mut rng = StdRng::seed_from_u64(0x544f_4b45_4e49_5a45);
 
     for case in [
-        &b"abc123!"[..],
+        &b"abc123!x"[..],
         b"1.2 .. ...\r\n\tfoo(bar)[baz]{qux}",
         b"        indented\n    next\n",
         b"UPPER_lower 000.111 <=> -> ::",
@@ -299,6 +299,124 @@ fn check_repeated_tensor_layers(seed: u64, tail_start: Option<usize>) {
 
 fn random_f32s(rng: &mut StdRng, len: usize) -> Vec<f32> {
     (0..len).map(|_| rng.gen_range(-0.25..0.25)).collect()
+}
+
+fn legacy_tokenize_bytes(bytes: &[u8]) -> Vec<i32> {
+    let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
+    let mut word: Vec<u8> = Vec::new();
+    let mut number: Vec<u8> = Vec::new();
+    let mut punct: Vec<u8> = Vec::new();
+    let mut at_line_start = true;
+    let mut indent_units: u32 = 0;
+
+    for &raw_value in bytes {
+        let value = raw_value.to_ascii_lowercase();
+        let is_letter = value.is_ascii_lowercase() || value == b'_';
+        let is_digit = value.is_ascii_digit();
+        let is_newline = value == b'\n';
+        let is_cr = value == b'\r';
+        let is_space = value == b' ' || value == b'\t';
+        let is_bracket = matches!(value, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+
+        if !is_letter {
+            legacy_flush(&mut word, &mut out, 0);
+        }
+        if !(is_digit || value == b'.') {
+            legacy_flush(&mut number, &mut out, NUM_FLAG);
+        }
+        let need_flush_punct =
+            is_letter || is_digit || is_space || is_newline || is_cr || is_bracket || value == b'.';
+        if need_flush_punct {
+            legacy_flush(&mut punct, &mut out, PUNCT_FLAG);
+        }
+
+        if out.len() >= MAX_UNITS {
+            break;
+        }
+
+        if is_letter {
+            if at_line_start {
+                push_legacy_indent(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            word.push(value);
+            continue;
+        }
+        if is_digit || value == b'.' {
+            if value == b'.' && number.is_empty() {
+                if at_line_start {
+                    push_legacy_indent(&mut out, indent_units);
+                }
+                at_line_start = false;
+                indent_units = 0;
+                punct.push(value);
+                continue;
+            }
+            if at_line_start {
+                push_legacy_indent(&mut out, indent_units);
+            }
+            at_line_start = false;
+            indent_units = 0;
+            number.push(value);
+            continue;
+        }
+        if is_newline {
+            if at_line_start {
+                push_legacy_indent(&mut out, indent_units);
+            }
+            if out.len() < MAX_UNITS {
+                out.push(((b'\n' as u32) | PUNCT_FLAG) as i32);
+            }
+            at_line_start = true;
+            indent_units = 0;
+            continue;
+        }
+        if is_cr {
+            continue;
+        }
+        if at_line_start && is_space {
+            indent_units += if value == b' ' { 1 } else { 4 };
+            continue;
+        }
+        if at_line_start {
+            push_legacy_indent(&mut out, indent_units);
+        }
+        at_line_start = false;
+        indent_units = 0;
+        if is_space {
+            let space_token = ((b' ' as u32) | PUNCT_FLAG) as i32;
+            if out.last() != Some(&space_token) && out.len() < MAX_UNITS {
+                out.push(space_token);
+            }
+            continue;
+        }
+        if is_bracket {
+            if out.len() < MAX_UNITS {
+                out.push(((value as u32) | BRACKET_FLAG) as i32);
+            }
+            continue;
+        }
+        punct.push(value);
+    }
+
+    legacy_flush(&mut word, &mut out, 0);
+    legacy_flush(&mut number, &mut out, NUM_FLAG);
+    legacy_flush(&mut punct, &mut out, PUNCT_FLAG);
+    out
+}
+
+fn legacy_flush(buffer: &mut Vec<u8>, out: &mut Vec<i32>, flag: u32) {
+    if !buffer.is_empty() && out.len() < MAX_UNITS {
+        out.push(((hash_unit_bytes(buffer) & WORD_MASK) | flag) as i32);
+    }
+    buffer.clear();
+}
+
+fn push_legacy_indent(out: &mut Vec<i32>, indent: u32) {
+    if indent > 0 && out.len() < MAX_UNITS {
+        out.push((indent.min(63) | INDENT_FLAG) as i32);
+    }
 }
 
 fn assert_f32s_eq(actual: &[f32], expected: &[f32]) {
