@@ -620,56 +620,57 @@ def format_bytes(value: int) -> str:
     raise AssertionError
 
 
-def render_png(
-    path: Path,
-    matrices: list[np.ndarray],
-    labels: list[str],
-    fs_accuracy: float,
-) -> None:
+def plot_confusion_panel(ax, title: str, matrix: np.ndarray, labels: list[str], cmap) -> object:
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized = np.divide(
+            matrix,
+            row_sums,
+            out=np.zeros_like(matrix, dtype=np.float64),
+            where=row_sums != 0,
+        )
+    masked = np.ma.masked_where(normalized <= 0, normalized)
+    image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
+    total = int(matrix.sum())
+    acc = float(np.trace(matrix) / total) if total else 0.0
+    ax.set_title(f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels, rotation=90, fontsize=5)
+    ax.set_yticklabels(labels, fontsize=5)
+    ax.set_xlabel("Predicted", fontsize=10)
+    ax.set_ylabel("Actual", fontsize=10)
+    ax.set_xticks(np.arange(-0.5, len(labels), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
+    ax.grid(which="minor", color="#eef2f7", linewidth=0.25)
+    ax.tick_params(length=0)
+    return image
+
+
+def configure_colorbar(fig, image, axes) -> None:
+    cbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.025)
+    cbar.set_label("Share of actual label", fontsize=10)
+    cbar.set_ticks([0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])
+    cbar.set_ticklabels(["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"])
+
+
+def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], fs_accuracy: float) -> None:
     cmap = plt.get_cmap("magma_r").copy()
     cmap.set_bad("white")
     fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160)
     axes_flat = axes.ravel()
     image = None
 
-    def plot_panel(ax, title: str, matrix: np.ndarray) -> None:
-        nonlocal image
-        row_sums = matrix.sum(axis=1, keepdims=True)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            normalized = np.divide(
-                matrix,
-                row_sums,
-                out=np.zeros_like(matrix, dtype=np.float64),
-                where=row_sums != 0,
-            )
-        masked = np.ma.masked_where(normalized <= 0, normalized)
-        image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
-        total = int(matrix.sum())
-        acc = float(np.trace(matrix) / total) if total else 0.0
-        ax.set_title(f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
-        ax.set_xticks(np.arange(len(labels)))
-        ax.set_yticks(np.arange(len(labels)))
-        ax.set_xticklabels(labels, rotation=90, fontsize=5)
-        ax.set_yticklabels(labels, fontsize=5)
-        ax.set_xlabel("Predicted", fontsize=10)
-        ax.set_ylabel("Actual", fontsize=10)
-        ax.set_xticks(np.arange(-0.5, len(labels), 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
-        ax.grid(which="minor", color="#eef2f7", linewidth=0.25)
-        ax.tick_params(length=0)
-
     for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
-        plot_panel(ax, bucket[0], matrix)
-    overall_ax = axes_flat[len(BUCKETS)]
-    overall_matrix = np.sum(np.stack(matrices, axis=0), axis=0)
-    plot_panel(overall_ax, "Overall", overall_matrix)
+        image = plot_confusion_panel(ax, bucket[0], matrix, labels, cmap)
+    axes_flat[len(BUCKETS)].axis("off")
 
     fig.suptitle("Betlang wordseq confusion matrices by file size", fontsize=24, weight="bold", y=0.995)
     fig.text(
         0.01,
         0.972,
         "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
-        f"for the held-out filesystem-label test split. Overall file accuracy: {fs_accuracy * 100:.2f}%.",
+        f"for each held-out filesystem-label size bucket. Overall file accuracy: {fs_accuracy * 100:.2f}%.",
         fontsize=11,
         color="#334155",
     )
@@ -677,16 +678,42 @@ def render_png(
         0.01,
         0.956,
         "Off-diagonal cells show where each actual language is confused within that size bucket. "
-        "Full raw counts and byte totals are in actual_dataset_confusion_by_size.csv.",
+        "The overall matrix is split out in assets/confusion-overall.png.",
         fontsize=11,
         color="#64748b",
     )
     fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
     if image is not None:
-        cbar = fig.colorbar(image, ax=overall_ax, fraction=0.046, pad=0.035)
-        cbar.set_label("Share of actual label", fontsize=10)
-        cbar.set_ticks([0.001, 0.01, 0.05, 0.10, 0.25, 0.50, 0.75, 1.0])
-        cbar.set_ticklabels(["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"])
+        configure_colorbar(fig, image, axes_flat[: len(BUCKETS)])
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def render_overall_png(path: Path, matrix: np.ndarray, labels: list[str], fs_accuracy: float) -> None:
+    cmap = plt.get_cmap("magma_r").copy()
+    cmap.set_bad("white")
+    fig, ax = plt.subplots(figsize=(18, 17), dpi=180)
+    image = plot_confusion_panel(ax, "Overall", matrix, labels, cmap)
+    ax.set_title(
+        f"Overall  |  n={int(matrix.sum()):,}  |  acc={fs_accuracy * 100:.2f}%",
+        fontsize=16,
+        weight="bold",
+    )
+    ax.set_xticklabels(labels, rotation=90, fontsize=7)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("Actual", fontsize=12)
+    fig.suptitle("Betlang wordseq overall confusion matrix", fontsize=24, weight="bold", y=0.995)
+    fig.text(
+        0.01,
+        0.962,
+        "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
+        "for the held-out filesystem-label test split.",
+        fontsize=11,
+        color="#334155",
+    )
+    fig.subplots_adjust(left=0.11, right=0.88, top=0.925, bottom=0.12)
+    configure_colorbar(fig, image, ax)
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 
@@ -706,6 +733,7 @@ def main() -> int:
     parser.add_argument("--csv-output", type=Path, default=Path("actual_dataset_confusion_by_size.csv"))
     parser.add_argument("--markdown-output", type=Path, default=Path("actual_dataset_confusion_by_size.md"))
     parser.add_argument("--png-output", type=Path, default=Path("assets/confusion-by-size.png"))
+    parser.add_argument("--overall-png-output", type=Path, default=Path("assets/confusion-overall.png"))
     args = parser.parse_args()
 
     split_meta = json.loads((args.cache_dir / f"{args.split}.json").read_text())
@@ -784,10 +812,13 @@ def main() -> int:
         fs_accuracy,
         dropped_labels,
     )
-    render_png(args.png_output, matrices, labels, fs_accuracy)
+    overall_matrix = np.sum(np.stack(matrices, axis=0), axis=0)
+    render_size_png(args.png_output, matrices, labels, fs_accuracy)
+    render_overall_png(args.overall_png_output, overall_matrix, labels, fs_accuracy)
     print(f"csv_output={args.csv_output}", flush=True)
     print(f"markdown_output={args.markdown_output}", flush=True)
     print(f"png_output={args.png_output}", flush=True)
+    print(f"overall_png_output={args.overall_png_output}", flush=True)
     return 0
 
 

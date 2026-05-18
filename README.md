@@ -15,13 +15,19 @@ the training corpus; unsupported empty labels such as `jsonl`, `matlab`, and
 manifest-aligned held-out filesystem-label test split, the exported model
 reaches `test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
 
-## Confusion By File Size
+## Overall Confusion Matrix
 
 The shipped wordseq model is evaluated below on the held-out filesystem-label
-test split, bucketed by file size. Each panel is row-normalized: actual labels
-are rows, predicted labels are columns, and the diagonal is correct
-classification. The final panel is the overall matrix. The full count and byte
-totals are in `actual_dataset_confusion_by_size.csv`, and the per-bucket
-summary is in `actual_dataset_confusion_by_size.md`.
+test split. The matrix is row-normalized: actual labels are rows, predicted
+labels are columns, and the diagonal is correct classification.
+
+![Betlang wordseq overall confusion matrix](assets/confusion-overall.png)
+
+## Confusion By File Size
+
+The same held-out filesystem-label test split is bucketed by file size below.
+Each panel is row-normalized with the same axes as the overall matrix. The full
+count and byte totals are in `actual_dataset_confusion_by_size.csv`, and the
+per-bucket summary is in `actual_dataset_confusion_by_size.md`.
 
 ![Betlang wordseq confusion matrices by file size](assets/confusion-by-size.png)
