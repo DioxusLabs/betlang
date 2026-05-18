@@ -37,11 +37,9 @@ assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
 `textproto`, `toml`, `typescript`, `vb`, `verilog`, `vhdl`, `vue`, `xml`,
 `yaml`, `zig`.
 
-Several embedded model classes intentionally map to one public language. For
-example, `gemfile` and `gemspec` map to `ruby`, `gradle` maps to `groovy`,
-`shell` maps to `bash`, and `vba` maps to `vb`. Some public languages are
-available for slug parsing and file-tree reporting but are not direct classes in
-the embedded 48-label model head.
+The confusion matrix for the model's 48 embedded classes:
+
+![Betlang wordseq confusion](assets/confusion-overall.png)
 
 ## Model
 
