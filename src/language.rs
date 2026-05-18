@@ -1,119 +1,126 @@
-/// Source language predicted by the embedded Magika student model.
+/// Source class predicted by the embedded Magika student model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Language {
-    /// Arborium slug `"asm"`.
+    /// Model label `"asm"`.
     Asm,
-    /// Arborium slug `"batch"`.
+    /// Model label `"batch"`.
     Batch,
-    /// Arborium slug `"bash"`.
-    Bash,
-    /// Arborium slug `"c"`.
+    /// Model label `"c"`.
     C,
-    /// Arborium slug `"c-sharp"`.
+    /// Model label `"cs"`.
     CSharp,
-    /// Arborium slug `"clojure"`.
+    /// Model label `"clojure"`.
     Clojure,
-    /// Arborium slug `"cmake"`.
+    /// Model label `"cmake"`.
     CMake,
-    /// Arborium slug `"cobol"`.
+    /// Model label `"cobol"`.
     Cobol,
-    /// Arborium slug `"commonlisp"`.
-    CommonLisp,
-    /// Arborium slug `"cpp"`.
+    /// Model label `"cpp"`.
     Cpp,
-    /// Arborium slug `"css"`.
+    /// Model label `"css"`.
     Css,
-    /// Arborium slug `"dart"`.
+    /// Model label `"dart"`.
     Dart,
-    /// Arborium slug `"dockerfile"`.
+    /// Model label `"dockerfile"`.
     Dockerfile,
-    /// Arborium slug `"elixir"`.
+    /// Model label `"elixir"`.
     Elixir,
-    /// Arborium slug `"erlang"`.
+    /// Model label `"erlang"`.
     Erlang,
-    /// Arborium slug `"go"`.
+    /// Model label `"gemfile"`.
+    Gemfile,
+    /// Model label `"gemspec"`.
+    Gemspec,
+    /// Model label `"go"`.
     Go,
-    /// Arborium slug `"groovy"`.
+    /// Model label `"gradle"`.
+    Gradle,
+    /// Model label `"groovy"`.
     Groovy,
-    /// Arborium slug `"haskell"`.
+    /// Model label `"haskell"`.
     Haskell,
-    /// Arborium slug `"html"`.
+    /// Model label `"html"`.
     Html,
-    /// Arborium slug `"ini"`.
+    /// Model label `"ini"`.
     Ini,
-    /// Arborium slug `"java"`.
+    /// Model label `"java"`.
     Java,
-    /// Arborium slug `"javascript"`.
+    /// Model label `"javascript"`.
     JavaScript,
-    /// Arborium slug `"json"`.
+    /// Model label `"json"`.
     Json,
-    /// Arborium slug `"julia"`.
+    /// Model label `"julia"`.
     Julia,
-    /// Arborium slug `"kotlin"`.
+    /// Model label `"kotlin"`.
     Kotlin,
-    /// Arborium slug `"lua"`.
+    /// Model label `"lisp"`.
+    Lisp,
+    /// Model label `"lua"`.
     Lua,
-    /// Arborium slug `"markdown"`.
+    /// Model label `"markdown"`.
     Markdown,
-    /// Arborium slug `"objc"`.
+    /// Model label `"objectivec"`.
     ObjectiveC,
-    /// Arborium slug `"ocaml"`.
+    /// Model label `"ocaml"`.
     Ocaml,
-    /// Arborium slug `"perl"`.
+    /// Model label `"perl"`.
     Perl,
-    /// Arborium slug `"php"`.
+    /// Model label `"php"`.
     Php,
-    /// Arborium slug `"powershell"`.
+    /// Model label `"powershell"`.
     Powershell,
-    /// Arborium slug `"python"`.
+    /// Model label `"python"`.
     Python,
-    /// Arborium slug `"r"`.
+    /// Model label `"r"`.
     R,
-    /// Arborium slug `"ruby"`.
+    /// Model label `"ruby"`.
     Ruby,
-    /// Arborium slug `"rust"`.
+    /// Model label `"rust"`.
     Rust,
-    /// Arborium slug `"scala"`.
+    /// Model label `"scala"`.
     Scala,
-    /// Arborium slug `"sql"`.
+    /// Model label `"shell"`.
+    Shell,
+    /// Model label `"sql"`.
     Sql,
-    /// Arborium slug `"swift"`.
+    /// Model label `"swift"`.
     Swift,
-    /// Arborium slug `"toml"`.
+    /// Model label `"toml"`.
     Toml,
-    /// Arborium slug `"typescript"`.
+    /// Model label `"typescript"`.
     TypeScript,
-    /// Arborium slug `"vb"`.
-    Vb,
-    /// Arborium slug `"verilog"`.
+    /// Model label `"vba"`.
+    Vba,
+    /// Model label `"verilog"`.
     Verilog,
-    /// Arborium slug `"xml"`.
+    /// Model label `"xml"`.
     Xml,
-    /// Arborium slug `"yaml"`.
+    /// Model label `"yaml"`.
     Yaml,
 }
 
 impl Language {
-    /// Arborium/tree-sitter language slug for this detected language.
-    pub const fn slug(self) -> &'static str {
+    /// Filesystem/model label for this detected class.
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Asm => "asm",
             Self::Batch => "batch",
-            Self::Bash => "bash",
             Self::C => "c",
-            Self::CSharp => "c-sharp",
+            Self::CSharp => "cs",
             Self::Clojure => "clojure",
             Self::CMake => "cmake",
             Self::Cobol => "cobol",
-            Self::CommonLisp => "commonlisp",
             Self::Cpp => "cpp",
             Self::Css => "css",
             Self::Dart => "dart",
             Self::Dockerfile => "dockerfile",
             Self::Elixir => "elixir",
             Self::Erlang => "erlang",
+            Self::Gemfile => "gemfile",
+            Self::Gemspec => "gemspec",
             Self::Go => "go",
+            Self::Gradle => "gradle",
             Self::Groovy => "groovy",
             Self::Haskell => "haskell",
             Self::Html => "html",
@@ -123,6 +130,61 @@ impl Language {
             Self::Json => "json",
             Self::Julia => "julia",
             Self::Kotlin => "kotlin",
+            Self::Lisp => "lisp",
+            Self::Lua => "lua",
+            Self::Markdown => "markdown",
+            Self::ObjectiveC => "objectivec",
+            Self::Ocaml => "ocaml",
+            Self::Perl => "perl",
+            Self::Php => "php",
+            Self::Powershell => "powershell",
+            Self::Python => "python",
+            Self::R => "r",
+            Self::Ruby => "ruby",
+            Self::Rust => "rust",
+            Self::Scala => "scala",
+            Self::Shell => "shell",
+            Self::Sql => "sql",
+            Self::Swift => "swift",
+            Self::Toml => "toml",
+            Self::TypeScript => "typescript",
+            Self::Vba => "vba",
+            Self::Verilog => "verilog",
+            Self::Xml => "xml",
+            Self::Yaml => "yaml",
+        }
+    }
+
+    /// Arborium/tree-sitter language slug for this detected class.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Asm => "asm",
+            Self::Batch => "batch",
+            Self::C => "c",
+            Self::CSharp => "c-sharp",
+            Self::Clojure => "clojure",
+            Self::CMake => "cmake",
+            Self::Cobol => "cobol",
+            Self::Cpp => "cpp",
+            Self::Css => "css",
+            Self::Dart => "dart",
+            Self::Dockerfile => "dockerfile",
+            Self::Elixir => "elixir",
+            Self::Erlang => "erlang",
+            Self::Gemfile => "ruby",
+            Self::Gemspec => "ruby",
+            Self::Go => "go",
+            Self::Gradle => "groovy",
+            Self::Groovy => "groovy",
+            Self::Haskell => "haskell",
+            Self::Html => "html",
+            Self::Ini => "ini",
+            Self::Java => "java",
+            Self::JavaScript => "javascript",
+            Self::Json => "json",
+            Self::Julia => "julia",
+            Self::Kotlin => "kotlin",
+            Self::Lisp => "commonlisp",
             Self::Lua => "lua",
             Self::Markdown => "markdown",
             Self::ObjectiveC => "objc",
@@ -135,11 +197,12 @@ impl Language {
             Self::Ruby => "ruby",
             Self::Rust => "rust",
             Self::Scala => "scala",
+            Self::Shell => "bash",
             Self::Sql => "sql",
             Self::Swift => "swift",
             Self::Toml => "toml",
             Self::TypeScript => "typescript",
-            Self::Vb => "vb",
+            Self::Vba => "vb",
             Self::Verilog => "verilog",
             Self::Xml => "xml",
             Self::Yaml => "yaml",
@@ -161,10 +224,10 @@ pub(crate) const CLASS_LANGUAGES: [Language; 48] = [
     Language::Dockerfile,
     Language::Elixir,
     Language::Erlang,
-    Language::Ruby,
-    Language::Ruby,
+    Language::Gemfile,
+    Language::Gemspec,
     Language::Go,
-    Language::Groovy,
+    Language::Gradle,
     Language::Groovy,
     Language::Haskell,
     Language::Html,
@@ -174,7 +237,7 @@ pub(crate) const CLASS_LANGUAGES: [Language; 48] = [
     Language::Json,
     Language::Julia,
     Language::Kotlin,
-    Language::CommonLisp,
+    Language::Lisp,
     Language::Lua,
     Language::Markdown,
     Language::ObjectiveC,
@@ -187,13 +250,84 @@ pub(crate) const CLASS_LANGUAGES: [Language; 48] = [
     Language::Ruby,
     Language::Rust,
     Language::Scala,
-    Language::Bash,
+    Language::Shell,
     Language::Sql,
     Language::Swift,
     Language::Toml,
     Language::TypeScript,
-    Language::Vb,
+    Language::Vba,
     Language::Verilog,
     Language::Xml,
     Language::Yaml,
 ];
+
+pub(crate) const CLASS_LABELS: [&str; 48] = [
+    "asm",
+    "batch",
+    "c",
+    "clojure",
+    "cmake",
+    "cobol",
+    "cpp",
+    "cs",
+    "css",
+    "dart",
+    "dockerfile",
+    "elixir",
+    "erlang",
+    "gemfile",
+    "gemspec",
+    "go",
+    "gradle",
+    "groovy",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "lisp",
+    "lua",
+    "markdown",
+    "objectivec",
+    "ocaml",
+    "perl",
+    "php",
+    "powershell",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scala",
+    "shell",
+    "sql",
+    "swift",
+    "toml",
+    "typescript",
+    "vba",
+    "verilog",
+    "xml",
+    "yaml",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn class_mapping_is_one_to_one_with_exported_labels() {
+        assert_eq!(CLASS_LANGUAGES.len(), CLASS_LABELS.len());
+
+        let mut variants = HashSet::new();
+        for (language, label) in CLASS_LANGUAGES.iter().zip(CLASS_LABELS) {
+            assert_eq!(language.label(), label);
+            assert!(
+                variants.insert(*language),
+                "duplicate class mapping: {language:?}"
+            );
+        }
+    }
+}

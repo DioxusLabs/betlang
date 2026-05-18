@@ -31,6 +31,117 @@ PADDING_TOKEN = 256
 CHUNK_COUNT = 64
 CHUNK_SIZE = TOKEN_LENGTH // CHUNK_COUNT
 QAT_MAGIC = b"MSQ1\x01\0\0\0"
+QAT_SCALE_COUNT = 6
+FIXED_EXPORT_ARCHITECTURE = "wordseq-b1024-k3-m2048-tiny-3conv-hidden"
+FIXED_EXPORT_TOKENIZER_VERSION = 3
+FIXED_EXPORT_LABELS = [
+    "asm",
+    "batch",
+    "c",
+    "clojure",
+    "cmake",
+    "cobol",
+    "cpp",
+    "cs",
+    "css",
+    "dart",
+    "dockerfile",
+    "elixir",
+    "erlang",
+    "gemfile",
+    "gemspec",
+    "go",
+    "gradle",
+    "groovy",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "lisp",
+    "lua",
+    "markdown",
+    "objectivec",
+    "ocaml",
+    "perl",
+    "php",
+    "powershell",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scala",
+    "shell",
+    "sql",
+    "swift",
+    "toml",
+    "typescript",
+    "vba",
+    "verilog",
+    "xml",
+    "yaml",
+]
+FIXED_EXPORT_SLUGS = [
+    "asm",
+    "batch",
+    "c",
+    "clojure",
+    "cmake",
+    "cobol",
+    "cpp",
+    "c-sharp",
+    "css",
+    "dart",
+    "dockerfile",
+    "elixir",
+    "erlang",
+    "ruby",
+    "ruby",
+    "go",
+    "groovy",
+    "groovy",
+    "haskell",
+    "html",
+    "ini",
+    "java",
+    "javascript",
+    "json",
+    "julia",
+    "kotlin",
+    "commonlisp",
+    "lua",
+    "markdown",
+    "objc",
+    "ocaml",
+    "perl",
+    "php",
+    "powershell",
+    "python",
+    "r",
+    "ruby",
+    "rust",
+    "scala",
+    "bash",
+    "sql",
+    "swift",
+    "toml",
+    "typescript",
+    "vb",
+    "verilog",
+    "xml",
+    "yaml",
+]
+FIXED_EXPORT_LAYER_SPECS = [
+    ("q_hash_embedding", [("embedding", [1024, 24], "int4", 4, 12288)], []),
+    ("q_conv_0", [("kernel", [7, 24, 64], "ternary", 2, 2688)], [("bias", [64], 256)]),
+    ("q_conv_1", [("kernel", [5, 64, 128], "ternary", 2, 10240)], [("bias", [128], 512)]),
+    ("q_conv_2", [("kernel", [3, 128, 128], "ternary", 2, 12288)], [("bias", [128], 512)]),
+    ("q_dense_0", [("kernel", [256, 96], "ternary", 2, 6144)], [("bias", [96], 384)]),
+    ("q_output", [("kernel", [96, 48], "int4", 4, 2304)], [("bias", [48], 192)]),
+]
 
 
 @dataclass(frozen=True)
@@ -4806,17 +4917,17 @@ def export_model(
     architecture: str,
     tokenizer_version: int | None = None,
 ) -> int:
-    metadata = {
-        "bits": bits,
-        "token_length": TOKEN_LENGTH,
-        "architecture": architecture,
-        "labels": labels,
-        "slugs": slugs,
-        "layers": [],
-    }
-    if tokenizer_version is not None:
-        metadata["tokenizer_version"] = tokenizer_version
-    blob = bytearray(QAT_MAGIC)
+    if architecture != FIXED_EXPORT_ARCHITECTURE:
+        raise ValueError(f"metadata-free MSQ1 export only supports {FIXED_EXPORT_ARCHITECTURE}")
+    if tokenizer_version != FIXED_EXPORT_TOKENIZER_VERSION:
+        raise ValueError(f"metadata-free MSQ1 export requires tokenizer v{FIXED_EXPORT_TOKENIZER_VERSION}")
+    if labels != FIXED_EXPORT_LABELS:
+        raise ValueError("metadata-free MSQ1 export requires the fixed 48-label production head")
+    if slugs != FIXED_EXPORT_SLUGS:
+        raise ValueError("metadata-free MSQ1 export requires the fixed production slug mapping")
+
+    payload_blob = bytearray()
+    scales: list[float] = []
     for layer in model.layers:
         if isinstance(layer, QEmbedding):
             weights = [("embedding", layer.embedding.numpy())]
@@ -4834,30 +4945,22 @@ def export_model(
             biases = [("bias", layer.bias.numpy())]
         else:
             continue
-        layer_meta = {"name": layer.name, "weights": [], "biases": []}
         layer_bits = getattr(layer, "bits", bits)
         for name, value in weights:
             payload, scale, encoding = quantize_weight(value, layer_bits)
-            layer_meta["weights"].append(
-                {
-                    "name": name,
-                    "shape": list(value.shape),
-                    "scale": scale,
-                    "bits": layer_bits,
-                    "encoding": encoding,
-                    "bytes": len(payload),
-                }
-            )
-            blob.extend(payload)
+            del name, encoding
+            scales.append(scale)
+            payload_blob.extend(payload)
         for name, value in biases:
             data = value.astype("<f4").tobytes()
-            layer_meta["biases"].append({"name": name, "shape": list(value.shape), "bytes": len(data)})
-            blob.extend(data)
-        metadata["layers"].append(layer_meta)
+            del name
+            payload_blob.extend(data)
 
-    metadata_json = json.dumps(metadata, separators=(",", ":")).encode()
-    blob.extend(len(metadata_json).to_bytes(4, "little"))
-    blob.extend(metadata_json)
+    if len(scales) != QAT_SCALE_COUNT:
+        raise ValueError(f"expected {QAT_SCALE_COUNT} exported weight scales, got {len(scales)}")
+    blob = bytearray(QAT_MAGIC)
+    blob.extend(np.asarray(scales, dtype="<f4").tobytes())
+    blob.extend(payload_blob)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(blob)
     return len(blob)
@@ -4888,16 +4991,51 @@ def unpack_ternary(payload: bytes, shape: list[int]) -> np.ndarray:
     return out.reshape(shape)
 
 
+def fixed_metadata(scales: list[float]) -> dict:
+    layers = []
+    scale_index = 0
+    for layer_name, weight_specs, bias_specs in FIXED_EXPORT_LAYER_SPECS:
+        layer_meta = {"name": layer_name, "weights": [], "biases": []}
+        for name, shape, encoding, weight_bits, nbytes in weight_specs:
+            layer_meta["weights"].append(
+                {
+                    "name": name,
+                    "shape": shape,
+                    "scale": scales[scale_index],
+                    "bits": weight_bits,
+                    "encoding": encoding,
+                    "bytes": nbytes,
+                }
+            )
+            scale_index += 1
+        for name, shape, nbytes in bias_specs:
+            layer_meta["biases"].append({"name": name, "shape": shape, "bytes": nbytes})
+        layers.append(layer_meta)
+    return {
+        "bits": 4,
+        "token_length": TOKEN_LENGTH,
+        "architecture": FIXED_EXPORT_ARCHITECTURE,
+        "labels": FIXED_EXPORT_LABELS,
+        "slugs": FIXED_EXPORT_SLUGS,
+        "tokenizer_version": FIXED_EXPORT_TOKENIZER_VERSION,
+        "layers": layers,
+    }
+
+
 def load_exported_layer_weights(path: Path) -> tuple[dict[str, list[np.ndarray]], dict]:
     data = path.read_bytes()
     if not data.startswith(QAT_MAGIC):
         raise ValueError(f"{path} is not an MSQ1 checkpoint")
     meta_start = data.rfind(b'{"bits"')
-    if meta_start < 0:
-        raise ValueError(f"metadata not found in {path}")
-    metadata = json.loads(data[meta_start:])
-    layers: dict[str, list[np.ndarray]] = {}
     cursor = len(QAT_MAGIC)
+    if meta_start >= 0:
+        metadata = json.loads(data[meta_start:])
+    else:
+        scales_nbytes = QAT_SCALE_COUNT * np.dtype("<f4").itemsize
+        scales = np.frombuffer(data[cursor : cursor + scales_nbytes], dtype="<f4").astype(float).tolist()
+        cursor += scales_nbytes
+        metadata = fixed_metadata(scales)
+    layers: dict[str, list[np.ndarray]] = {}
     for layer_meta in metadata["layers"]:
         values: list[np.ndarray] = []
         for weight_meta in layer_meta["weights"]:
@@ -4920,6 +5058,11 @@ def load_exported_layer_weights(path: Path) -> tuple[dict[str, list[np.ndarray]]
             cursor += nbytes
             values.append(np.frombuffer(payload, dtype="<f4").reshape(bias_meta["shape"]).copy())
         layers[str(layer_meta["name"])] = values
+    if meta_start >= 0:
+        if cursor + 4 != meta_start:
+            raise ValueError(f"unexpected MSQ1 payload length in {path}")
+    elif cursor != len(data):
+        raise ValueError(f"unexpected metadata-free MSQ1 payload length in {path}")
     return layers, metadata
 
 

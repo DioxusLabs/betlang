@@ -1,6 +1,6 @@
 //! Inference for the wordseq student.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (~50 KB MSQ1 export) and
+//! Loads `assets/magika/source-student-q4.bin` (weights-only MSQ1 export) and
 //! runs a forward pass: byte-window tokenization → word-unit tokenization
 //! → HashEmbedding lookup (K=3) → 3 conv stages with max-pool → global
 //! max+avg pool → 2 dense layers → 48-class softmax logits.
@@ -19,8 +19,8 @@
 //! Convolution hot paths use `fearless_simd` with scalar fallbacks for
 //! edges and out-channel counts not divisible by 16.
 
-use crate::language::{CLASS_LANGUAGES, Language};
-use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
+use crate::language::{Language, CLASS_LABELS, CLASS_LANGUAGES};
+use fearless_simd::{dispatch, f32x4, Level, Simd, SimdBase, SimdFloat};
 use std::sync::OnceLock;
 
 /// Detect the best available SIMD level once per process.
@@ -52,6 +52,7 @@ const CONV2: usize = 128;
 const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 const DENSE: usize = 96;
 pub(crate) const CLASSES: usize = 48;
+const SCALE_COUNT: usize = 6;
 const RELIABLE_LOGIT_MARGIN: f32 = 3.0;
 
 // v2 tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
@@ -63,6 +64,7 @@ const NUM_FLAG: u32 = 0x4000_0000;
 const BRACKET_FLAG: u32 = 0x5000_0000;
 const STRING_FLAG: u32 = 0x7000_0000;
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TokenizerVersion {
     V2,
@@ -93,18 +95,10 @@ struct Model {
 impl Model {
     fn load() -> Self {
         assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
-        let metadata_start = rfind_bytes(MODEL_BYTES, br#"{"bits""#).expect("no metadata");
-        let metadata = std::str::from_utf8(&MODEL_BYTES[metadata_start..]).expect("utf-8 meta");
-        assert!(
-            metadata.contains(r#""architecture":"wordseq-b1024-k3-m2048-tiny-3conv-hidden""#),
-            "shipped model is not the expected wordseq architecture",
-        );
-        let tokenizer_version = parse_tokenizer_version(metadata);
-        let scales = parse_scales(metadata);
-        // 6 layers, each with 1 weight tensor → 6 scales total.
-        assert_eq!(scales.len(), 6, "expected 6 weight scales");
-
+        debug_assert_eq!(CLASS_LABELS.len(), CLASSES);
         let mut cur = MODEL_MAGIC.len();
+        let scales = read_f32_array::<SCALE_COUNT>(&mut cur);
+        let tokenizer_version = TokenizerVersion::V3;
 
         // q_hash_embedding: weights [(1024, 24)] int4
         let embedding = read_int4_dequant(&mut cur, BINS * EMBED, scales[0]);
@@ -129,10 +123,7 @@ impl Model {
         let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
         let output_bias = read_f32_array::<CLASSES>(&mut cur);
 
-        // Trailing 4-byte LE metadata length (not used for indexing here, just sanity).
-        assert_eq!(cur + 4, metadata_start, "unexpected payload length");
-        let metadata_len = u32::from_le_bytes(MODEL_BYTES[cur..cur + 4].try_into().unwrap());
-        assert_eq!(metadata_len as usize, MODEL_BYTES.len() - metadata_start);
+        assert_eq!(cur, MODEL_BYTES.len(), "unexpected payload length");
 
         Self {
             tokenizer_version,
@@ -910,61 +901,6 @@ fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
     out
 }
 
-fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .rposition(|w| w == needle)
-        .map(|i| i)
-}
-
-fn parse_scales(metadata: &str) -> Vec<f32> {
-    let mut scales = Vec::new();
-    let mut rest = metadata;
-    while let Some(idx) = rest.find(r#""scale":"#) {
-        let value_start = idx + r#""scale":"#.len();
-        let value_end = rest[value_start..]
-            .find([',', '}'])
-            .map(|e| value_start + e)
-            .expect("scale terminator");
-        scales.push(
-            rest[value_start..value_end]
-                .parse::<f32>()
-                .expect("scale parse"),
-        );
-        rest = &rest[value_end..];
-    }
-    scales
-}
-
-fn parse_tokenizer_version(metadata: &str) -> TokenizerVersion {
-    let Some(version) = parse_usize_field(metadata, "tokenizer_version") else {
-        // Legacy exported checkpoints predate tokenizer metadata. The shipped
-        // wordseq asset was trained with v2.
-        return TokenizerVersion::V2;
-    };
-    match version {
-        2 => TokenizerVersion::V2,
-        3 => TokenizerVersion::V3,
-        4 => TokenizerVersion::V4,
-        other => {
-            panic!("unsupported wordseq tokenizer_version {other}; runtime supports v2, v3, and v4")
-        }
-    }
-}
-
-fn parse_usize_field(metadata: &str, field: &str) -> Option<usize> {
-    let key = format!(r#""{field}""#);
-    let after_key = &metadata[metadata.find(&key)? + key.len()..];
-    let rest = after_key[after_key.find(':')? + 1..].trim_start();
-    let end = rest
-        .find(|ch: char| !ch.is_ascii_digit())
-        .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
-    }
-    rest[..end].parse().ok()
-}
-
 // ============================================================================
 // Byte windowing + v2 word-unit tokenization
 // ============================================================================
@@ -1532,22 +1468,6 @@ mod tests {
         assert_eq!(model.tokenizer_version, TokenizerVersion::V3);
         assert_eq!(model.embedding.len(), BINS * EMBED);
         assert_eq!(model.output_kernel.len(), DENSE * CLASSES);
-    }
-
-    #[test]
-    fn tokenizer_version_defaults_legacy_checkpoints_to_v2() {
-        assert_eq!(
-            parse_tokenizer_version(r#"{"bits":4}"#),
-            TokenizerVersion::V2
-        );
-        assert_eq!(
-            parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":3}"#),
-            TokenizerVersion::V3
-        );
-        assert_eq!(
-            parse_tokenizer_version(r#"{"bits":4,"tokenizer_version":4}"#),
-            TokenizerVersion::V4
-        );
     }
 
     #[test]
