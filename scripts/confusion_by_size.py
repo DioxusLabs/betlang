@@ -620,7 +620,14 @@ def format_bytes(value: int) -> str:
     raise AssertionError
 
 
+FIGURE_BACKGROUND = "#000000"
+PRIMARY_TEXT = "#f8fafc"
+SECONDARY_TEXT = "#cbd5e1"
+GRID_COLOR = "#1f2937"
+
+
 def plot_confusion_panel(ax, title: str, matrix: np.ndarray, labels: list[str], cmap) -> object:
+    ax.set_facecolor(FIGURE_BACKGROUND)
     row_sums = matrix.sum(axis=1, keepdims=True)
     with np.errstate(divide="ignore", invalid="ignore"):
         normalized = np.divide(
@@ -633,17 +640,24 @@ def plot_confusion_panel(ax, title: str, matrix: np.ndarray, labels: list[str], 
     image = ax.imshow(masked, cmap=cmap, norm=LogNorm(vmin=0.001, vmax=1.0), interpolation="nearest")
     total = int(matrix.sum())
     acc = float(np.trace(matrix) / total) if total else 0.0
-    ax.set_title(f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%", fontsize=13, weight="bold")
+    ax.set_title(
+        f"{title}  |  n={total:,}  |  acc={acc * 100:.2f}%",
+        fontsize=13,
+        weight="bold",
+        color=PRIMARY_TEXT,
+    )
     ax.set_xticks(np.arange(len(labels)))
     ax.set_yticks(np.arange(len(labels)))
     ax.set_xticklabels(labels, rotation=90, fontsize=5)
     ax.set_yticklabels(labels, fontsize=5)
-    ax.set_xlabel("Predicted", fontsize=10)
-    ax.set_ylabel("Actual", fontsize=10)
+    ax.set_xlabel("Predicted", fontsize=10, color=PRIMARY_TEXT)
+    ax.set_ylabel("Actual", fontsize=10, color=PRIMARY_TEXT)
     ax.set_xticks(np.arange(-0.5, len(labels), 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(labels), 1), minor=True)
-    ax.grid(which="minor", color="#eef2f7", linewidth=0.25)
-    ax.tick_params(length=0)
+    ax.grid(which="minor", color=GRID_COLOR, linewidth=0.25)
+    ax.tick_params(length=0, colors=SECONDARY_TEXT)
+    for spine in ax.spines.values():
+        spine.set_color(SECONDARY_TEXT)
     return image
 
 
@@ -652,30 +666,44 @@ COLORBAR_TICK_LABELS = ["0.1%", "1%", "5%", "10%", "25%", "50%", "75%", "100%"]
 
 
 def configure_colorbar(fig, image, axes=None, *, cax=None, label: str = "Share of actual label") -> None:
-    cbar = fig.colorbar(image, ax=axes, cax=cax)
-    cbar.set_label(label, fontsize=10)
+    if cax is None:
+        cbar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.025)
+    else:
+        cbar = fig.colorbar(image, cax=cax)
+    cbar.ax.set_facecolor(FIGURE_BACKGROUND)
+    cbar.outline.set_edgecolor(SECONDARY_TEXT)
+    cbar.ax.tick_params(colors=PRIMARY_TEXT)
+    cbar.set_label(label, fontsize=10, color=PRIMARY_TEXT)
     cbar.set_ticks(COLORBAR_TICKS)
     cbar.set_ticklabels(COLORBAR_TICK_LABELS)
 
 
 def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], fs_accuracy: float) -> None:
-    cmap = plt.get_cmap("magma_r").copy()
-    cmap.set_bad("white")
-    fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160)
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad(FIGURE_BACKGROUND)
+    fig, axes = plt.subplots(4, 2, figsize=(24, 30), dpi=160, facecolor=FIGURE_BACKGROUND)
     axes_flat = axes.ravel()
     image = None
 
     for ax, bucket, matrix in zip(axes_flat[: len(BUCKETS)], BUCKETS, matrices):
         image = plot_confusion_panel(ax, bucket[0], matrix, labels, cmap)
+    axes_flat[len(BUCKETS)].set_facecolor(FIGURE_BACKGROUND)
+    axes_flat[len(BUCKETS)].axis("off")
 
-    fig.suptitle("Betlang wordseq confusion matrices by file size", fontsize=24, weight="bold", y=0.995)
+    fig.suptitle(
+        "Betlang wordseq confusion matrices by file size",
+        fontsize=24,
+        weight="bold",
+        y=0.995,
+        color=PRIMARY_TEXT,
+    )
     fig.text(
         0.01,
         0.972,
         "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
         f"for each held-out filesystem-label size bucket. Overall file accuracy: {fs_accuracy * 100:.2f}%.",
         fontsize=11,
-        color="#334155",
+        color=PRIMARY_TEXT,
     )
     fig.text(
         0.01,
@@ -683,47 +711,54 @@ def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], f
         "Off-diagonal cells show where each actual language is confused within that size bucket. "
         "The overall matrix is split out in assets/confusion-overall.png.",
         fontsize=11,
-        color="#64748b",
+        color=SECONDARY_TEXT,
     )
     fig.subplots_adjust(left=0.055, right=0.94, top=0.93, bottom=0.035, hspace=0.34, wspace=0.16)
     if image is not None:
         configure_colorbar(
             fig,
             image,
-            cax=axes_flat[len(BUCKETS)],
+            axes=axes_flat[: len(BUCKETS)],
             label="Share of actual label in bucket",
         )
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
 def render_overall_png(path: Path, matrix: np.ndarray, labels: list[str], fs_accuracy: float) -> None:
-    cmap = plt.get_cmap("magma_r").copy()
-    cmap.set_bad("white")
-    fig, ax = plt.subplots(figsize=(18, 17), dpi=180)
+    cmap = plt.get_cmap("magma").copy()
+    cmap.set_bad(FIGURE_BACKGROUND)
+    fig, ax = plt.subplots(figsize=(18, 17), dpi=180, facecolor=FIGURE_BACKGROUND)
     image = plot_confusion_panel(ax, "Overall", matrix, labels, cmap)
     ax.set_title(
         f"Overall  |  n={int(matrix.sum()):,}  |  acc={fs_accuracy * 100:.2f}%",
         fontsize=16,
         weight="bold",
+        color=PRIMARY_TEXT,
     )
     ax.set_xticklabels(labels, rotation=90, fontsize=7)
     ax.set_yticklabels(labels, fontsize=7)
-    ax.set_xlabel("Predicted", fontsize=12)
-    ax.set_ylabel("Actual", fontsize=12)
-    fig.suptitle("Betlang wordseq overall confusion matrix", fontsize=24, weight="bold", y=0.995)
+    ax.set_xlabel("Predicted", fontsize=12, color=PRIMARY_TEXT)
+    ax.set_ylabel("Actual", fontsize=12, color=PRIMARY_TEXT)
+    fig.suptitle(
+        "Betlang wordseq overall confusion matrix",
+        fontsize=24,
+        weight="bold",
+        y=0.995,
+        color=PRIMARY_TEXT,
+    )
     fig.text(
         0.01,
         0.962,
         "Actual labels are rows, predicted labels are columns. Cells are row-normalized shares "
         "for the held-out filesystem-label test split.",
         fontsize=11,
-        color="#334155",
+        color=PRIMARY_TEXT,
     )
     fig.subplots_adjust(left=0.11, right=0.84, top=0.925, bottom=0.12)
     scale_ax = fig.add_axes([0.875, 0.18, 0.05, 0.65])
     configure_colorbar(fig, image, cax=scale_ax)
-    fig.savefig(path, bbox_inches="tight")
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
