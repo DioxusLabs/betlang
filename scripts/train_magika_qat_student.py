@@ -1177,7 +1177,7 @@ def build_conv_xwide_dilated_tcn_tiny_hidden_model(
     return tf.keras.Model(inputs=inputs, outputs=[outputs, hidden])
 
 
-def build_conv_xwide_seperable_se_tiny_hidden_model(
+def build_conv_xwide_separable_se_tiny_hidden_model(
     classes: int, bits: int, hidden_dim: int = 512
 ) -> tf.keras.Model:
     """Tiny depthwise-separable byte-CNN with squeeze-and-excite.
@@ -3352,7 +3352,7 @@ def build_model(classes: int, bits: int, architecture: str, hidden_dim: int = 51
     if architecture == "conv-xwide-dilated-tcn-tiny-hidden":
         return build_conv_xwide_dilated_tcn_tiny_hidden_model(classes, bits, hidden_dim=hidden_dim)
     if architecture == "conv-xwide-sep-se-tiny-hidden":
-        return build_conv_xwide_seperable_se_tiny_hidden_model(classes, bits, hidden_dim=hidden_dim)
+        return build_conv_xwide_separable_se_tiny_hidden_model(classes, bits, hidden_dim=hidden_dim)
     if architecture == "conv-xwide-multiscale-tiny-hidden":
         return build_conv_xwide_multiscale_tiny_hidden_model(classes, bits, hidden_dim=hidden_dim)
     if architecture == "conv-xwide-multiscale-tiny-plus-hidden":
