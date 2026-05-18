@@ -14,10 +14,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use betlang::Language;
+use rayon::prelude::*;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -90,6 +91,20 @@ enum Kind {
     Unreadable,
 }
 
+enum PendingKind {
+    Dir,
+    File {
+        path: PathBuf,
+        truth: Option<Language>,
+    },
+}
+
+struct PendingNode {
+    depth: usize,
+    name: String,
+    kind: PendingKind,
+}
+
 struct Node {
     depth: usize,
     name: String,
@@ -110,7 +125,7 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         .sort_by_file_path(|a, b| a.cmp(b))
         .build();
 
-    let mut nodes: Vec<Node> = Vec::new();
+    let mut pending_nodes: Vec<PendingNode> = Vec::new();
     let mut bytes_by_language: HashMap<Language, u64> = HashMap::new();
     let mut total: u64 = 0;
     let mut undetected: u64 = 0;
@@ -132,53 +147,56 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         let name = display_name(entry.path(), root, depth);
 
         if is_dir {
-            nodes.push(Node {
+            pending_nodes.push(PendingNode {
                 depth,
                 name,
-                kind: Kind::Dir,
+                kind: PendingKind::Dir,
             });
             continue;
         }
 
-        let truth = ground_truth(entry.path());
-        match classify_file(entry.path()) {
-            Some((language, size)) => {
-                total += size;
-                match language {
-                    Some(language) => *bytes_by_language.entry(language).or_default() += size,
-                    None => undetected += size,
-                }
-                if let Some(truth_lang) = truth {
-                    graded += 1;
-                    let stat = by_truth.entry(truth_lang).or_default();
-                    stat.total += 1;
-                    if language == Some(truth_lang) {
-                        stat.correct += 1;
-                        correct += 1;
-                    }
-                    *confusion.entry((truth_lang, language)).or_default() += 1;
-                }
-                nodes.push(Node {
-                    depth,
-                    name,
-                    kind: Kind::File {
-                        language,
-                        truth,
-                        size,
-                    },
-                });
-            }
-            None => nodes.push(Node {
-                depth,
-                name,
-                kind: Kind::Unreadable,
-            }),
-        }
+        pending_nodes.push(PendingNode {
+            depth,
+            name,
+            kind: PendingKind::File {
+                path: entry.path().to_path_buf(),
+                truth: ground_truth(entry.path()),
+            },
+        });
     }
+
+    let nodes: Vec<Node> = pending_nodes.into_par_iter().map(classify_node).collect();
 
     if nodes.is_empty() {
         eprintln!("betlang: nothing to scan under {}", root.display());
         return ExitCode::from(1);
+    }
+
+    for node in &nodes {
+        let Kind::File {
+            language,
+            truth,
+            size,
+        } = node.kind
+        else {
+            continue;
+        };
+
+        total += size;
+        match language {
+            Some(language) => *bytes_by_language.entry(language).or_default() += size,
+            None => undetected += size,
+        }
+        if let Some(truth_lang) = truth {
+            graded += 1;
+            let stat = by_truth.entry(truth_lang).or_default();
+            stat.total += 1;
+            if language == Some(truth_lang) {
+                stat.correct += 1;
+                correct += 1;
+            }
+            *confusion.entry((truth_lang, language)).or_default() += 1;
+        }
     }
 
     print_tree(&nodes);
@@ -197,6 +215,26 @@ fn breakdown_tree(root: &Path) -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+fn classify_node(node: PendingNode) -> Node {
+    let kind = match node.kind {
+        PendingKind::Dir => Kind::Dir,
+        PendingKind::File { path, truth } => match classify_file(&path) {
+            Some((language, size)) => Kind::File {
+                language,
+                truth,
+                size,
+            },
+            None => Kind::Unreadable,
+        },
+    };
+
+    Node {
+        depth: node.depth,
+        name: node.name,
+        kind,
+    }
 }
 
 fn display_name(path: &Path, root: &Path, depth: usize) -> String {
