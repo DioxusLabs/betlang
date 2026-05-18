@@ -40,7 +40,7 @@ one-to-one with no label aggregation.
 
 The confusion matrix uses the same labels:
 
-![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/v0.1.0/assets/confusion-overall.png)
+![Betlang wordseq confusion](./assets/confusion-overall.png)
 
 ## Model
 
@@ -80,4 +80,4 @@ split. Each panel is a row-normalized confusion matrix for one file-size
 bucket: actual labels are rows, predicted labels are columns, and the diagonal
 is correct classification.
 
-![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/v0.1.0/assets/confusion-by-size.png)
+![Betlang wordseq confusion by file size](./assets/confusion-by-size.png)
