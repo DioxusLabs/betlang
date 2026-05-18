@@ -174,6 +174,19 @@ fn language_fixtures_have_unique_expected_languages() {
 }
 
 #[test]
+fn language_fixtures_cover_model_languages() {
+    let fixture_languages = LANGUAGE_FIXTURES
+        .into_iter()
+        .map(|(language, _)| language)
+        .collect::<HashSet<_>>();
+    let model_languages = (0..Language::MODEL_LABEL_COUNT)
+        .map(|index| Language::from_model_index(index).expect("model label"))
+        .collect::<HashSet<_>>();
+
+    assert_eq!(fixture_languages, model_languages);
+}
+
+#[test]
 fn detect_accepts_non_utf8_inputs() {
     let mut bytes = b"fn main() {\n    println!(\"hello\");\n}\n".to_vec();
     bytes.extend([0xff, 0xfe]);
@@ -182,7 +195,7 @@ fn detect_accepts_non_utf8_inputs() {
 }
 
 #[test]
-fn probabilities_sum_to_one_across_public_languages() {
+fn probabilities_sum_to_one_across_model_languages() {
     let detection = crate::detect("use std::fmt;\nfn main() { println!(\"hi\"); }\n");
     let sum: f32 = detection
         .top_languages()
@@ -443,29 +456,31 @@ fn fixture_path(path: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(path)
 }
 
-const LANGUAGE_FIXTURES: [(Language, &str); 44] = [
+const LANGUAGE_FIXTURES: [(Language, &str); 48] = [
     (Language::Asm, "tests/fixtures/languages/asm.s"),
     (Language::Batch, "tests/fixtures/languages/batch.bat"),
-    (Language::Bash, "tests/fixtures/languages/bash.sh"),
     (Language::C, "tests/fixtures/languages/c.c"),
-    (Language::CSharp, "tests/fixtures/languages/c-sharp.cs"),
     (Language::Clojure, "tests/fixtures/languages/clojure.clj"),
     (Language::CMake, "tests/fixtures/languages/cmake.cmake"),
     (Language::Cobol, "tests/fixtures/languages/cobol.cob"),
-    (
-        Language::CommonLisp,
-        "tests/fixtures/languages/commonlisp.lisp",
-    ),
     (Language::Cpp, "tests/fixtures/languages/cpp.cpp"),
+    (Language::Cs, "tests/fixtures/languages/c-sharp.cs"),
     (Language::Css, "tests/fixtures/languages/css.css"),
+    (Language::Dart, "tests/fixtures/languages/dart.dart"),
     (
         Language::Dockerfile,
         "tests/fixtures/languages/dockerfile.Dockerfile",
     ),
     (Language::Elixir, "tests/fixtures/languages/elixir.ex"),
     (Language::Erlang, "tests/fixtures/languages/erlang.erl"),
+    (Language::Gemfile, "tests/fixtures/languages/Gemfile"),
+    (
+        Language::Gemspec,
+        "tests/fixtures/languages/gemspec.gemspec",
+    ),
     (Language::Go, "tests/fixtures/languages/go.go"),
-    (Language::Groovy, "tests/fixtures/languages/groovy.gradle"),
+    (Language::Gradle, "tests/fixtures/languages/gradle.gradle"),
+    (Language::Groovy, "tests/fixtures/languages/groovy.groovy"),
     (Language::Haskell, "tests/fixtures/languages/haskell.hs"),
     (Language::Html, "tests/fixtures/languages/html.html"),
     (Language::Ini, "tests/fixtures/languages/ini.ini"),
@@ -477,6 +492,7 @@ const LANGUAGE_FIXTURES: [(Language, &str); 44] = [
     (Language::Json, "tests/fixtures/languages/json.json"),
     (Language::Julia, "tests/fixtures/languages/julia.jl"),
     (Language::Kotlin, "tests/fixtures/languages/kotlin.kt"),
+    (Language::Lisp, "tests/fixtures/languages/commonlisp.lisp"),
     (Language::Lua, "tests/fixtures/languages/lua.lua"),
     (Language::Markdown, "tests/fixtures/languages/markdown.md"),
     (Language::ObjectiveC, "tests/fixtures/languages/objc.m"),
@@ -492,6 +508,7 @@ const LANGUAGE_FIXTURES: [(Language, &str); 44] = [
     (Language::Ruby, "tests/fixtures/languages/ruby.rb"),
     (Language::Rust, "tests/fixtures/languages/rust.rs"),
     (Language::Scala, "tests/fixtures/languages/scala.scala"),
+    (Language::Shell, "tests/fixtures/languages/bash.sh"),
     (Language::Sql, "tests/fixtures/languages/sql.sql"),
     (Language::Swift, "tests/fixtures/languages/swift.swift"),
     (Language::Toml, "tests/fixtures/languages/toml.toml"),
@@ -499,7 +516,7 @@ const LANGUAGE_FIXTURES: [(Language, &str); 44] = [
         Language::TypeScript,
         "tests/fixtures/languages/typescript.ts",
     ),
-    (Language::Vb, "tests/fixtures/languages/vb.vb"),
+    (Language::Vba, "tests/fixtures/languages/vb.vb"),
     (Language::Verilog, "tests/fixtures/languages/verilog.v"),
     (Language::Xml, "tests/fixtures/languages/xml.xml"),
     (Language::Yaml, "tests/fixtures/languages/yaml.yaml"),

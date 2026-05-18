@@ -491,17 +491,16 @@ fn print_confusion(
 }
 
 /// Filename- and extension-based ground truth. Returns `None` for files whose
-/// extension is ambiguous (e.g. `.m`, bare `.pl`, `.h`) or unknown, so those
-/// files are excluded from accuracy and confusion counts.
+/// extension is ambiguous, outside the model output surface, or unknown, so
+/// those files are excluded from accuracy and confusion counts.
 fn ground_truth(path: &Path) -> Option<Language> {
     if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
         match name {
             "Dockerfile" | "Containerfile" | "dockerfile" => return Some(Language::Dockerfile),
             "CMakeLists.txt" => return Some(Language::CMake),
+            "Gemfile" => return Some(Language::Gemfile),
             "Makefile" | "GNUmakefile" | "makefile" => return None, // not a tracked language
-            "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => {
-                return Some(Language::Starlark);
-            }
+            "BUILD" | "BUILD.bazel" | "WORKSPACE" | "WORKSPACE.bazel" => return None,
             _ => {}
         }
     }
@@ -511,30 +510,28 @@ fn ground_truth(path: &Path) -> Option<Language> {
         .to_ascii_lowercase();
     Some(match ext.as_str() {
         "asm" | "s" => Language::Asm,
-        "awk" => Language::Awk,
         "bat" | "cmd" => Language::Batch,
-        "sh" | "bash" | "zsh" | "ksh" => Language::Bash,
+        "sh" | "bash" | "zsh" | "ksh" => Language::Shell,
         "c" => Language::C,
-        "cs" => Language::CSharp,
+        "cs" => Language::Cs,
         "clj" | "cljs" | "cljc" | "edn" => Language::Clojure,
         "cmake" => Language::CMake,
         "cob" | "cbl" | "cpy" => Language::Cobol,
-        "lisp" | "lsp" | "cl" => Language::CommonLisp,
+        "lisp" | "lsp" | "cl" => Language::Lisp,
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Language::Cpp,
         "css" => Language::Css,
         "dart" => Language::Dart,
-        "diff" | "patch" => Language::Diff,
         "ex" | "exs" => Language::Elixir,
         "erl" | "hrl" => Language::Erlang,
+        "gemspec" => Language::Gemspec,
         "go" => Language::Go,
-        "groovy" | "gvy" | "gradle" => Language::Groovy,
+        "gradle" => Language::Gradle,
+        "groovy" | "gvy" => Language::Groovy,
         "hs" | "lhs" => Language::Haskell,
-        "hcl" | "tf" | "tfvars" => Language::Hcl,
         "html" | "htm" | "xhtml" => Language::Html,
         "ini" | "cfg" => Language::Ini,
         "java" => Language::Java,
         "js" | "mjs" | "cjs" | "jsx" => Language::JavaScript,
-        "jinja" | "j2" | "jinja2" => Language::Jinja2,
         "json" | "jsonc" | "json5" => Language::Json,
         "jl" => Language::Julia,
         "kt" | "kts" => Language::Kotlin,
@@ -543,32 +540,21 @@ fn ground_truth(path: &Path) -> Option<Language> {
         "mm" => Language::ObjectiveC,
         "ml" | "mli" => Language::Ocaml,
         "php" | "phtml" => Language::Php,
-        "ps" | "eps" => Language::Postscript,
         "ps1" | "psm1" | "psd1" => Language::Powershell,
         "py" | "pyi" | "pyw" => Language::Python,
-        "rb" | "rake" | "gemspec" => Language::Ruby,
+        "rb" | "rake" => Language::Ruby,
         "rs" => Language::Rust,
         "scala" | "sbt" => Language::Scala,
-        "scss" => Language::Scss,
-        "sol" => Language::Solidity,
         "sql" => Language::Sql,
-        "bzl" | "star" => Language::Starlark,
         "swift" => Language::Swift,
-        "textproto" => Language::TextProto,
         "toml" => Language::Toml,
         "ts" | "tsx" | "mts" | "cts" => Language::TypeScript,
-        "vb" | "vbs" => Language::Vb,
+        "vb" | "vbs" => Language::Vba,
         "v" | "sv" | "svh" => Language::Verilog,
-        "vhd" | "vhdl" => Language::Vhdl,
-        "vue" => Language::Vue,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => Language::Xml,
         "yaml" | "yml" => Language::Yaml,
-        "zig" | "zon" => Language::Zig,
-        // Ambiguous or out-of-vocab: skip.
-        // .m  → Matlab vs ObjectiveC
-        // .pl → Perl vs Prolog
-        // .h  → C vs Cpp vs ObjectiveC
-        // .r  → R vs Rebol
+        // Ambiguous, unsupported, or out-of-vocabulary: skip.
+        // Examples: .m, .pl, .h, .r.
         _ => return None,
     })
 }

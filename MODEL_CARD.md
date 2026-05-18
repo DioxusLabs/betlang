@@ -8,7 +8,7 @@
 - SHA-256: `59ef24167bddd1364eb9c1650add8a67e1a542b5155fac67f5e1cda07df0c0f0`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
-- Classes: 48 embedded model classes mapped to public `Language` variants
+- Output head: 48 model labels exposed one-to-one as public `Language` variants
 
 ## Intended Use
 
@@ -43,11 +43,6 @@ The README confusion matrix groups the same held-out split by file-size bucket.
   non-whitespace bytes are available.
 - Ambiguous snippets can put several languages close together even when a human
   can infer the language from file naming context.
-- Public variants may combine multiple model classes. For example, `gemfile`
-  and `gemspec` map to `ruby`, `gradle` maps to `groovy`, `shell` maps to
-  `bash`, and `vba` maps to `vb`.
-- Some public language slugs remain parseable and usable for file-tree
-  reporting but are not direct classes in the embedded 48-label model head.
 - The classifier uses content only. It does not inspect file names, extensions,
   shebangs outside the model window, repository metadata, or build-system
   context.

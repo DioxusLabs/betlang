@@ -28,7 +28,7 @@ mod tokenizer;
 mod window;
 
 use self::{constants::CLASSES, runtime::Model, window::build_window};
-use crate::{Detection, Language, language::CLASS_LANGUAGES};
+use crate::{Detection, Language};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
     let Some(window) = build_window(source) else {
@@ -55,17 +55,12 @@ fn detection_from_logits(logits: &[f32; CLASSES]) -> Detection {
         return Detection::from_predictions(Vec::new());
     }
 
-    let mut predictions: Vec<(f32, Language)> = Vec::new();
-    for (&logit, &language) in logits.iter().zip(CLASS_LANGUAGES.iter()) {
+    debug_assert_eq!(CLASSES, Language::MODEL_LABEL_COUNT);
+    let mut predictions = Vec::with_capacity(logits.len());
+    for (index, &logit) in logits.iter().enumerate() {
+        let language = Language::from_model_index(index).expect("model label index");
         let probability = (logit - max).exp() / denominator;
-        if let Some((existing, _)) = predictions
-            .iter_mut()
-            .find(|(_, existing_language)| *existing_language == language)
-        {
-            *existing += probability;
-        } else {
-            predictions.push((probability, language));
-        }
+        predictions.push((probability, language));
     }
 
     predictions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.slug().cmp(b.1.slug())));

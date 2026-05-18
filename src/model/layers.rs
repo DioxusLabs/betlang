@@ -3,7 +3,7 @@ use super::{
     constants::{BINS, EMBED},
 };
 use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
-use std::sync::OnceLock;
+use std::{ops::Range, sync::OnceLock};
 
 /// Detect the best available SIMD level once per process.
 fn simd_level() -> Level {
@@ -319,28 +319,46 @@ fn conv1d_block4_group16<S: Simd>(
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RepeatedRows {
-    start: usize,
-    end: usize,
+    range: Range<usize>,
     extends_right_padding: bool,
 }
 
 impl RepeatedRows {
-    fn is_empty(self) -> bool {
-        self.start >= self.end
+    fn new(start: usize, end: usize, extends_right_padding: bool) -> Self {
+        Self {
+            range: start..end,
+            extends_right_padding,
+        }
     }
 
-    fn len(self) -> usize {
-        self.end - self.start
+    fn empty(at: usize) -> Self {
+        Self::new(at, at, false)
     }
 
-    fn contains(self, row: usize) -> bool {
-        self.start <= row && row < self.end
+    fn start(&self) -> usize {
+        self.range.start
+    }
+
+    fn end(&self) -> usize {
+        self.range.end
+    }
+
+    fn is_empty(&self) -> bool {
+        self.range.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    fn contains(&self, row: usize) -> bool {
+        self.range.contains(&row)
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Tensor<'a> {
     data: &'a [f32],
     rows: usize,
@@ -363,16 +381,12 @@ impl<'a> Tensor<'a> {
             data,
             rows,
             channels,
-            repeated_tail: RepeatedRows {
-                start,
-                end: rows,
-                extends_right_padding: true,
-            },
+            repeated_tail: RepeatedRows::new(start, rows, true),
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn copy_to_dense(self, out: &mut [f32]) {
+    pub(crate) fn copy_to_dense(&self, out: &mut [f32]) {
         debug_assert_eq!(out.len(), self.rows * self.channels);
         for row_index in 0..self.rows {
             out[row_index * self.channels..(row_index + 1) * self.channels]
@@ -380,11 +394,11 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    fn row(self, index: usize) -> &'a [f32] {
+    fn row(&self, index: usize) -> &'a [f32] {
         debug_assert!(index < self.rows);
-        let region = self.repeated_tail;
+        let region = &self.repeated_tail;
         let index = if region.contains(index) {
-            region.start
+            region.start()
         } else {
             index
         };
@@ -428,19 +442,21 @@ pub(crate) fn conv_gelu_maxpool_tensor<'a>(
         bias,
         pool,
     };
-    let out_region = pooled_repeated_region(input, &spec);
+    let out_region = pooled_repeated_region(&input, &spec);
     let row_count = spec.row_count();
     debug_assert_eq!(out.len(), row_count * out_channels);
 
     if out_region.is_empty() {
-        conv_gelu_range(input, &spec, 0, row_count, out, scratch);
+        conv_gelu_range(&input, &spec, 0, row_count, out, scratch);
         return Tensor::with_repeated_tail(out, row_count, out_channels, row_count);
     }
 
-    conv_gelu_range(input, &spec, 0, out_region.start, out, scratch);
-    let value_row = row_range_mut(out, out_channels, out_region.start, out_region.start + 1);
-    const_output_value(input, &spec, value_row);
-    conv_gelu_range(input, &spec, out_region.end, row_count, out, scratch);
+    let out_start = out_region.start();
+    let out_end = out_region.end();
+    conv_gelu_range(&input, &spec, 0, out_start, out, scratch);
+    let value_row = row_range_mut(out, out_channels, out_start, out_start + 1);
+    const_output_value(&input, &spec, value_row);
+    conv_gelu_range(&input, &spec, out_end, row_count, out, scratch);
 
     Tensor {
         data: out,
@@ -485,19 +501,19 @@ pub(crate) fn global_max_avg_pool(input: Tensor<'_>, out_max: &mut [f32], out_av
         return;
     }
 
-    let region = input.repeated_tail;
+    let region = &input.repeated_tail;
     if region.is_empty() {
         accumulate_pool_rows(input.data, input.channels, out_max, out_avg);
     } else {
         accumulate_pool_rows(
-            row_range(input.data, input.channels, 0, region.start),
+            row_range(input.data, input.channels, 0, region.start()),
             input.channels,
             out_max,
             out_avg,
         );
-        accumulate_const_rows(input.row(region.start), region.len(), out_max, out_avg);
+        accumulate_const_rows(input.row(region.start()), region.len(), out_max, out_avg);
         accumulate_pool_rows(
-            row_range(input.data, input.channels, region.end, input.rows),
+            row_range(input.data, input.channels, region.end(), input.rows),
             input.channels,
             out_max,
             out_avg,
@@ -510,52 +526,36 @@ pub(crate) fn global_max_avg_pool(input: Tensor<'_>, out_max: &mut [f32], out_av
     }
 }
 
-fn pooled_repeated_region(input: Tensor<'_>, spec: &ConvSpec<'_>) -> RepeatedRows {
-    let input_region = input.repeated_tail;
+fn pooled_repeated_region(input: &Tensor<'_>, spec: &ConvSpec<'_>) -> RepeatedRows {
+    let input_region = &input.repeated_tail;
     if input_region.is_empty() {
-        return RepeatedRows {
-            start: spec.row_count(),
-            end: spec.row_count(),
-            extends_right_padding: false,
-        };
+        return RepeatedRows::empty(spec.row_count());
     }
 
     let pad = (spec.kernel_size - 1) / 2;
     let right = spec.kernel_size - 1 - pad;
-    let conv_start = input_region.start.saturating_add(pad).min(spec.seq_len);
+    let conv_start = input_region.start().saturating_add(pad).min(spec.seq_len);
     let conv_end = if input_region.extends_right_padding {
         spec.seq_len
     } else {
-        input_region.end.saturating_sub(right).min(spec.seq_len)
+        input_region.end().saturating_sub(right).min(spec.seq_len)
     };
 
     if conv_start >= conv_end {
-        return RepeatedRows {
-            start: spec.row_count(),
-            end: spec.row_count(),
-            extends_right_padding: false,
-        };
+        return RepeatedRows::empty(spec.row_count());
     }
 
     let start = conv_start.div_ceil(spec.pool);
     let end = conv_end / spec.pool;
     if start >= end {
-        RepeatedRows {
-            start: spec.row_count(),
-            end: spec.row_count(),
-            extends_right_padding: false,
-        }
+        RepeatedRows::empty(spec.row_count())
     } else {
-        RepeatedRows {
-            start,
-            end,
-            extends_right_padding: false,
-        }
+        RepeatedRows::new(start, end, false)
     }
 }
 
 fn conv_gelu_range(
-    input: Tensor<'_>,
+    input: &Tensor<'_>,
     spec: &ConvSpec<'_>,
     row_start: usize,
     row_end: usize,
@@ -586,12 +586,12 @@ fn conv_gelu_range(
 }
 
 fn range_touches_repeated(
-    input: Tensor<'_>,
+    input: &Tensor<'_>,
     spec: &ConvSpec<'_>,
     row_start: usize,
     row_end: usize,
 ) -> bool {
-    let region = input.repeated_tail;
+    let region = &input.repeated_tail;
     if row_start >= row_end {
         return false;
     }
@@ -604,7 +604,7 @@ fn range_touches_repeated(
     let last_output = (row_end - 1) * spec.pool + (spec.pool - 1);
     let src_start = first_output.saturating_sub(pad);
     let src_end = (last_output + right + 1).min(input.rows);
-    src_start < region.end && region.start < src_end
+    src_start < region.end() && region.start() < src_end
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -727,7 +727,7 @@ fn conv_gelu_maxpool_range_run<S: Simd, const POOL: usize>(
 }
 
 fn conv_gelu_maxpool_tensor_range(
-    input: Tensor<'_>,
+    input: &Tensor<'_>,
     spec: &ConvSpec<'_>,
     row_start: usize,
     out: &mut [f32],
@@ -746,7 +746,7 @@ fn conv_gelu_maxpool_tensor_range(
 }
 
 fn conv1d_tensor_block(
-    input: Tensor<'_>,
+    input: &Tensor<'_>,
     spec: &ConvSpec<'_>,
     t_base: usize,
     block: usize,
@@ -786,10 +786,10 @@ fn pool_rows_scalar(rows: &[f32], channels: usize, dst: &mut [f32]) {
     }
 }
 
-fn const_output_value(input: Tensor<'_>, spec: &ConvSpec<'_>, out: &mut [f32]) {
-    let input_region = input.repeated_tail;
+fn const_output_value(input: &Tensor<'_>, spec: &ConvSpec<'_>, out: &mut [f32]) {
+    let input_region = &input.repeated_tail;
     debug_assert!(!input_region.is_empty());
-    let input_row = input.row(input_region.start);
+    let input_row = input.row(input_region.start());
     out.copy_from_slice(spec.bias);
     for krow in spec
         .kernel

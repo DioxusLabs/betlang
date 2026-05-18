@@ -28,16 +28,17 @@ Slugs parse through the standard `FromStr` implementation:
 assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
 ```
 
-`asm`, `awk`, `batch`, `bash`, `c`, `c-sharp`, `clojure`, `cmake`, `cobol`,
-`commonlisp`, `cpp`, `css`, `dart`, `diff`, `dockerfile`, `elixir`, `erlang`,
-`go`, `groovy`, `haskell`, `hcl`, `html`, `ini`, `java`, `javascript`,
-`jinja2`, `json`, `julia`, `kotlin`, `lua`, `markdown`, `matlab`, `objc`,
-`ocaml`, `perl`, `php`, `postscript`, `powershell`, `prolog`, `python`, `r`,
-`ruby`, `rust`, `scala`, `scss`, `solidity`, `sql`, `starlark`, `swift`,
-`textproto`, `toml`, `typescript`, `vb`, `verilog`, `vhdl`, `vue`, `xml`,
-`yaml`, `zig`.
+`asm`, `batch`, `c`, `clojure`, `cmake`, `cobol`, `cpp`, `cs`, `css`, `dart`,
+`dockerfile`, `elixir`, `erlang`, `gemfile`, `gemspec`, `go`, `gradle`,
+`groovy`, `haskell`, `html`, `ini`, `java`, `javascript`, `json`, `julia`,
+`kotlin`, `lisp`, `lua`, `markdown`, `objectivec`, `ocaml`, `perl`, `php`,
+`powershell`, `python`, `r`, `ruby`, `rust`, `scala`, `shell`, `sql`, `swift`,
+`toml`, `typescript`, `vba`, `verilog`, `xml`, `yaml`.
 
-The confusion matrix for the model's 48 embedded classes:
+These are the model's 48 output labels. Runtime detections expose them
+one-to-one with no label aggregation.
+
+The confusion matrix uses the same labels:
 
 ![Betlang wordseq confusion](assets/confusion-overall.png)
 
