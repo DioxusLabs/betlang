@@ -6,7 +6,12 @@ use super::{
     reader::{read_f32_array, read_int4_dequant, read_ternary_dequant},
     tokenizer::tokenize,
 };
-use std::sync::OnceLock;
+use std::{cell::RefCell, sync::OnceLock};
+
+thread_local! {
+    static INFERENCE_SCRATCH_BUF: RefCell<Box<[f32]>> =
+        RefCell::new(vec![0.0f32; INFERENCE_SCRATCH].into_boxed_slice());
+}
 
 #[derive(Debug)]
 pub(crate) struct Model {
@@ -80,13 +85,25 @@ impl Model {
 
     /// Run the full forward pass on a unit-id sequence (length = `len`).
     pub(crate) fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
+        INFERENCE_SCRATCH_BUF.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            self.logits_with_scratch(units, len, &mut scratch)
+        })
+    }
+
+    fn logits_with_scratch(
+        &self,
+        units: &[i32],
+        len: usize,
+        scratch: &mut [f32],
+    ) -> [f32; CLASSES] {
+        assert!(scratch.len() >= INFERENCE_SCRATCH);
         let t = len.min(MAX_UNITS);
         let t1 = t / CONV0_POOL;
         let t2 = t1 / CONV1_POOL;
         let embed_len = t * EMBED;
         let pool0_len = t1 * CONV0;
         let pool1_len = t2 * CONV1;
-        let mut scratch = vec![0.0f32; INFERENCE_SCRATCH].into_boxed_slice();
         let (activations, conv_scratch) = scratch.split_at_mut(ACTIVATION_SCRATCH);
 
         {
@@ -95,14 +112,16 @@ impl Model {
             // 1) HashEmbedding + GELU.
             let (embed_rows, embed_remainder) = embed.as_chunks_mut::<EMBED>();
             debug_assert!(embed_remainder.is_empty());
-            for (pos, dst) in embed_rows.iter_mut().take(t.min(units.len())).enumerate() {
-                let id = units[pos];
-                if id < 0 {
-                    continue;
-                }
-                embed_position(&self.embedding, id as u32, dst);
-                for v in dst.iter_mut() {
-                    *v = gelu(*v);
+            for (pos, dst) in embed_rows.iter_mut().take(t).enumerate() {
+                if let Some(&id) = units.get(pos)
+                    && id >= 0
+                {
+                    embed_position(&self.embedding, id as u32, dst);
+                    for v in dst.iter_mut() {
+                        *v = gelu(*v);
+                    }
+                } else {
+                    dst.fill(0.0);
                 }
             }
 

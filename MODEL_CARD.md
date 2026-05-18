@@ -3,12 +3,12 @@
 ## Artifact
 
 - File: `assets/magika/source-student-q4.bin`
-- Format: raw quantized tensor payload
-- Size: 100,444 bytes
-- SHA-256: `e2498dc23a60cc32ae21a448c3763ee7080a6fbf9f813b63a066ef195e1e44a0`
-- Architecture: `wordseq-b1536-k3-m2048-med-3conv-hidden`
+- Format: weights-only MSQ1 quantized tensor payload
+- Size: 47,840 bytes
+- SHA-256: `59ef24167bddd1364eb9c1650add8a67e1a542b5155fac67f5e1cda07df0c0f0`
+- Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
-- Classes: 67 embedded model classes mapped to 59 public `Language` variants
+- Classes: 48 embedded model classes mapped to public `Language` variants
 
 ## Intended Use
 
@@ -30,10 +30,10 @@ derived from the training corpus and Magika teacher.
 
 ## Evaluation
 
-Held-out `bigorig` test split:
+Manifest-aligned held-out filesystem-label test split:
 
-- `test_teacher_parity=0.967618`
-- `test_fs_accuracy=0.962517`
+- `test_fs_accuracy=0.965238`
+- `macro_recall=0.965411`
 
 The README confusion matrix groups the same held-out split by file-size bucket.
 
@@ -43,9 +43,11 @@ The README confusion matrix groups the same held-out split by file-size bucket.
   non-whitespace bytes are available.
 - Ambiguous snippets can put several languages close together even when a human
   can infer the language from file naming context.
-- Public variants may combine multiple model classes. For example, `jsonl`
-  maps to `json`, `shell` maps to `bash`, and several Ruby packaging/template
-  classes map to `ruby`.
+- Public variants may combine multiple model classes. For example, `gemfile`
+  and `gemspec` map to `ruby`, `gradle` maps to `groovy`, `shell` maps to
+  `bash`, and `vba` maps to `vb`.
+- Some public language slugs remain parseable and usable for file-tree
+  reporting but are not direct classes in the embedded 48-label model head.
 - The classifier uses content only. It does not inspect file names, extensions,
   shebangs outside the model window, repository metadata, or build-system
   context.
