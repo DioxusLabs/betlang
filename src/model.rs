@@ -31,12 +31,12 @@ use self::{constants::CLASSES, runtime::Model, window::build_window};
 use crate::{Detection, Language, language::CLASS_LANGUAGES};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
-    let Some((bytes, pad)) = build_window(source) else {
+    let Some(window) = build_window(source) else {
         return Detection::from_predictions(Vec::new());
     };
     let model = Model::get();
-    let units = model.tokenize_units(&bytes, &pad);
-    let logits = model.logits_for_runtime_units(&units);
+    let units = model.tokenize_units(&window);
+    let logits = model.logits(&units);
     detection_from_logits(&logits)
 }
 

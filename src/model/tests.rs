@@ -1,8 +1,6 @@
 use super::{
     constants::*,
-    layers::{
-        Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_dense, conv_gelu_maxpool_tensor,
-    },
+    layers::{Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_tensor},
     runtime::Model,
     tokenizer::{hash_unit_bytes, tokenize},
     window::build_window,
@@ -22,12 +20,42 @@ fn loads_embedded_model() {
 #[test]
 fn tokenizer_casefolds_and_isolates_brackets() {
     let source = b"Foo(foo)\n";
-    let pad = vec![false; source.len()];
-    let units = tokenize(source, &pad);
+    let window = build_window(source).expect("source should build a model window");
+    let units = tokenize(&window);
 
     assert_eq!(units[0] as u32, hash_unit_bytes(b"foo") & WORD_MASK);
     assert!(units.contains(&((BRACKET_FLAG | b'(' as u32) as i32)));
     assert!(units.contains(&((BRACKET_FLAG | b')' as u32) as i32)));
+}
+
+#[test]
+fn tokenizer_matches_legacy_buffer_model_on_fuzzed_windows() {
+    let mut rng = StdRng::seed_from_u64(0x544f_4b45_4e49_5a45);
+
+    for case in [
+        &b"abc123!"[..],
+        b"1.2 .. ...\r\n\tfoo(bar)[baz]{qux}",
+        b"        indented\n    next\n",
+        b"UPPER_lower 000.111 <=> -> ::",
+    ] {
+        let window = build_window(case).expect("case should build a model window");
+        assert_eq!(tokenize(&window), legacy_tokenize_bytes(window.bytes()));
+    }
+
+    for _ in 0..1024 {
+        let len = rng.gen_range(8..6000);
+        let mut source = Vec::with_capacity(len);
+        for _ in 0..rng.gen_range(0..16) {
+            source.push(b' ');
+        }
+        while source.len() < len {
+            source.push(rng.gen_range(0..=255));
+        }
+
+        if let Some(window) = build_window(&source) {
+            assert_eq!(tokenize(&window), legacy_tokenize_bytes(window.bytes()));
+        }
+    }
 }
 
 #[test]
@@ -167,40 +195,34 @@ fn probabilities_sum_to_one_across_public_languages() {
 }
 
 #[test]
-fn runtime_inference_pads_short_sources_to_eval_shape() {
+fn runtime_inference_accepts_short_sources() {
     let source = "use std::fmt;\nfn main() { println!(\"hi\"); }\n";
-    let Some((bytes, pad)) = build_window(source.as_bytes()) else {
+    let Some(window) = build_window(source.as_bytes()) else {
         panic!("expected source to build a model window");
     };
     let model = Model::get();
-    let units = model.tokenize_units(&bytes, &pad);
+    let units = model.tokenize_units(&window);
     assert!(units.len() < MAX_UNITS);
 
-    let mut padded = units.clone();
-    padded.resize(MAX_UNITS, -1);
-
-    let runtime_logits = model.logits_for_runtime_units(&units);
-    let eval_shape_logits = model.logits(&padded, MAX_UNITS);
-
-    for (runtime, eval_shape) in runtime_logits.iter().zip(eval_shape_logits) {
-        assert_eq!(*runtime, eval_shape);
-    }
+    let logits = model.logits(&units);
+    assert!(logits.iter().all(|logit| logit.is_finite()));
 }
 
 #[test]
 fn repeated_tensor_layers_match_full_convolution() {
     for seed in 0..32 {
-        check_repeated_tensor_layers(seed);
+        check_repeated_tensor_layers(seed, None);
     }
+    check_repeated_tensor_layers(32, Some(128));
 }
 
-fn check_repeated_tensor_layers(seed: u64) {
+fn check_repeated_tensor_layers(seed: u64, tail_start: Option<usize>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let seq_len = 128;
     let in_channels = 8;
     let mid_channels = 16;
     let out_channels = 12;
-    let tail_start = rng.gen_range(8..seq_len - 8);
+    let tail_start = tail_start.unwrap_or_else(|| rng.gen_range(8..seq_len - 8));
 
     let mut input = random_f32s(&mut rng, seq_len * in_channels);
     for value in &mut input[tail_start * in_channels..] {
@@ -213,10 +235,9 @@ fn check_repeated_tensor_layers(seed: u64) {
     let mut full_pool = vec![0.0; (seq_len / 4) * mid_channels];
     let mut const_pool = vec![0.0; full_pool.len()];
     let mut scratch = vec![0.0; 4 * mid_channels.max(out_channels)];
-    conv_gelu_maxpool_dense(
-        &input,
-        seq_len,
-        in_channels,
+    let full_input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, seq_len);
+    conv_gelu_maxpool_tensor(
+        full_input_tensor,
         &kernel0,
         5,
         mid_channels,
@@ -241,30 +262,22 @@ fn check_repeated_tensor_layers(seed: u64) {
 
     let kernel1 = random_f32s(&mut rng, 3 * mid_channels * out_channels);
     let bias1 = random_f32s(&mut rng, out_channels);
-    let mut full_rows = vec![0.0; (seq_len / 4) * out_channels];
-    conv_gelu_maxpool_dense(
-        &full_pool,
-        seq_len / 4,
-        mid_channels,
+    let full_pool_tensor =
+        Tensor::with_repeated_tail(&full_pool, seq_len / 4, mid_channels, seq_len / 4);
+    let mut full_max = vec![0.0; out_channels];
+    let mut full_avg = vec![0.0; out_channels];
+    let mut full_tmp = vec![0.0; (seq_len / 4) * out_channels];
+    conv_gelu_global_pool_tensor(
+        full_pool_tensor,
         &kernel1,
         3,
         out_channels,
         &bias1,
-        1,
-        &mut full_rows,
+        &mut full_max,
+        &mut full_avg,
+        &mut full_tmp,
         &mut scratch,
     );
-    let mut full_max = vec![f32::NEG_INFINITY; out_channels];
-    let mut full_avg = vec![0.0; out_channels];
-    for row in full_rows.chunks_exact(out_channels) {
-        for ((mx, avg), &v) in full_max.iter_mut().zip(full_avg.iter_mut()).zip(row) {
-            *mx = mx.max(v);
-            *avg += v;
-        }
-    }
-    for avg in &mut full_avg {
-        *avg /= (seq_len / 4) as f32;
-    }
 
     let mut const_max = vec![0.0; out_channels];
     let mut const_avg = vec![0.0; out_channels];

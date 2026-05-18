@@ -8,6 +8,7 @@ use super::{
     },
     reader::{read_f32_array, read_int4_dequant, read_ternary_dequant},
     tokenizer::tokenize,
+    window::TokenWindow,
 };
 use std::sync::OnceLock;
 
@@ -32,7 +33,7 @@ pub(crate) struct Model {
 
 impl Model {
     fn load() -> Self {
-        assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
+        debug_assert!(MODEL_BYTES.starts_with(&MODEL_MAGIC), "bad MSQ1 magic");
         let mut cur = MODEL_MAGIC.len();
         let scales = read_f32_array::<SCALE_COUNT>(&mut cur);
 
@@ -59,7 +60,7 @@ impl Model {
         let output_kernel = read_int4_dequant(&mut cur, DENSE * CLASSES, scales[5]);
         let output_bias = read_f32_array::<CLASSES>(&mut cur);
 
-        assert_eq!(cur, MODEL_BYTES.len(), "unexpected model payload length");
+        debug_assert_eq!(cur, MODEL_BYTES.len(), "unexpected model payload length");
 
         Self {
             embedding,
@@ -81,53 +82,49 @@ impl Model {
         MODEL.get_or_init(Self::load)
     }
 
-    /// Run the full forward pass on a unit-id sequence (length = `len`).
-    pub(crate) fn logits(&self, units: &[i32], len: usize) -> [f32; CLASSES] {
+    /// Run the full forward pass on a unit-id sequence using the fixed padded
+    /// shape used by the shipped Python evaluator.
+    pub(crate) fn logits(&self, units: &[i32]) -> [f32; CLASSES] {
         let mut scratch = [0.0f32; INFERENCE_SCRATCH];
-        self.logits_with_scratch(units, len, &mut scratch)
-    }
-
-    fn logits_with_scratch(
-        &self,
-        units: &[i32],
-        len: usize,
-        scratch: &mut [f32],
-    ) -> [f32; CLASSES] {
-        assert!(scratch.len() >= INFERENCE_SCRATCH);
-        let t = len.min(MAX_UNITS);
-        let t1 = t / CONV0_POOL;
+        debug_assert!(scratch.len() >= INFERENCE_SCRATCH);
+        let t1 = MAX_UNITS / CONV0_POOL;
         let t2 = t1 / CONV1_POOL;
-        let embed_len = t * EMBED;
+        let embed_len = MAX_UNITS * EMBED;
         let pool0_len = t1 * CONV0;
         let pool1_len = t2 * CONV1;
-        let const_tail_start = constant_tail_start(units, t);
+        let unit_count = units.len().min(MAX_UNITS);
         let (activations, conv_scratch) = scratch.split_at_mut(ACTIVATION_SCRATCH);
 
         {
-            let (embed, pool0_storage) = activations.split_at_mut(embed_len);
+            let (embed_storage, pool0_storage) = activations.split_at_mut(embed_len);
 
             // 1) HashEmbedding + GELU.
-            let (embed_rows, embed_remainder) = embed.as_chunks_mut::<EMBED>();
+            let (embed_rows, embed_remainder) = embed_storage.as_chunks_mut::<EMBED>();
             debug_assert!(embed_remainder.is_empty());
-            for (pos, dst) in embed_rows.iter_mut().take(const_tail_start).enumerate() {
-                if let Some(&id) = units.get(pos)
-                    && id >= 0
-                {
-                    embed_position(&self.embedding, id as u32, dst);
-                    for v in dst.iter_mut() {
-                        *v = gelu(*v);
-                    }
-                } else {
-                    dst.fill(0.0);
+            for (&id, dst) in units.iter().take(unit_count).zip(embed_rows.iter_mut()) {
+                debug_assert!(id >= 0);
+                embed_position(&self.embedding, id as u32, dst);
+                for v in dst.iter_mut() {
+                    *v = gelu(*v);
                 }
             }
-            for dst in embed_rows.iter_mut().take(t).skip(const_tail_start) {
-                dst.fill(0.0);
+            if unit_count < MAX_UNITS {
+                embed_rows[unit_count].fill(0.0);
             }
 
             // 2) Conv0 + GELU + MaxPool(4).
             let pool0 = &mut pool0_storage[..pool0_len];
-            let embed_tensor = Tensor::with_repeated_tail(embed, t, EMBED, const_tail_start);
+            let embed_materialized_rows = if unit_count < MAX_UNITS {
+                unit_count + 1
+            } else {
+                MAX_UNITS
+            };
+            let embed_tensor = Tensor::with_repeated_tail(
+                &embed_storage[..embed_materialized_rows * EMBED],
+                MAX_UNITS,
+                EMBED,
+                unit_count,
+            );
             let pool0_tensor = conv_gelu_maxpool_tensor(
                 embed_tensor,
                 &self.conv0_kernel,
@@ -140,7 +137,7 @@ impl Model {
             );
 
             // 3) Conv1 + GELU + MaxPool(2).
-            let pool1 = &mut embed[..pool1_len];
+            let pool1 = &mut embed_storage[..pool1_len];
             let pool1_tensor = conv_gelu_maxpool_tensor(
                 pool0_tensor,
                 &self.conv1_kernel,
@@ -191,22 +188,7 @@ impl Model {
         }
     }
 
-    /// Run inference using the padded 2048-position shape used by the shipped
-    /// Python evaluator. Shorter runtime sequences must not shrink the CNN,
-    /// because pooling/global-average behavior changes materially.
-    pub(crate) fn logits_for_runtime_units(&self, units: &[i32]) -> [f32; CLASSES] {
-        self.logits(units, MAX_UNITS)
+    pub(crate) fn tokenize_units(&self, window: &TokenWindow) -> Vec<i32> {
+        tokenize(window)
     }
-
-    pub(crate) fn tokenize_units(&self, bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
-        tokenize(bytes, padding_mask)
-    }
-}
-
-fn constant_tail_start(units: &[i32], len: usize) -> usize {
-    units
-        .iter()
-        .take(len)
-        .rposition(|&id| id >= 0)
-        .map_or(0, |pos| pos + 1)
 }

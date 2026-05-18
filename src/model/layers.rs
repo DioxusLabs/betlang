@@ -319,90 +319,6 @@ fn conv1d_block4_group16<S: Simd>(
     }
 }
 
-/// Fused conv1d (SAME pad) + GELU + MaxPool(pool).
-/// Always accumulates BLOCK=4 consecutive conv positions per outer iteration
-/// (max NEON-friendly krow reuse), then applies POOL-wide maxpool over them.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn conv_gelu_maxpool(
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    pool: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-) {
-    let pooled_len = seq_len / pool;
-    assert_eq!(out.len(), pooled_len * out_channels);
-    let level = simd_level();
-    dispatch!(level, simd => conv_gelu_maxpool_simd(
-        simd, input, seq_len, in_channels, kernel, kernel_size,
-        out_channels, bias, pool, pooled_len, out, scratch,
-    ));
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn conv_gelu_maxpool_simd<S: Simd>(
-    simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    pool: usize,
-    pooled_len: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-) {
-    match pool {
-        4 => conv_gelu_maxpool_run::<S, 4, 4>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-            scratch,
-        ),
-        2 => conv_gelu_maxpool_run::<S, 4, 2>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-            scratch,
-        ),
-        _ => conv_gelu_maxpool_run::<S, 1, 1>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-            scratch,
-        ),
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct RepeatedRows {
     start: usize,
@@ -425,61 +341,33 @@ impl RepeatedRows {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum RowLayout {
-    Dense,
-    Repeated(RepeatedRows),
-}
-
-impl RowLayout {
-    fn repeated(self) -> Option<RepeatedRows> {
-        match self {
-            Self::Dense => None,
-            Self::Repeated(region) if !region.is_empty() => Some(region),
-            Self::Repeated(_) => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub(crate) struct Tensor<'a> {
     data: &'a [f32],
     rows: usize,
     channels: usize,
-    layout: RowLayout,
+    repeated_tail: RepeatedRows,
 }
 
 impl<'a> Tensor<'a> {
-    pub(crate) fn dense(data: &'a [f32], rows: usize, channels: usize) -> Self {
-        debug_assert_eq!(data.len(), rows * channels);
-        Self {
-            data,
-            rows,
-            channels,
-            layout: RowLayout::Dense,
-        }
-    }
-
     pub(crate) fn with_repeated_tail(
         data: &'a [f32],
         rows: usize,
         channels: usize,
         start: usize,
     ) -> Self {
-        debug_assert_eq!(data.len(), rows * channels);
-        let layout = if start < rows {
-            RowLayout::Repeated(RepeatedRows {
-                start,
-                end: rows,
-                extends_right_padding: true,
-            })
-        } else {
-            RowLayout::Dense
-        };
+        let start = start.min(rows);
+        let materialized_rows = if start < rows { start + 1 } else { rows };
+        debug_assert!(data.len() >= materialized_rows * channels);
+        debug_assert!(data.len() <= rows * channels);
         Self {
             data,
             rows,
             channels,
-            layout,
+            repeated_tail: RepeatedRows {
+                start,
+                end: rows,
+                extends_right_padding: true,
+            },
         }
     }
 
@@ -492,14 +380,11 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    fn repeated(self) -> Option<RepeatedRows> {
-        self.layout.repeated()
-    }
-
     fn row(self, index: usize) -> &'a [f32] {
         debug_assert!(index < self.rows);
-        let index = if self.repeated().is_some_and(|region| region.contains(index)) {
-            self.repeated().unwrap().start
+        let region = self.repeated_tail;
+        let index = if region.contains(index) {
+            region.start
         } else {
             index
         };
@@ -545,26 +430,11 @@ pub(crate) fn conv_gelu_maxpool_tensor<'a>(
     };
     let out_region = pooled_repeated_region(input, &spec);
     let row_count = spec.row_count();
-    assert_eq!(out.len(), row_count * out_channels);
+    debug_assert_eq!(out.len(), row_count * out_channels);
 
     if out_region.is_empty() {
-        if let RowLayout::Dense = input.layout {
-            conv_gelu_maxpool_dense(
-                input.data,
-                input.rows,
-                input.channels,
-                kernel,
-                kernel_size,
-                out_channels,
-                bias,
-                pool,
-                out,
-                scratch,
-            );
-        } else {
-            conv_gelu_range(input, &spec, 0, row_count, out, scratch);
-        }
-        return Tensor::dense(out, row_count, out_channels);
+        conv_gelu_range(input, &spec, 0, row_count, out, scratch);
+        return Tensor::with_repeated_tail(out, row_count, out_channels, row_count);
     }
 
     conv_gelu_range(input, &spec, 0, out_region.start, out, scratch);
@@ -576,35 +446,8 @@ pub(crate) fn conv_gelu_maxpool_tensor<'a>(
         data: out,
         rows: row_count,
         channels: out_channels,
-        layout: RowLayout::Repeated(out_region),
+        repeated_tail: out_region,
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn conv_gelu_maxpool_dense(
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    pool: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-) {
-    conv_gelu_maxpool(
-        input,
-        seq_len,
-        in_channels,
-        kernel,
-        kernel_size,
-        out_channels,
-        bias,
-        pool,
-        out,
-        scratch,
-    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -642,7 +485,10 @@ pub(crate) fn global_max_avg_pool(input: Tensor<'_>, out_max: &mut [f32], out_av
         return;
     }
 
-    if let Some(region) = input.repeated() {
+    let region = input.repeated_tail;
+    if region.is_empty() {
+        accumulate_pool_rows(input.data, input.channels, out_max, out_avg);
+    } else {
         accumulate_pool_rows(
             row_range(input.data, input.channels, 0, region.start),
             input.channels,
@@ -656,8 +502,6 @@ pub(crate) fn global_max_avg_pool(input: Tensor<'_>, out_max: &mut [f32], out_av
             out_max,
             out_avg,
         );
-    } else {
-        accumulate_pool_rows(input.data, input.channels, out_max, out_avg);
     }
 
     let inv = 1.0 / input.rows as f32;
@@ -667,13 +511,14 @@ pub(crate) fn global_max_avg_pool(input: Tensor<'_>, out_max: &mut [f32], out_av
 }
 
 fn pooled_repeated_region(input: Tensor<'_>, spec: &ConvSpec<'_>) -> RepeatedRows {
-    let Some(input_region) = input.repeated() else {
+    let input_region = input.repeated_tail;
+    if input_region.is_empty() {
         return RepeatedRows {
             start: spec.row_count(),
             end: spec.row_count(),
             extends_right_padding: false,
         };
-    };
+    }
 
     let pad = (spec.kernel_size - 1) / 2;
     let right = spec.kernel_size - 1 - pad;
@@ -721,7 +566,7 @@ fn conv_gelu_range(
         return;
     }
     let range = row_range_mut(out, spec.out_channels, row_start, row_end);
-    if input.repeated().is_none() || !range_touches_repeated(input, spec, row_start, row_end) {
+    if !range_touches_repeated(input, spec, row_start, row_end) {
         conv_gelu_maxpool_range(
             input.data,
             spec.seq_len,
@@ -746,10 +591,11 @@ fn range_touches_repeated(
     row_start: usize,
     row_end: usize,
 ) -> bool {
-    let Some(region) = input.repeated() else {
-        return false;
-    };
+    let region = input.repeated_tail;
     if row_start >= row_end {
+        return false;
+    }
+    if region.is_empty() {
         return false;
     }
     let pad = (spec.kernel_size - 1) / 2;
@@ -860,7 +706,7 @@ fn conv_gelu_maxpool_range_run<S: Simd, const POOL: usize>(
     out: &mut [f32],
     scratch: &mut [f32],
 ) {
-    assert!(scratch.len() >= POOL * out_channels);
+    debug_assert!(scratch.len() >= POOL * out_channels);
     let accs = &mut scratch[..POOL * out_channels];
     for (row_offset, dst) in out.chunks_exact_mut(out_channels).enumerate() {
         let t_base = (row_start + row_offset) * POOL;
@@ -887,7 +733,7 @@ fn conv_gelu_maxpool_tensor_range(
     out: &mut [f32],
     scratch: &mut [f32],
 ) {
-    assert!(scratch.len() >= spec.pool * spec.out_channels);
+    debug_assert!(scratch.len() >= spec.pool * spec.out_channels);
     let accs = &mut scratch[..spec.pool * spec.out_channels];
     for (row_offset, dst) in out.chunks_exact_mut(spec.out_channels).enumerate() {
         let t_base = (row_start + row_offset) * spec.pool;
@@ -941,9 +787,8 @@ fn pool_rows_scalar(rows: &[f32], channels: usize, dst: &mut [f32]) {
 }
 
 fn const_output_value(input: Tensor<'_>, spec: &ConvSpec<'_>, out: &mut [f32]) {
-    let input_region = input
-        .repeated()
-        .expect("constant output requires repeated input");
+    let input_region = input.repeated_tail;
+    debug_assert!(!input_region.is_empty());
     let input_row = input.row(input_region.start);
     out.copy_from_slice(spec.bias);
     for krow in spec
@@ -987,77 +832,6 @@ fn accumulate_const_rows(value: &[f32], count: usize, out_max: &mut [f32], out_a
         *mx = mx.max(v);
         for _ in 0..count {
             *avg += v;
-        }
-    }
-}
-
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
-    simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    pooled_len: usize,
-    out: &mut [f32],
-    scratch: &mut [f32],
-) {
-    debug_assert_eq!(BLOCK % POOL, 0);
-    assert!(scratch.len() >= BLOCK * out_channels);
-    let outs_per_block: usize = BLOCK / POOL;
-    let block_count = pooled_len / outs_per_block;
-    {
-        let accs = &mut scratch[..BLOCK * out_channels];
-        for tb in 0..block_count {
-            let t_base = tb * BLOCK;
-            conv1d_block::<S, BLOCK>(
-                simd,
-                input,
-                seq_len,
-                in_channels,
-                kernel,
-                kernel_size,
-                out_channels,
-                bias,
-                t_base,
-                accs,
-            );
-            let out_start = tb * outs_per_block * out_channels;
-            let out_block = &mut out[out_start..out_start + outs_per_block * out_channels];
-            for (op, dst) in out_block.chunks_exact_mut(out_channels).enumerate() {
-                let s_first = op * POOL;
-                let pool_start = s_first * out_channels;
-                let pool_accs = &accs[pool_start..pool_start + POOL * out_channels];
-                pool_gelu_rows(simd, pool_accs, out_channels, dst);
-            }
-        }
-    }
-    let processed = block_count * outs_per_block;
-    if processed < pooled_len {
-        let tail_accs = &mut scratch[..POOL * out_channels];
-        for (tail_offset, dst) in out[processed * out_channels..]
-            .chunks_exact_mut(out_channels)
-            .enumerate()
-        {
-            let tp = processed + tail_offset;
-            let t_base = tp * POOL;
-            conv1d_block::<S, POOL>(
-                simd,
-                input,
-                seq_len,
-                in_channels,
-                kernel,
-                kernel_size,
-                out_channels,
-                bias,
-                t_base,
-                &mut *tail_accs,
-            );
-            pool_gelu_rows(simd, tail_accs, out_channels, dst);
         }
     }
 }
