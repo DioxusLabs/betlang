@@ -20,6 +20,7 @@ include = [
     "/README.md",
     "/RELEASING.md",
     "/assets/confusion-by-size.png",
+    "/assets/confusion-overall.png",
     "/assets/magika/source-student-q4.bin",
     "/benches/detect.rs",
     "/examples/*.rs",

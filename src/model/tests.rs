@@ -45,9 +45,7 @@ fn tokenizer_matches_legacy_buffer_model_on_fuzzed_windows() {
     for _ in 0..1024 {
         let len = rng.gen_range(8..6000);
         let mut source = Vec::with_capacity(len);
-        for _ in 0..rng.gen_range(0..16) {
-            source.push(b' ');
-        }
+        source.extend(std::iter::repeat_n(b' ', rng.gen_range(0..16)));
         while source.len() < len {
             source.push(rng.gen_range(0..=255));
         }
