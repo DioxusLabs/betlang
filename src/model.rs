@@ -165,25 +165,29 @@ impl Model {
         // 2) Conv0 (k=7, 24→64) + GELU + MaxPool(4), fused to avoid the
         //    ~524 KB intermediate buffer and the second read pass.
         let (pool0, t1) = conv_gelu_maxpool(
-            &embed,
-            t,
-            EMBED,
-            &self.conv0_kernel,
-            CONV0_KERNEL,
-            CONV0,
-            &self.conv0_bias,
+            Conv1dParams {
+                input: &embed,
+                seq_len: t,
+                in_channels: EMBED,
+                kernel: &self.conv0_kernel,
+                kernel_size: CONV0_KERNEL,
+                out_channels: CONV0,
+                bias: &self.conv0_bias,
+            },
             CONV0_POOL,
         );
 
         // 3) Conv1 (k=5, 64→128) + GELU + MaxPool(2), fused.
         let (pool1, t2) = conv_gelu_maxpool(
-            &pool0,
-            t1,
-            CONV0,
-            &self.conv1_kernel,
-            CONV1_KERNEL,
-            CONV1,
-            &self.conv1_bias,
+            Conv1dParams {
+                input: &pool0,
+                seq_len: t1,
+                in_channels: CONV0,
+                kernel: &self.conv1_kernel,
+                kernel_size: CONV1_KERNEL,
+                out_channels: CONV1,
+                bias: &self.conv1_bias,
+            },
             CONV1_POOL,
         );
 
@@ -192,13 +196,15 @@ impl Model {
         let mut pooled = [0.0f32; POOLED];
         let (max_slice, avg_slice) = pooled.split_at_mut(CONV2);
         conv_gelu_global_pool(
-            &pool1,
-            t2,
-            CONV1,
-            &self.conv2_kernel,
-            CONV2_KERNEL,
-            CONV2,
-            &self.conv2_bias,
+            Conv1dParams {
+                input: &pool1,
+                seq_len: t2,
+                in_channels: CONV1,
+                kernel: &self.conv2_kernel,
+                kernel_size: CONV2_KERNEL,
+                out_channels: CONV2,
+                bias: &self.conv2_bias,
+            },
             max_slice,
             avg_slice,
         );
@@ -268,6 +274,17 @@ fn hash_bin(unit: u32, head: usize) -> usize {
     (h as usize) % BINS
 }
 
+#[derive(Clone, Copy)]
+struct Conv1dParams<'a> {
+    input: &'a [f32],
+    seq_len: usize,
+    in_channels: usize,
+    kernel: &'a [f32],
+    kernel_size: usize,
+    out_channels: usize,
+    bias: &'a [f32],
+}
+
 /// Conv1d (SAME pad) for a block of `BLOCK` consecutive output positions
 /// starting at `t_base`. Accumulates into `accs` (`BLOCK * out_channels` long).
 ///
@@ -282,16 +299,19 @@ fn hash_bin(unit: u32, head: usize) -> usize {
 #[inline(always)]
 fn conv1d_block<S: Simd, const BLOCK: usize>(
     simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     t_base: usize,
     accs: &mut [f32],
 ) {
+    let Conv1dParams {
+        input,
+        seq_len,
+        in_channels,
+        kernel,
+        kernel_size,
+        out_channels,
+        bias,
+    } = params;
     debug_assert_eq!(accs.len(), BLOCK * out_channels);
     debug_assert_eq!(out_channels % 4, 0);
     let pad = (kernel_size - 1) / 2;
@@ -299,18 +319,7 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
         let all_in_bounds =
             t_base >= pad && t_base + 4 + (kernel_size - 1).saturating_sub(pad) <= seq_len;
         if all_in_bounds {
-            conv1d_block4_simd_inner(
-                simd,
-                input,
-                in_channels,
-                kernel,
-                kernel_size,
-                out_channels,
-                bias,
-                t_base,
-                pad,
-                accs,
-            );
+            conv1d_block4_simd_inner(simd, params, t_base, pad, accs);
             return;
         }
     }
@@ -359,30 +368,23 @@ fn conv1d_block<S: Simd, const BLOCK: usize>(
 #[inline(always)]
 fn conv1d_block4_simd_inner<S: Simd>(
     simd: S,
-    input: &[f32],
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     t_base: usize,
     pad: usize,
     accs: &mut [f32],
 ) {
+    let Conv1dParams {
+        input,
+        in_channels,
+        kernel,
+        kernel_size,
+        out_channels,
+        bias,
+        ..
+    } = params;
     const GROUP: usize = 16;
-    if out_channels % GROUP == 0 {
-        conv1d_block4_group16::<S>(
-            simd,
-            input,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            t_base,
-            pad,
-            accs,
-        );
+    if out_channels.is_multiple_of(GROUP) {
+        conv1d_block4_group16::<S>(simd, params, t_base, pad, accs);
         return;
     }
     // Fallback for out_channels not a multiple of 16: chunk-inner SIMD.
@@ -435,16 +437,20 @@ fn conv1d_block4_simd_inner<S: Simd>(
 #[inline(always)]
 fn conv1d_block4_group16<S: Simd>(
     simd: S,
-    input: &[f32],
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     t_base: usize,
     pad: usize,
     accs: &mut [f32],
 ) {
+    let Conv1dParams {
+        input,
+        in_channels,
+        kernel,
+        kernel_size,
+        out_channels,
+        bias,
+        ..
+    } = params;
     let groups = out_channels / 16;
     for g in 0..groups {
         let g_off = g * 16;
@@ -516,22 +522,13 @@ fn conv1d_block4_group16<S: Simd>(
 /// Fused conv1d (SAME pad) + GELU + MaxPool(pool).
 /// Always accumulates BLOCK=4 consecutive conv positions per outer iteration
 /// (max NEON-friendly krow reuse), then applies POOL-wide maxpool over them.
-fn conv_gelu_maxpool(
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    pool: usize,
-) -> (Vec<f32>, usize) {
-    let pooled_len = seq_len / pool;
+fn conv_gelu_maxpool(params: Conv1dParams<'_>, pool: usize) -> (Vec<f32>, usize) {
+    let out_channels = params.out_channels;
+    let pooled_len = params.seq_len / pool;
     let mut out = vec![0.0f32; pooled_len * out_channels];
     let level = simd_level();
     dispatch!(level, simd => conv_gelu_maxpool_simd(
-        simd, input, seq_len, in_channels, kernel, kernel_size,
-        out_channels, bias, pool, pooled_len, &mut out,
+        simd, params, pool, pooled_len, &mut out,
     ));
     (out, pooled_len)
 }
@@ -539,88 +536,33 @@ fn conv_gelu_maxpool(
 #[inline(always)]
 fn conv_gelu_maxpool_simd<S: Simd>(
     simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     pool: usize,
     pooled_len: usize,
     out: &mut [f32],
 ) {
     match pool {
-        4 => conv_gelu_maxpool_run::<S, 4, 4>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-        ),
-        2 => conv_gelu_maxpool_run::<S, 4, 2>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-        ),
-        _ => conv_gelu_maxpool_run::<S, 1, 1>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            pooled_len,
-            out,
-        ),
+        4 => conv_gelu_maxpool_run::<S, 4, 4>(simd, params, pooled_len, out),
+        2 => conv_gelu_maxpool_run::<S, 4, 2>(simd, params, pooled_len, out),
+        _ => conv_gelu_maxpool_run::<S, 1, 1>(simd, params, pooled_len, out),
     }
 }
 
 #[inline(always)]
 fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
     simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     pooled_len: usize,
     out: &mut [f32],
 ) {
+    let out_channels = params.out_channels;
     debug_assert_eq!(BLOCK % POOL, 0);
     let outs_per_block: usize = BLOCK / POOL;
     let mut accs = vec![0.0f32; BLOCK * out_channels];
     let block_count = pooled_len / outs_per_block;
     for tb in 0..block_count {
         let t_base = tb * BLOCK;
-        conv1d_block::<S, BLOCK>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            t_base,
-            &mut accs,
-        );
+        conv1d_block::<S, BLOCK>(simd, params, t_base, &mut accs);
         for op in 0..outs_per_block {
             let pooled_idx = tb * outs_per_block + op;
             let dst = &mut out[pooled_idx * out_channels..(pooled_idx + 1) * out_channels];
@@ -647,18 +589,7 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
         let mut tail_accs = vec![0.0f32; POOL * out_channels];
         for tp in processed..pooled_len {
             let t_base = tp * POOL;
-            conv1d_block::<S, POOL>(
-                simd,
-                input,
-                seq_len,
-                in_channels,
-                kernel,
-                kernel_size,
-                out_channels,
-                bias,
-                t_base,
-                &mut tail_accs,
-            );
+            conv1d_block::<S, POOL>(simd, params, t_base, &mut tail_accs);
             let dst = &mut out[tp * out_channels..(tp + 1) * out_channels];
             let first = &tail_accs[..out_channels];
             for (d_c, a_c) in dst.chunks_exact_mut(4).zip(first.chunks_exact(4)) {
@@ -681,59 +612,33 @@ fn conv_gelu_maxpool_run<S: Simd, const BLOCK: usize, const POOL: usize>(
 /// Fused conv1d (SAME pad) + GELU + (GlobalMax || GlobalAvg) pool.
 /// Writes max into `out_max` and average into `out_avg` (each `out_channels` long).
 /// Processes T_BLOCK=4 positions per outer iteration to reuse kernel rows.
-fn conv_gelu_global_pool(
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
-    out_max: &mut [f32],
-    out_avg: &mut [f32],
-) {
+fn conv_gelu_global_pool(params: Conv1dParams<'_>, out_max: &mut [f32], out_avg: &mut [f32]) {
     out_max.fill(f32::NEG_INFINITY);
     out_avg.fill(0.0);
-    if seq_len == 0 {
+    if params.seq_len == 0 {
         return;
     }
     let level = simd_level();
     dispatch!(level, simd => conv_gelu_global_pool_simd(
-        simd, input, seq_len, in_channels, kernel, kernel_size,
-        out_channels, bias, out_max, out_avg,
+        simd, params, out_max, out_avg,
     ));
 }
 
 #[inline(always)]
 fn conv_gelu_global_pool_simd<S: Simd>(
     simd: S,
-    input: &[f32],
-    seq_len: usize,
-    in_channels: usize,
-    kernel: &[f32],
-    kernel_size: usize,
-    out_channels: usize,
-    bias: &[f32],
+    params: Conv1dParams<'_>,
     out_max: &mut [f32],
     out_avg: &mut [f32],
 ) {
+    let seq_len = params.seq_len;
+    let out_channels = params.out_channels;
     const T_BLOCK: usize = 4;
     let mut accs = vec![0.0f32; T_BLOCK * out_channels];
     let block_count = seq_len / T_BLOCK;
     for tb in 0..block_count {
         let t_base = tb * T_BLOCK;
-        conv1d_block::<S, T_BLOCK>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            t_base,
-            &mut accs,
-        );
+        conv1d_block::<S, T_BLOCK>(simd, params, t_base, &mut accs);
         for s in 0..T_BLOCK {
             let acc = &accs[s * out_channels..(s + 1) * out_channels];
             for ((mx_c, av_c), a_c) in out_max
@@ -752,18 +657,7 @@ fn conv_gelu_global_pool_simd<S: Simd>(
     }
     let mut tail_accs = vec![0.0f32; out_channels];
     for t in (block_count * T_BLOCK)..seq_len {
-        conv1d_block::<S, 1>(
-            simd,
-            input,
-            seq_len,
-            in_channels,
-            kernel,
-            kernel_size,
-            out_channels,
-            bias,
-            t,
-            &mut tail_accs,
-        );
+        conv1d_block::<S, 1>(simd, params, t, &mut tail_accs);
         for ((mx_c, av_c), a_c) in out_max
             .chunks_exact_mut(4)
             .zip(out_avg.chunks_exact_mut(4))
@@ -800,7 +694,7 @@ fn dense_forward(input: &[f32], kernel: &[f32], bias: &[f32], out: &mut [f32]) {
 fn gelu(x: f32) -> f32 {
     // Tanh-form GELU (Hendrycks & Gimpel), matching how the student was trained.
     // 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-    0.5 * x * (1.0 + tanh_approx(0.797_884_56 * (x + 0.044_715 * x * x * x)))
+    0.5 * x * (1.0 + tanh_approx(0.797_884_6 * (x + 0.044_715 * x * x * x)))
 }
 
 /// [7/6] Padé approximation of tanh, accurate to ~1e-6 over the clamped range.
@@ -818,7 +712,7 @@ fn tanh_approx(x: f32) -> f32 {
 fn gelu_simd<S: Simd>(simd: S, x: f32x4<S>) -> f32x4<S> {
     let half = f32x4::splat(simd, 0.5);
     let one = f32x4::splat(simd, 1.0);
-    let c1 = f32x4::splat(simd, 0.797_884_56);
+    let c1 = f32x4::splat(simd, 0.797_884_6);
     let c2 = f32x4::splat(simd, 0.044_715);
     let x2 = x * x;
     let x3 = x * x2;
@@ -891,9 +785,9 @@ fn read_ternary_dequant(cursor: &mut usize, count: usize, scale: f32) -> Vec<f32
 
 fn read_f32_array<const N: usize>(cursor: &mut usize) -> [f32; N] {
     let mut out = [0.0; N];
-    for i in 0..N {
+    for (i, value) in out.iter_mut().enumerate() {
         let off = *cursor + i * 4;
-        out[i] = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
+        *value = f32::from_le_bytes(MODEL_BYTES[off..off + 4].try_into().unwrap());
     }
     *cursor += N * 4;
     out
@@ -963,9 +857,8 @@ fn tokenize_v2(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             break;
         }
 
-        let is_letter =
-            (b'a'..=b'z').contains(&value) || (b'A'..=b'Z').contains(&value) || value == b'_';
-        let is_digit = (b'0'..=b'9').contains(&value);
+        let is_letter = value.is_ascii_alphabetic() || value == b'_';
+        let is_digit = value.is_ascii_digit();
         let is_newline = value == b'\n';
         let is_cr = value == b'\r';
         let is_space = value == b' ' || value == b'\t';
@@ -1246,7 +1139,7 @@ fn tokenize_v4(bytes: &[u8], padding_mask: &[bool]) -> Vec<i32> {
             flush_hashed(&mut word, &mut out, 0, style);
             word_had_upper = false;
         }
-        if !(is_digit || value == b'.') && !number.is_empty() {
+        if !(is_digit || value == b'.' || number.is_empty()) {
             flush_hashed(&mut number, &mut out, NUM_FLAG, 0);
         }
         let need_flush_punct = is_letter
