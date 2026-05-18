@@ -85,7 +85,7 @@ impl Model {
     /// Run the full forward pass on a unit-id sequence using the fixed padded
     /// shape used by the shipped Python evaluator.
     pub(crate) fn logits(&self, units: &[i32]) -> [f32; CLASSES] {
-        let mut scratch = [0.0f32; INFERENCE_SCRATCH];
+        let mut scratch = vec![0.0f32; INFERENCE_SCRATCH].into_boxed_slice();
         debug_assert!(scratch.len() >= INFERENCE_SCRATCH);
         let t1 = MAX_UNITS / CONV0_POOL;
         let t2 = t1 / CONV1_POOL;
