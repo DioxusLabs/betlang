@@ -11,23 +11,6 @@ impl TokenWindow {
     }
 }
 
-fn trim_start_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    &bytes[start..]
-}
-
-fn trim_end_ascii(bytes: &[u8]) -> &[u8] {
-    let end = bytes
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    &bytes[..end]
-}
-
 /// Build the (begin + end) byte window and its first padding boundary.
 /// Mirrors `magika_features` in the trainer.
 pub(crate) fn build_window(source: &[u8]) -> Option<TokenWindow> {
@@ -35,11 +18,11 @@ pub(crate) fn build_window(source: &[u8]) -> Option<TokenWindow> {
         return None;
     }
     let block = source.len().min(MAGIKA_BLOCK_SIZE);
-    let stripped_beg_full = trim_start_ascii(&source[..block]);
+    let stripped_beg_full = source[..block].trim_ascii_start();
     if stripped_beg_full.len() < 8 {
         return None;
     }
-    let stripped_end_full = trim_end_ascii(&source[source.len() - block..]);
+    let stripped_end_full = source[source.len() - block..].trim_ascii_end();
 
     let beg_len = stripped_beg_full.len().min(MAGIKA_BEG_SIZE);
     let end_len = stripped_end_full.len().min(MAGIKA_END_SIZE);

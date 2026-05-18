@@ -4,12 +4,12 @@ use super::{
 };
 
 pub(crate) fn hash_unit_bytes(bytes: &[u8]) -> u32 {
-    const PRIME: u64 = 2_654_435_761;
-    let mut h: u64 = 0;
+    const PRIME: u32 = 2_654_435_761;
+    let mut h = 0u32;
     for &b in bytes {
-        h = h.wrapping_mul(PRIME).wrapping_add(b as u64) & 0xFFFF_FFFF;
+        h = h.wrapping_mul(PRIME).wrapping_add(b as u32);
     }
-    h as u32
+    h
 }
 
 fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
@@ -18,27 +18,22 @@ fn push_indent_unit(out: &mut Vec<i32>, indent: u32) {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum TokenKind {
+    #[default]
     Empty,
     Word,
     Number,
     Punct,
 }
 
+#[derive(Default)]
 struct TokenBuffer {
     kind: TokenKind,
     bytes: Vec<u8>,
 }
 
 impl TokenBuffer {
-    fn new() -> Self {
-        Self {
-            kind: TokenKind::Empty,
-            bytes: Vec::new(),
-        }
-    }
-
     fn is_number(&self) -> bool {
         self.kind == TokenKind::Number
     }
@@ -72,7 +67,7 @@ impl TokenBuffer {
 pub(crate) fn tokenize(window: &TokenWindow) -> Vec<i32> {
     let bytes = window.bytes();
     let mut out: Vec<i32> = Vec::with_capacity(MAX_UNITS);
-    let mut current = TokenBuffer::new();
+    let mut current = TokenBuffer::default();
     let mut at_line_start = true;
     let mut indent_units: u32 = 0;
 
