@@ -20,7 +20,7 @@
 //! edges and out-channel counts not divisible by 16.
 
 use crate::{Detection, Language, language::CLASS_LANGUAGES};
-use fearless_simd::{dispatch, f32x4, Level, Simd, SimdBase, SimdFloat};
+use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::sync::OnceLock;
 
 /// Detect the best available SIMD level once per process.
