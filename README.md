@@ -7,7 +7,7 @@ CPU source-language detection for code with a tiny 50kb model.
 
 ```toml
 [dependencies]
-betlang = "0.1.0"
+betlang = "0.1.1"
 ```
 
 ```rust
@@ -40,7 +40,7 @@ one-to-one with no label aggregation.
 
 The confusion matrix uses the same labels:
 
-![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/issue5-ova-calibration/assets/confusion-overall.png)
+![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-overall.png)
 
 ## Model
 
@@ -81,4 +81,4 @@ panel is a row-normalized confusion matrix for one file-size bucket: actual
 labels are rows, predicted labels are columns, and the diagonal is correct
 classification.
 
-![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/issue5-ova-calibration/assets/confusion-by-size.png)
+![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-by-size.png)
