@@ -13,8 +13,7 @@ are emitted as constants and applied once at model load.
 fp32 error against direct convolution with ternary-scale weights and
 activation magnitudes like this model's is ~1e-6 (F(4,3)/F(4,5)) to ~1e-5
 (F(4,7)), far below the ~1e-4 error of the runtime's Pade GELU
-approximation. Verified by `fast_forward_matches_naive_oracle_on_fuzzed_unit_
-lengths` in src/model/tests.rs.
+approximation. Verified by `forward_matches_naive_oracle_on_fuzzed_unit_lengths` in src/model/tests.rs.
 
 Usage:
     python3 scripts/gen_winograd.py > src/model/wino.rs

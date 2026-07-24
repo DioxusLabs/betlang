@@ -572,7 +572,7 @@ fn fill_padding(
 
 impl Model {
     /// Length-aware forward pass.
-    pub(crate) fn logits_fast(&self, units: &[i32]) -> [f32; CLASSES] {
+    pub(crate) fn logits(&self, units: &[i32]) -> [f32; CLASSES] {
         let n = units.len().min(MAX_UNITS);
         let plan = self.forward_plan();
         if n == 0 {

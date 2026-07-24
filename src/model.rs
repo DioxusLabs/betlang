@@ -38,7 +38,7 @@ pub(crate) fn detect(source: &[u8]) -> Detection {
     };
     let model = Model::get();
     let units = model.tokenize_units(&window);
-    let logits = model.logits_fast(&units);
+    let logits = model.logits(&units);
     detection_from_logits(&logits)
 }
 

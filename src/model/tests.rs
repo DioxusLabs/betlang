@@ -265,7 +265,7 @@ fn runtime_inference_accepts_short_sources() {
     let units = model.tokenize_units(&window);
     assert!(units.len() < MAX_UNITS);
 
-    let logits = model.logits_fast(&units);
+    let logits = model.logits(&units);
     assert!(logits.iter().all(|logit| logit.is_finite()));
 }
 
@@ -484,10 +484,10 @@ fn naive_logits(model: &Model, units: &[i32]) -> [f32; CLASSES] {
     model.dense_head(&pooled)
 }
 
-/// The fast forward path must match the naive scalar oracle for every input
+/// The forward pass must match the naive scalar oracle for every input
 /// length, including the padded-tail and boundary regions.
 #[test]
-fn fast_forward_matches_naive_oracle_on_fuzzed_unit_lengths() {
+fn forward_matches_naive_oracle_on_fuzzed_unit_lengths() {
     let mut rng = StdRng::seed_from_u64(0x4645_4152_4c45_5353);
     let model = Model::get();
 
@@ -497,11 +497,11 @@ fn fast_forward_matches_naive_oracle_on_fuzzed_unit_lengths() {
     for length in lengths {
         let units: Vec<i32> = (0..length).map(|_| rng.gen_range(0..1 << 24)).collect();
         let oracle = naive_logits(model, &units);
-        let fast = model.logits_fast(&units);
-        for (index, (&a, &b)) in fast.iter().zip(&oracle).enumerate() {
+        let logits = model.logits(&units);
+        for (index, (&a, &b)) in logits.iter().zip(&oracle).enumerate() {
             assert!(
                 (a - b).abs() < 1e-2,
-                "length {length} logit {index}: fast {a} vs oracle {b}"
+                "length {length} logit {index}: forward {a} vs oracle {b}"
             );
         }
     }
