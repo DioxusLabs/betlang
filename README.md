@@ -7,7 +7,7 @@ CPU source-language detection for code with a tiny 50kb model.
 
 ```toml
 [dependencies]
-betlang = "0.1.0"
+betlang = "0.2.0"
 ```
 
 ```rust
