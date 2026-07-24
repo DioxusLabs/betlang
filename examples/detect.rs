@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -58,14 +58,37 @@ fn detect_stdin() -> ExitCode {
 }
 
 fn detect_file(path: &Path) -> ExitCode {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let (bytes, _) = match read_model_window(path) {
+        Ok(window) => window,
         Err(err) => {
             eprintln!("betlang: failed to read {}: {err}", path.display());
             return ExitCode::from(2);
         }
     };
     report_single(betlang::detect(bytes))
+}
+
+/// The model only inspects the first and last 4096 bytes of a file, so read
+/// just those two windows instead of the whole file. `build_window` derives
+/// its begin/end blocks from `source[..4096]` and `source[len - 4096..]`,
+/// which the concatenated head + tail preserves exactly. Returns the window
+/// bytes and the file's real size.
+fn read_model_window(path: &Path) -> io::Result<(Vec<u8>, u64)> {
+    const BLOCK: u64 = 4096;
+
+    let mut file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    if size <= 2 * BLOCK {
+        let mut bytes = Vec::with_capacity(size as usize);
+        file.read_to_end(&mut bytes)?;
+        return Ok((bytes, size));
+    }
+
+    let mut bytes = vec![0u8; (2 * BLOCK) as usize];
+    file.read_exact(&mut bytes[..BLOCK as usize])?;
+    file.seek(SeekFrom::End(-(BLOCK as i64)))?;
+    file.read_exact(&mut bytes[BLOCK as usize..])?;
+    Ok((bytes, size))
 }
 
 fn report_single(detection: betlang::Detection) -> ExitCode {
@@ -247,8 +270,7 @@ fn display_name(path: &Path, root: &Path, depth: usize) -> String {
 }
 
 fn classify_file(path: &Path) -> Option<(Option<Language>, u64)> {
-    let bytes = fs::read(path).ok()?;
-    let size = bytes.len() as u64;
+    let (bytes, size) = read_model_window(path).ok()?;
     let language = betlang::detect(bytes).language();
     Some((language, size))
 }
