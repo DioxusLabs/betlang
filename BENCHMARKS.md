@@ -18,8 +18,8 @@ cargo bench --bench detect
 
 | Case | Bytes | Median time | Throughput |
 |---|---:|---:|---:|
-| short | 68 | 35.904 µs/inference | 1.8939 MB/s |
-| full window | 4623 | 753.41 µs/inference | 6.1361 MB/s |
+| short | 68 | 23.841 µs/inference | 2.8522 MB/s |
+| full window | 4623 | 386.32 µs/inference | 11.967 MB/s |
 
 `detect` reads a fixed window (at most the first and last 4096 bytes), so
 per-file cost is constant in file size; the throughput above is the

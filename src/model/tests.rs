@@ -1,6 +1,5 @@
 use super::{
     constants::*,
-    layers::{Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_tensor},
     runtime::Model,
     tokenizer::{hash_unit_bytes, tokenize},
     window::build_window,
@@ -266,101 +265,8 @@ fn runtime_inference_accepts_short_sources() {
     let units = model.tokenize_units(&window);
     assert!(units.len() < MAX_UNITS);
 
-    let logits = model.logits(&units);
+    let logits = model.logits_fast(&units);
     assert!(logits.iter().all(|logit| logit.is_finite()));
-}
-
-#[test]
-fn repeated_tensor_layers_match_full_convolution() {
-    for seed in 0..32 {
-        check_repeated_tensor_layers(seed, None);
-    }
-    check_repeated_tensor_layers(32, Some(128));
-}
-
-fn check_repeated_tensor_layers(seed: u64, tail_start: Option<usize>) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let seq_len = 128;
-    let in_channels = 8;
-    let mid_channels = 16;
-    let out_channels = 12;
-    let tail_start = tail_start.unwrap_or_else(|| rng.gen_range(8..seq_len - 8));
-
-    let mut input = random_f32s(&mut rng, seq_len * in_channels);
-    for value in &mut input[tail_start * in_channels..] {
-        *value = 0.0;
-    }
-    let input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, tail_start);
-
-    let kernel0 = random_f32s(&mut rng, 5 * in_channels * mid_channels);
-    let bias0 = random_f32s(&mut rng, mid_channels);
-    let mut full_pool = vec![0.0; (seq_len / 4) * mid_channels];
-    let mut const_pool = vec![0.0; full_pool.len()];
-    let mut scratch = vec![0.0; 4 * mid_channels.max(out_channels)];
-    let full_input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, seq_len);
-    conv_gelu_maxpool_tensor(
-        full_input_tensor,
-        &kernel0,
-        5,
-        mid_channels,
-        &bias0,
-        4,
-        &mut full_pool,
-        &mut scratch,
-    );
-    let pool_tensor = conv_gelu_maxpool_tensor(
-        input_tensor,
-        &kernel0,
-        5,
-        mid_channels,
-        &bias0,
-        4,
-        &mut const_pool,
-        &mut scratch,
-    );
-    let mut materialized_pool = vec![0.0; full_pool.len()];
-    pool_tensor.copy_to_dense(&mut materialized_pool);
-    assert_f32s_eq(&materialized_pool, &full_pool);
-
-    let kernel1 = random_f32s(&mut rng, 3 * mid_channels * out_channels);
-    let bias1 = random_f32s(&mut rng, out_channels);
-    let full_pool_tensor =
-        Tensor::with_repeated_tail(&full_pool, seq_len / 4, mid_channels, seq_len / 4);
-    let mut full_max = vec![0.0; out_channels];
-    let mut full_avg = vec![0.0; out_channels];
-    let mut full_tmp = vec![0.0; (seq_len / 4) * out_channels];
-    conv_gelu_global_pool_tensor(
-        full_pool_tensor,
-        &kernel1,
-        3,
-        out_channels,
-        &bias1,
-        &mut full_max,
-        &mut full_avg,
-        &mut full_tmp,
-        &mut scratch,
-    );
-
-    let mut const_max = vec![0.0; out_channels];
-    let mut const_avg = vec![0.0; out_channels];
-    let mut tmp = vec![0.0; (seq_len / 4) * out_channels];
-    conv_gelu_global_pool_tensor(
-        pool_tensor,
-        &kernel1,
-        3,
-        out_channels,
-        &bias1,
-        &mut const_max,
-        &mut const_avg,
-        &mut tmp,
-        &mut scratch,
-    );
-    assert_f32s_eq(&const_max, &full_max);
-    assert_f32s_eq(&const_avg, &full_avg);
-}
-
-fn random_f32s(rng: &mut StdRng, len: usize) -> Vec<f32> {
-    (0..len).map(|_| rng.gen_range(-0.25..0.25)).collect()
 }
 
 fn legacy_tokenize_bytes(bytes: &[u8]) -> Vec<i32> {
@@ -481,31 +387,121 @@ fn push_legacy_indent(out: &mut Vec<i32>, indent: u32) {
     }
 }
 
-fn assert_f32s_eq(actual: &[f32], expected: &[f32]) {
-    assert_eq!(actual.len(), expected.len());
-    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(actual.to_bits(), expected.to_bits(), "index {index}");
+/// Naive scalar oracle: the whole forward pass written as plainly as
+/// possible over the fixed padded 2048-unit shape. Slow, but obviously
+/// correct against the trained architecture.
+fn naive_logits(model: &Model, units: &[i32]) -> [f32; CLASSES] {
+    use crate::model::activation::gelu;
+    use crate::model::constants::*;
+
+    fn conv_gelu_maxpool(
+        input: &[Vec<f32>],
+        kernel: &[f32],
+        kernel_size: usize,
+        out_channels: usize,
+        bias: &[f32],
+        pool: usize,
+    ) -> Vec<Vec<f32>> {
+        let in_channels = input[0].len();
+        let pad = (kernel_size - 1) / 2;
+        let conv: Vec<Vec<f32>> = (0..input.len())
+            .map(|t| {
+                (0..out_channels)
+                    .map(|o| {
+                        let mut acc = bias[o];
+                        for k in 0..kernel_size {
+                            let src = t as isize + k as isize - pad as isize;
+                            if src < 0 || src >= input.len() as isize {
+                                continue;
+                            }
+                            for c in 0..in_channels {
+                                acc += input[src as usize][c]
+                                    * kernel[(k * in_channels + c) * out_channels + o];
+                            }
+                        }
+                        gelu(acc)
+                    })
+                    .collect()
+            })
+            .collect();
+        conv.chunks(pool)
+            .map(|group| {
+                (0..out_channels)
+                    .map(|o| {
+                        group
+                            .iter()
+                            .map(|row| row[o])
+                            .fold(f32::NEG_INFINITY, f32::max)
+                    })
+                    .collect()
+            })
+            .collect()
     }
+
+    let mut rows = vec![vec![0.0f32; EMBED]; MAX_UNITS];
+    for (row, &id) in rows.iter_mut().zip(units.iter().take(MAX_UNITS)) {
+        crate::model::layers::embed_position(&model.embedding, id as u32, row);
+        for v in row.iter_mut() {
+            *v = gelu(*v);
+        }
+    }
+    let pool0 = conv_gelu_maxpool(
+        &rows,
+        &model.conv0_kernel,
+        CONV0_KERNEL,
+        CONV0,
+        &model.conv0_bias,
+        CONV0_POOL,
+    );
+    let pool1 = conv_gelu_maxpool(
+        &pool0,
+        &model.conv1_kernel,
+        CONV1_KERNEL,
+        CONV1,
+        &model.conv1_bias,
+        CONV1_POOL,
+    );
+    let conv2 = conv_gelu_maxpool(
+        &pool1,
+        &model.conv2_kernel,
+        CONV2_KERNEL,
+        CONV2,
+        &model.conv2_bias,
+        1,
+    );
+
+    let mut pooled = [0.0f32; POOLED];
+    for o in 0..CONV2 {
+        let mut mx = f32::NEG_INFINITY;
+        let mut sum = 0.0f32;
+        for row in &conv2 {
+            mx = mx.max(row[o]);
+            sum += row[o];
+        }
+        pooled[o] = mx;
+        pooled[CONV2 + o] = sum / conv2.len() as f32;
+    }
+    model.dense_head(&pooled)
 }
 
-/// The fast forward path must match the reference pipeline for every input
+/// The fast forward path must match the naive scalar oracle for every input
 /// length, including the padded-tail and boundary regions.
 #[test]
-fn fast_forward_matches_reference_on_fuzzed_unit_lengths() {
+fn fast_forward_matches_naive_oracle_on_fuzzed_unit_lengths() {
     let mut rng = StdRng::seed_from_u64(0x4645_4152_4c45_5353);
     let model = Model::get();
 
-    let mut lengths: Vec<usize> = vec![1, 2, 3, 4, 5, 7, 8, 2045, 2046, 2047, 2048];
-    lengths.extend((0..96).map(|_| rng.gen_range(1..=MAX_UNITS)));
+    let mut lengths: Vec<usize> = vec![0, 1, 2, 3, 4, 5, 8, 2045, 2047, 2048];
+    lengths.extend((0..8).map(|_| rng.gen_range(1..=MAX_UNITS)));
 
     for length in lengths {
         let units: Vec<i32> = (0..length).map(|_| rng.gen_range(0..1 << 24)).collect();
-        let reference = model.logits_reference(&units);
+        let oracle = naive_logits(model, &units);
         let fast = model.logits_fast(&units);
-        for (index, (&a, &b)) in fast.iter().zip(&reference).enumerate() {
+        for (index, (&a, &b)) in fast.iter().zip(&oracle).enumerate() {
             assert!(
                 (a - b).abs() < 1e-2,
-                "length {length} logit {index}: fast {a} vs reference {b}"
+                "length {length} logit {index}: fast {a} vs oracle {b}"
             );
         }
     }

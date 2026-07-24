@@ -11,3 +11,5 @@ cpy = "cpy"
 edn = "edn"
 # Verilog data-out signal name used by the synthetic hard-pair generator.
 dout = "dout"
+# Cook-Toom is the Winograd construction, not a typo.
+Toom = "Toom"
