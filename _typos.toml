@@ -9,3 +9,5 @@ extend-exclude = [
 [default.extend-words]
 cpy = "cpy"
 edn = "edn"
+# Verilog data-out signal name used by the synthetic hard-pair generator.
+dout = "dout"

@@ -186,6 +186,57 @@ fn language_fixtures_cover_model_languages() {
     assert_eq!(fixture_languages, model_languages);
 }
 
+/// Issue #5: a heading plus a bare single-word bullet list is valid Markdown
+/// and valid YAML. The Magika teacher labels it markdown with high confidence;
+/// the student should agree instead of assigning YAML >0.9.
+#[test]
+fn ambiguous_markdown_list_prefers_markdown() {
+    let detection = crate::detect("# Heading\n\n- first\n- second\n- third\n- fourth\n- fifth");
+    assert_eq!(top_language(&detection), Some(Language::Markdown));
+}
+
+#[test]
+fn markdown_list_with_capitalized_items_prefers_markdown() {
+    let detection = crate::detect("# Names\n\n- Alice\n- Bob\n- Carol\n- Dave");
+    assert_eq!(top_language(&detection), Some(Language::Markdown));
+}
+
+#[test]
+fn yaml_sequence_of_mappings_stays_yaml() {
+    let detection = crate::detect("- name: build\n  run: make\n- name: test\n  run: make test");
+    assert_eq!(top_language(&detection), Some(Language::Yaml));
+}
+
+/// The Magika teacher is nearly split (yaml 0.54 / markdown 0.44) on a
+/// comment-or-heading followed by a keyed sequence, so only require that the
+/// model ranks the two plausible readings first and second.
+#[test]
+fn commented_yaml_sequence_ranks_yaml_and_markdown_first() {
+    let detection = crate::detect("# comment\nitems:\n- first\n- second\n- third");
+    let top: Vec<(f32, Language)> = detection.top_languages().take(2).collect();
+    let languages = [top[0].1, top[1].1];
+
+    assert!(languages.contains(&Language::Yaml), "{top:?}");
+    assert!(languages.contains(&Language::Markdown), "{top:?}");
+}
+
+/// A bare `- item` list with no heading is valid YAML and valid Markdown, and
+/// the teacher is split between the two. The model should rank them first and
+/// second without near-certain confidence in either.
+#[test]
+fn bare_dash_list_stays_uncertain_between_yaml_and_markdown() {
+    let detection = crate::detect("- first\n- second\n- third\n- fourth\n- fifth");
+    let top: Vec<(f32, Language)> = detection.top_languages().take(2).collect();
+    let languages = [top[0].1, top[1].1];
+
+    assert!(languages.contains(&Language::Yaml), "{top:?}");
+    assert!(languages.contains(&Language::Markdown), "{top:?}");
+    assert!(
+        top[0].0 < 0.9,
+        "top prediction should stay uncertain: {top:?}"
+    );
+}
+
 #[test]
 fn detect_accepts_non_utf8_inputs() {
     let mut bytes = b"fn main() {\n    println!(\"hello\");\n}\n".to_vec();
