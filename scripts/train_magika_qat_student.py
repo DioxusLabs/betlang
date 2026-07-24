@@ -3489,6 +3489,9 @@ def build_split_cache(
     limit: int | None,
     teacher_batch_size: int,
     hidden_output: str | None,
+    min_head_mass: float = 0.0,
+    oov_uniform_max_mass: float = 0.0,
+    head_marginal_targets: bool = False,
 ) -> int:
     capacity = count_paths(split_dir, limit)
     if capacity == 0:
@@ -3542,8 +3545,38 @@ def build_split_cache(
         raw = outputs[0].astype(np.float32)
         selected = raw[:, teacher.selected_indices]
         selected_sum = selected.sum(axis=1, keepdims=True)
-        keep = selected_sum[:, 0] > 0.0
-        selected = selected[keep] / selected_sum[keep]
+        # The teacher predicts over a larger label space than the exported
+        # head. `selected_sum` is the probability mass it keeps on the head
+        # labels; rows below `min_head_mass` are mostly out-of-scope (txt,
+        # diff, ...) and their in-head argmax is noise, so drop them.
+        keep = selected_sum[:, 0] > max(min_head_mass, 0.0)
+        classes = selected.shape[1]
+        if head_marginal_targets:
+            # Store the teacher's raw per-class marginals P(label_i | input)
+            # restricted to the head. Rows sum to the in-head mass (<= 1), so
+            # out-of-scope inputs keep uniformly low targets instead of the
+            # manufactured confidence renormalization would produce. Intended
+            # for one-vs-all BCE distillation (--soft-loss-mode bce).
+            selected = selected[keep]
+        elif oov_uniform_max_mass > 0.0:
+            # Renormalization conditions on "the file is one of the head
+            # labels", which manufactures confident targets for inputs the
+            # teacher mostly considers out-of-scope (txt, ...). Spreading the
+            # out-of-head mass uniformly preserves the teacher's uncertainty
+            # but blurs decision boundaries for rows where the teacher *is*
+            # confident. Blend the two by kept mass: rows at or above
+            # `oov_uniform_max_mass` renormalize as before, and the uniform
+            # spread fades in as the kept mass approaches zero.
+            mass = selected_sum[keep]
+            renormalized = selected[keep] / mass
+            uniform_mix = selected[keep] + np.clip(1.0 - mass, 0.0, 1.0) / classes
+            if oov_uniform_max_mass >= 1.0:
+                selected = uniform_mix
+            else:
+                weight = np.clip((oov_uniform_max_mass - mass) / oov_uniform_max_mass, 0.0, 1.0)
+                selected = weight * uniform_mix + (1.0 - weight) * renormalized
+        else:
+            selected = selected[keep] / selected_sum[keep]
         kept_tokens = [window for window, should_keep in zip(pending_tokens, keep) if should_keep]
         if kept_tokens:
             end = written + len(kept_tokens)
@@ -3624,6 +3657,9 @@ def build_split_cache(
         "slugs": teacher.selected_slugs,
         "hidden_dim": hidden_dim_value if hidden_output else None,
         "hidden_output": hidden_output,
+        "min_head_mass": min_head_mass,
+        "oov_uniform_max_mass": oov_uniform_max_mass,
+        "head_marginal_targets": head_marginal_targets,
     }
     cache_meta_path(cache_dir, split).write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
     print(f"{split}: cached={written} skipped={skipped}", flush=True)
@@ -3638,23 +3674,47 @@ def ensure_cache(
     teacher_batch_size: int,
     rebuild_cache: bool,
     hidden_output: str | None,
+    min_head_mass: float = 0.0,
+    oov_uniform_max_mass: float = 0.0,
+    head_marginal_targets: bool = False,
 ) -> dict[str, int]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     counts = {}
     for split in SPLITS:
         meta_path = cache_meta_path(cache_dir, split)
         existing_hidden_dim = None
+        existing_meta = {}
         if meta_path.exists():
             existing_meta = json.loads(meta_path.read_text())
             existing_hidden_dim = existing_meta.get("hidden_dim")
         hidden_dim = existing_hidden_dim if hidden_output else None
-        if not rebuild_cache and cache_is_current(cache_dir, split, len(teacher.selected_labels), hidden_dim):
+        target_settings_current = (
+            float(existing_meta.get("min_head_mass", 0.0)) == float(min_head_mass)
+            and float(existing_meta.get("oov_uniform_max_mass", 0.0)) == float(oov_uniform_max_mass)
+            and bool(existing_meta.get("head_marginal_targets", False)) == bool(head_marginal_targets)
+        )
+        if (
+            not rebuild_cache
+            and target_settings_current
+            and cache_is_current(cache_dir, split, len(teacher.selected_labels), hidden_dim)
+        ):
             meta = json.loads(meta_path.read_text())
             if meta.get("hidden_output") == hidden_output:
                 counts[split] = int(meta["count"])
                 print(f"{split}: using cached {counts[split]} examples (hidden_dim={hidden_dim})", flush=True)
                 continue
-        counts[split] = build_split_cache(dataset / split, cache_dir, split, teacher, limit, teacher_batch_size, hidden_output)
+        counts[split] = build_split_cache(
+            dataset / split,
+            cache_dir,
+            split,
+            teacher,
+            limit,
+            teacher_batch_size,
+            hidden_output,
+            min_head_mass=min_head_mass,
+            oov_uniform_max_mass=oov_uniform_max_mass,
+            head_marginal_targets=head_marginal_targets,
+        )
     return counts
 
 
@@ -4417,8 +4477,27 @@ def distillation_loss(
     self_probabilities_batch: tf.Tensor | None = None,
     self_loss_weight: float = 0.0,
     label_smoothing: float = 0.0,
+    mass_discounted_hard_labels: bool = False,
+    soft_loss_mode: str = "ce",
 ) -> tf.Tensor:
-    if temperature > 1.0:
+    if soft_loss_mode == "bce":
+        # One-vs-all distillation: per-class binary cross-entropy against the
+        # teacher's raw head marginals (rows sum to the in-head mass, <= 1).
+        # Unlike softmax CE, BCE does not require the target to be a
+        # normalized distribution, so the teacher's out-of-head mass simply
+        # lowers every class target instead of being renormalized into
+        # manufactured confidence. See "Revisiting One-vs-All Classifiers for
+        # Predictive Uncertainty and OOD Detection" (Padhy et al., 2020).
+        # `temperature` is ignored in this mode: the small marginals already
+        # carry the dark knowledge that softmax CE needs softening to expose.
+        soft_per_example = tf.reduce_sum(
+            tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=tf.cast(probability_batch, tf.float32),
+                logits=tf.cast(logits, tf.float32),
+            ),
+            axis=1,
+        )
+    elif temperature > 1.0:
         softened = tf.pow(
             tf.maximum(probability_batch, tf.constant(1e-8, dtype=probability_batch.dtype)),
             1.0 / temperature,
@@ -4426,22 +4505,54 @@ def distillation_loss(
         soft_targets = softened / tf.reduce_sum(softened, axis=1, keepdims=True)
         soft_logits = logits / temperature
         soft_scale = temperature * temperature
+        soft_per_example = tf.keras.losses.categorical_crossentropy(
+            soft_targets, soft_logits, from_logits=True
+        ) * soft_scale
     else:
-        soft_targets = probability_batch
-        soft_logits = logits
-        soft_scale = 1.0
-    soft_per_example = tf.keras.losses.categorical_crossentropy(
-        soft_targets, soft_logits, from_logits=True
-    ) * soft_scale
-    if label_smoothing > 0.0:
+        soft_per_example = tf.keras.losses.categorical_crossentropy(
+            probability_batch, logits, from_logits=True
+        )
+    if label_smoothing > 0.0 or mass_discounted_hard_labels or soft_loss_mode == "bce":
         # Per-class smoothing: target = (1 - eps) * one_hot + eps / classes.
         # Equivalent to mixing the hard target with the uniform distribution.
         classes_static = int(logits.shape[-1])
         one_hot = tf.one_hot(label_batch, classes_static, dtype=tf.float32)
         smoothed = one_hot * (1.0 - label_smoothing) + (label_smoothing / classes_static)
-        hard_per_example = tf.keras.losses.categorical_crossentropy(
-            smoothed, logits, from_logits=True
-        )
+        if mass_discounted_hard_labels:
+            # The hard label is the teacher argmax *within the exported head*,
+            # so its confidence is conditional on "the file is one of the head
+            # labels". Discount it by the teacher's in-head mass. With head
+            # marginal targets the mass is the row sum; with uniform-mixed
+            # targets it is recoverable as 1 - classes * min(q), because
+            # classes with ~zero teacher probability sit exactly on the
+            # uniform floor (1 - mass) / classes.
+            if soft_loss_mode == "bce":
+                mass = tf.clip_by_value(
+                    tf.reduce_sum(tf.cast(probability_batch, tf.float32), axis=1),
+                    0.0,
+                    1.0,
+                )[:, None]
+                smoothed = mass * smoothed
+            else:
+                mass = tf.clip_by_value(
+                    1.0
+                    - tf.cast(classes_static, tf.float32)
+                    * tf.reduce_min(tf.cast(probability_batch, tf.float32), axis=1),
+                    0.0,
+                    1.0,
+                )[:, None]
+                smoothed = mass * smoothed + (1.0 - mass) / classes_static
+        if soft_loss_mode == "bce":
+            hard_per_example = tf.reduce_sum(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    labels=smoothed, logits=tf.cast(logits, tf.float32)
+                ),
+                axis=1,
+            )
+        else:
+            hard_per_example = tf.keras.losses.categorical_crossentropy(
+                smoothed, logits, from_logits=True
+            )
     else:
         hard_per_example = tf.keras.losses.sparse_categorical_crossentropy(
             label_batch, logits, from_logits=True
@@ -4474,6 +4585,19 @@ def distillation_loss(
         group_per_example = tf.cast(group_per_example, tf.float32)
         loss = loss + group_loss_weight * tf.reduce_mean(group_per_example * weights)
     if self_loss_weight > 0.0 and self_probabilities_batch is not None:
+        if soft_loss_mode == "bce":
+            # Mirror the one-vs-all soft term: the parent's cached targets are
+            # per-class sigmoid marginals, so out-of-scope uncertainty
+            # transfers without renormalization.
+            self_per_example = tf.reduce_sum(
+                tf.nn.sigmoid_cross_entropy_with_logits(
+                    labels=tf.cast(self_probabilities_batch, tf.float32),
+                    logits=tf.cast(logits, tf.float32),
+                ),
+                axis=1,
+            )
+            self_loss = tf.reduce_mean(self_per_example * weights)
+            return loss + tf.cast(self_loss_weight, tf.float32) * self_loss
         if temperature > 1.0:
             self_softened = tf.pow(
                 tf.maximum(
@@ -4594,6 +4718,8 @@ def make_train_step(
     parent_feature_model: tf.keras.Model | None = None,
     student_feature_model: tf.keras.Model | None = None,
     parent_feature_loss_weight: float = 0.0,
+    mass_discounted_hard_labels: bool = False,
+    soft_loss_mode: str = "ce",
 ):
     @tf.function(jit_compile=jit_compile)
     def train_step(token_batch, probability_batch, label_batch, hidden_batch, self_probs_batch):
@@ -4617,6 +4743,8 @@ def make_train_step(
                 self_probabilities_batch=self_probs,
                 self_loss_weight=self_loss_weight,
                 label_smoothing=label_smoothing,
+                mass_discounted_hard_labels=mass_discounted_hard_labels,
+                soft_loss_mode=soft_loss_mode,
             )
             if (
                 parent_feature_loss_weight > 0.0
@@ -4654,6 +4782,8 @@ def make_eval_step(
     parent_feature_model: tf.keras.Model | None = None,
     student_feature_model: tf.keras.Model | None = None,
     parent_feature_loss_weight: float = 0.0,
+    mass_discounted_hard_labels: bool = False,
+    soft_loss_mode: str = "ce",
 ):
     @tf.function(jit_compile=jit_compile)
     def eval_step(token_batch, probability_batch, label_batch, hidden_batch, self_probs_batch):
@@ -4675,6 +4805,8 @@ def make_eval_step(
             confidence_power,
             self_probabilities_batch=self_probs,
             self_loss_weight=self_loss_weight,
+            mass_discounted_hard_labels=mass_discounted_hard_labels,
+            soft_loss_mode=soft_loss_mode,
         )
         if (
             parent_feature_loss_weight > 0.0
@@ -5492,6 +5624,71 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--limit-per-split", type=int)
     parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument(
+        "--min-teacher-head-mass",
+        type=float,
+        default=0.0,
+        help="drop cache rows where the teacher keeps at most this much probability "
+             "mass on the exported head labels. Such rows are mostly out-of-scope "
+             "(txt, diff, ...) and their in-head argmax is noise. Default 0.0 keeps "
+             "the legacy behavior (drop only exact-zero rows).",
+    )
+    parser.add_argument(
+        "--oov-uniform-max-mass",
+        type=float,
+        default=0.0,
+        help="blend the teacher's out-of-head probability mass into a uniform "
+             "spread for rows whose in-head mass is below this value, fading to "
+             "plain renormalization at and above it. Renormalization manufactures "
+             "confident soft targets for inputs the teacher mostly places outside "
+             "the head (e.g. txt); the blend preserves its uncertainty on those "
+             "rows without blurring boundaries where the teacher is confident. "
+             "Default 0.0 keeps the legacy renormalize-everything behavior; values "
+             ">= 1 apply the uniform spread to every row. "
+             "ensure_cache detects a settings change from the split metadata.",
+    )
+    parser.add_argument(
+        "--head-marginal-targets",
+        action="store_true",
+        help="store the teacher's raw per-class head marginals in the cache "
+             "instead of a normalized distribution (rows sum to the in-head "
+             "mass). Use with --soft-loss-mode bce. Mutually exclusive with "
+             "--oov-uniform-max-mass.",
+    )
+    parser.add_argument(
+        "--soft-loss-mode",
+        choices=("ce", "bce"),
+        default="ce",
+        help="soft distillation loss. 'ce' is the legacy temperature-softened "
+             "softmax cross-entropy against a normalized target distribution. "
+             "'bce' is one-vs-all sigmoid cross-entropy against the teacher's "
+             "raw head marginals (requires --head-marginal-targets); it "
+             "transfers absolute per-class beliefs, so inputs the teacher "
+             "considers mostly out-of-scope train toward uniformly low logits "
+             "and keep low softmax confidence at inference.",
+    )
+    parser.add_argument(
+        "--mass-discounted-hard-labels",
+        action="store_true",
+        help="discount the hard-label target by the teacher's in-head mass. The "
+             "hard label is the in-head teacher argmax, so its confidence is "
+             "conditional on the input being one of the head labels; without "
+             "the discount it re-sharpens rows whose soft targets express "
+             "out-of-scope uncertainty. Requires soft targets built with "
+             "--head-marginal-targets (the mass is the cached row sum) or "
+             "--oov-uniform-max-mass (the mass is recovered from the uniform "
+             "floor of the cached distribution).",
+    )
+    parser.add_argument(
+        "--checkpoint-weights",
+        type=Path,
+        default=None,
+        help="also save the best checkpoint's raw layer weights to this .npz "
+             "path (keys '<layer>|<index>'). Required to train non-exportable "
+             "architectures (e.g. a larger self-distillation parent): the "
+             "metadata-free MSQ1 exporter only supports the fixed production "
+             "architecture, so export is skipped for other architectures.",
+    )
     parser.add_argument("--prepare-cache-only", action="store_true")
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--tf-data-batches", action="store_true")
@@ -5715,6 +5912,10 @@ def main() -> None:
             "sliced examples need to remain single-file examples"
         )
 
+    if args.head_marginal_targets and args.oov_uniform_max_mass > 0.0:
+        raise SystemExit("--head-marginal-targets and --oov-uniform-max-mass are mutually exclusive")
+    if args.soft_loss_mode == "bce" and not args.head_marginal_targets:
+        raise SystemExit("--soft-loss-mode bce requires --head-marginal-targets")
     tf.keras.utils.set_random_seed(args.seed)
     teacher = load_teacher(args.magika_model, args.magika_config)
     classes = len(teacher.selected_labels)
@@ -5726,6 +5927,9 @@ def main() -> None:
         args.teacher_batch_size,
         args.rebuild_cache,
         args.teacher_hidden_output,
+        min_head_mass=args.min_teacher_head_mass,
+        oov_uniform_max_mass=args.oov_uniform_max_mass,
+        head_marginal_targets=args.head_marginal_targets,
     )
     if args.build_short_slice_target_cache or args.prepare_short_slice_target_cache_only:
         assert short_slice_target_dir is not None
@@ -5827,11 +6031,37 @@ def main() -> None:
         model = add_trunk_hidden_output(model, hidden_dim=cache_hidden_dim)
         print(f"hidden_loss_target=trunk hidden_dim={cache_hidden_dim}", flush=True)
     if args.init_from_checkpoint is not None:
-        initialized_layers, adapted_layers = initialize_model_from_checkpoint(
-            model,
-            args.init_from_checkpoint,
-            channel_selection=args.channel_selection,
-        )
+        if args.init_from_checkpoint.suffix == ".npz":
+            # Raw weights saved via --checkpoint-weights (exact-shape resume).
+            arrays = np.load(args.init_from_checkpoint)
+            initialized_layers: set[str] = set()
+            adapted_layers: set[str] = set()
+            for layer in model.layers:
+                values = []
+                index = 0
+                while f"{layer.name}|{index}" in arrays:
+                    values.append(arrays[f"{layer.name}|{index}"])
+                    index += 1
+                if not values:
+                    continue
+                current = layer.get_weights()
+                if len(current) != len(values) or any(
+                    c.shape != v.shape for c, v in zip(current, values)
+                ):
+                    raise SystemExit(f"layer {layer.name} shape mismatch against npz checkpoint")
+                layer.set_weights([v.astype(c.dtype) for c, v in zip(current, values)])
+                initialized_layers.add(layer.name)
+            print(
+                f"init_from_checkpoint={args.init_from_checkpoint} (npz) "
+                f"initialized_layers={','.join(sorted(initialized_layers))}",
+                flush=True,
+            )
+        else:
+            initialized_layers, adapted_layers = initialize_model_from_checkpoint(
+                model,
+                args.init_from_checkpoint,
+                channel_selection=args.channel_selection,
+            )
         apply_freeze_policy(
             model,
             initialized_layers,
@@ -5901,6 +6131,8 @@ def main() -> None:
         parent_feature_model=parent_feature_model,
         student_feature_model=student_feature_model,
         parent_feature_loss_weight=args.parent_feature_loss_weight,
+        mass_discounted_hard_labels=args.mass_discounted_hard_labels,
+        soft_loss_mode=args.soft_loss_mode,
     )
     eval_step = make_eval_step(
         model,
@@ -5915,7 +6147,36 @@ def main() -> None:
         parent_feature_model=parent_feature_model,
         student_feature_model=student_feature_model,
         parent_feature_loss_weight=args.parent_feature_loss_weight,
+        mass_discounted_hard_labels=args.mass_discounted_hard_labels,
+        soft_loss_mode=args.soft_loss_mode,
     )
+
+    def save_checkpoint(current_model) -> None:
+        if args.checkpoint_weights is not None:
+            arrays = {}
+            for layer in current_model.layers:
+                for index, value in enumerate(layer.get_weights()):
+                    arrays[f"{layer.name}|{index}"] = value
+            np.savez(args.checkpoint_weights, **arrays)
+            print(f"checkpoint_weights={args.checkpoint_weights}", flush=True)
+        if args.architecture != FIXED_EXPORT_ARCHITECTURE:
+            if args.checkpoint_weights is None:
+                raise SystemExit(
+                    f"architecture {args.architecture!r} cannot be exported as "
+                    "metadata-free MSQ1; pass --checkpoint-weights to save it"
+                )
+            return
+        size = export_model(
+            args.output,
+            current_model,
+            teacher.selected_labels,
+            teacher.selected_slugs,
+            args.weight_bits,
+            args.architecture,
+            tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
+        )
+        print(f"best_checkpoint_model_size_bytes={size}", flush=True)
+
     best_valid = -1.0
     best_weights = None
     checks_without_improvement = 0
@@ -5942,16 +6203,7 @@ def main() -> None:
         if initial_export_phase:
             best_valid = valid_accuracy
             best_weights = model.get_weights()
-            size = export_model(
-                args.output,
-                model,
-                teacher.selected_labels,
-                teacher.selected_slugs,
-                args.weight_bits,
-                args.architecture,
-                tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
-            )
-            print(f"best_checkpoint_model_size_bytes={size}", flush=True)
+            save_checkpoint(model)
 
     for epoch in range(args.epochs):
         if args.qat_start_epoch > 0 and epoch == args.qat_start_epoch:
@@ -6040,16 +6292,7 @@ def main() -> None:
                 best_valid = valid_accuracy
                 best_weights = model.get_weights()
                 checks_without_improvement = 0
-                size = export_model(
-                    args.output,
-                    model,
-                    teacher.selected_labels,
-                    teacher.selected_slugs,
-                    args.weight_bits,
-                    args.architecture,
-                    tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
-                )
-                print(f"best_checkpoint_model_size_bytes={size}", flush=True)
+                save_checkpoint(model)
             elif not qat_phase:
                 pass
             else:
@@ -6078,15 +6321,8 @@ def main() -> None:
         classes,
         collect_confusion=args.confusion_matrix_output is not None or args.confusion_matrix_top > 0,
     )
-    size = export_model(
-        args.output,
-        model,
-        teacher.selected_labels,
-        teacher.selected_slugs,
-        args.weight_bits,
-        args.architecture,
-        tokenizer_version=args.unit_tokenizer if architecture_uses_word_units(args.architecture) else None,
-    )
+    save_checkpoint(model)
+    size = args.output.stat().st_size if args.output.exists() else 0
     print(f"train: {counts['train']} examples")
     print(f"valid: {counts['valid']} examples")
     print(f"test: {counts['test']} examples")

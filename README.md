@@ -40,7 +40,7 @@ one-to-one with no label aggregation.
 
 The confusion matrix uses the same labels:
 
-![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/92da743c8c97fd11bb57645ec394371ee7cf836f/assets/confusion-overall.png)
+![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/issue5-ova-calibration/assets/confusion-overall.png)
 
 ## Model
 
@@ -48,12 +48,13 @@ The embedded model is `assets/magika/source-student-q4.bin`, a 47,840-byte
 weights-only MSQ1 payload with SHA-256:
 
 ```text
-59ef24167bddd1364eb9c1650add8a67e1a542b5155fac67f5e1cda07df0c0f0
+8493d2d3757572c8661141e414b1c0755aa08d4c4e5382dfbbc6b73b02d89083
 ```
 
 Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`, tokenizer version 3.
-On the manifest-aligned held-out filesystem-label test split it reaches
-`test_fs_accuracy=0.965238` with `macro_recall=0.965411`.
+On the held-out filesystem-label test split it reaches
+`test_fs_accuracy=0.942353` with `macro_recall=0.939690`. Probabilities are
+calibrated: ambiguous inputs report split scores instead of a confident label.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
@@ -75,9 +76,9 @@ Apache-2.0. Keep this attribution with redistributed model artifacts.
 
 ## Confusion By File Size
 
-The shipped wordseq model is evaluated below on the held-out `bigorig` test
-split. Each panel is a row-normalized confusion matrix for one file-size
-bucket: actual labels are rows, predicted labels are columns, and the diagonal
-is correct classification.
+The shipped wordseq model is evaluated below on the held-out test split. Each
+panel is a row-normalized confusion matrix for one file-size bucket: actual
+labels are rows, predicted labels are columns, and the diagonal is correct
+classification.
 
-![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/92da743c8c97fd11bb57645ec394371ee7cf836f/assets/confusion-by-size.png)
+![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/issue5-ova-calibration/assets/confusion-by-size.png)
