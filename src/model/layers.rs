@@ -6,7 +6,7 @@ use fearless_simd::{Level, Simd, SimdBase, SimdFloat, dispatch, f32x4};
 use std::{ops::Range, sync::OnceLock};
 
 /// Detect the best available SIMD level once per process.
-fn simd_level() -> Level {
+pub(crate) fn simd_level() -> Level {
     static LEVEL: OnceLock<Level> = OnceLock::new();
     *LEVEL.get_or_init(Level::new)
 }
@@ -64,7 +64,7 @@ fn hash_bin(unit: u32, head: usize) -> usize {
 /// Edges and partial blocks use the plain f32 path in this kernel.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn conv1d_block<S: Simd, const BLOCK: usize>(
+pub(crate) fn conv1d_block<S: Simd, const BLOCK: usize>(
     simd: S,
     input: &[f32],
     seq_len: usize,
@@ -368,7 +368,6 @@ impl<'a> Tensor<'a> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn copy_to_dense(&self, out: &mut [f32]) {
         debug_assert_eq!(out.len(), self.rows * self.channels);
         for row_index in 0..self.rows {
@@ -859,6 +858,80 @@ fn max_gelu_row<S: Simd>(simd: S, row: &[f32], dst: &mut [f32]) {
         let g = gelu_simd(simd, v);
         let dv = f32x4::from_slice(simd, d_c);
         g.max(dv).store_slice(d_c);
+    }
+}
+
+/// Apply GELU in place over a buffer whose length is a multiple of 4.
+pub(crate) fn gelu_in_place(values: &mut [f32]) {
+    let level = simd_level();
+    dispatch!(level, simd => gelu_in_place_simd(simd, values));
+}
+
+#[inline(always)]
+fn gelu_in_place_simd<S: Simd>(simd: S, values: &mut [f32]) {
+    for chunk in as_array_chunks_mut::<4>(values) {
+        let v = f32x4::from_slice(simd, chunk);
+        gelu_simd(simd, v).store_slice(chunk);
+    }
+}
+
+/// Max-pool GELU over groups of `pool` consecutive rows using the endpoint
+/// identity: GELU is unimodal with a single minimum at x ~= -0.7517, so
+/// `max(gelu(x_i))` over any group is attained at an endpoint of
+/// `[min x_i, max x_i]`. Two GELU evaluations per pooled output regardless
+/// of pool width.
+#[inline(always)]
+pub(crate) fn pool_endpoint_gelu_rows<S: Simd>(
+    simd: S,
+    rows: &[f32],
+    channels: usize,
+    pool: usize,
+    dst: &mut [f32],
+) {
+    debug_assert!(rows.len().is_multiple_of(pool * channels));
+    for (group, out) in rows
+        .chunks_exact(pool * channels)
+        .zip(dst.chunks_exact_mut(channels))
+    {
+        let (first, others) = group.split_at(channels);
+        for (chunk, (d_c, f_c)) in as_array_chunks_mut::<4>(out)
+            .iter_mut()
+            .zip(as_array_chunks::<4>(first))
+            .enumerate()
+        {
+            let mut hi = f32x4::from_slice(simd, f_c);
+            let mut lo = hi;
+            for row in others.chunks_exact(channels) {
+                let v = f32x4::from_slice(simd, &as_array_chunks::<4>(row)[chunk]);
+                hi = hi.max(v);
+                lo = lo.min(v);
+            }
+            let best = gelu_simd(simd, hi).max(gelu_simd(simd, lo));
+            best.store_slice(d_c);
+        }
+    }
+}
+
+/// Fused GELU + global max/sum reduction over rows.
+#[inline(always)]
+pub(crate) fn gelu_max_sum_rows<S: Simd>(
+    simd: S,
+    rows: &[f32],
+    channels: usize,
+    out_max: &mut [f32],
+    out_sum: &mut [f32],
+) {
+    debug_assert!(rows.len().is_multiple_of(channels));
+    for row in rows.chunks_exact(channels) {
+        for ((m_c, s_c), r_c) in as_array_chunks_mut::<4>(out_max)
+            .iter_mut()
+            .zip(as_array_chunks_mut::<4>(out_sum).iter_mut())
+            .zip(as_array_chunks::<4>(row))
+        {
+            let v = gelu_simd(simd, f32x4::from_slice(simd, r_c));
+            v.max(f32x4::from_slice(simd, m_c)).store_slice(m_c);
+            (v + f32x4::from_slice(simd, s_c)).store_slice(s_c);
+        }
     }
 }
 

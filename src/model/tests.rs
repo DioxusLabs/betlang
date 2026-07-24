@@ -488,6 +488,56 @@ fn assert_f32s_eq(actual: &[f32], expected: &[f32]) {
     }
 }
 
+/// The fast forward path must match the reference pipeline for every input
+/// length, including the padded-tail and boundary regions.
+#[test]
+fn fast_forward_matches_reference_on_fuzzed_unit_lengths() {
+    let mut rng = StdRng::seed_from_u64(0x4645_4152_4c45_5353);
+    let model = Model::get();
+
+    let mut lengths: Vec<usize> = vec![1, 2, 3, 4, 5, 7, 8, 2045, 2046, 2047, 2048];
+    lengths.extend((0..96).map(|_| rng.gen_range(1..=MAX_UNITS)));
+
+    for length in lengths {
+        let units: Vec<i32> = (0..length).map(|_| rng.gen_range(0..1 << 24)).collect();
+        let reference = model.logits_reference(&units);
+        let fast = model.logits_fast(&units);
+        for (index, (&a, &b)) in fast.iter().zip(&reference).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-2,
+                "length {length} logit {index}: fast {a} vs reference {b}"
+            );
+        }
+    }
+}
+
+/// max(gelu) over a pool group equals max(gelu(max), gelu(min)) because GELU
+/// is unimodal; verify over adversarial negative mixes.
+#[test]
+fn pooled_endpoint_identity_matches_direct_max() {
+    use crate::model::activation::gelu;
+    let cases: &[[f32; 4]] = &[
+        [-0.2, -0.9, -3.0, -80.0],
+        [-0.7517, -0.7517, -0.75, -0.76],
+        [0.0, -0.1, -50.0, -0.7],
+        [1.5, -2.0, -0.4, 0.2],
+        [-1e30, -0.75, -0.5, -0.25],
+    ];
+    for case in cases {
+        let direct = case
+            .iter()
+            .map(|&x| gelu(x))
+            .fold(f32::NEG_INFINITY, f32::max);
+        let hi = case.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+        let lo = case.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+        let endpoint = gelu(hi).max(gelu(lo));
+        assert!(
+            (direct - endpoint).abs() < 1e-6,
+            "case {case:?}: direct {direct} vs endpoint {endpoint}"
+        );
+    }
+}
+
 #[test]
 fn empty_input_returns_empty_detection() {
     assert!(crate::detect("").top_languages().next().is_none());

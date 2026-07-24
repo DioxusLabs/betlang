@@ -19,6 +19,7 @@
 mod activation;
 mod constants;
 mod embedded;
+mod forward;
 mod layers;
 mod reader;
 mod runtime;
