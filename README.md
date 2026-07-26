@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU source-language detection for code with a tiny 50kb model.
+CPU source-language detection for code with a tiny 50kb model. Try it in browser [here](https://dioxuslabs.github.io/dioxus-code/#playground)
 
 ```toml
 [dependencies]
