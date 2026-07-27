@@ -5,7 +5,7 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `aac486a486b290b6b7e4e183e51a4b9765a6ae0f7edeebb32fd3aad6325fe748`
+- SHA-256: `029c94e4533d8d559b2351ed297de8b805bf51b260c8827a3aa8ba80575674c4`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
@@ -33,7 +33,9 @@ The model is trained from scratch with hard labels on a corpus assembled by
   the `fka/awesome-chatgpt-prompts` personas.
 - `shell_command`: real bash one-liners from the NL2Bash corpus
   (TellinaTool/nl2bash), example commands from English tldr-pages with
-  `{{placeholder}}` markers flattened, and synthetic hard negatives that
+  `{{placeholder}}` markers flattened, bash tool calls mined from agent
+  RL/SFT trajectories (`SWE-bench/SWE-smith-trajectories`), real user shell
+  history (`spignelon/bash_history`), and synthetic hard negatives that
   embed English phrases inside quoted command arguments
   (`git commit -m "..."`, `echo "..."`, `grep -r "..."`).
 
@@ -49,17 +51,20 @@ There is no teacher model: unlike the earlier source-language student, the
 ## Evaluation
 
 Held-out test split of the training corpus (5% of samples, disjoint from
-train/valid; ~153k samples total). Metrics are printed by
+train/valid; ~251k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.990169`
-- `prompt` recall `0.991324`
-- `shell_command` recall `0.988164`
+- `test_accuracy=0.990154`
+- `prompt` recall `0.992277`
+- `shell_command` recall `0.988077`
 
-For reference, Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
-`warpdotdev/Warp` `crates/input_classifier`) scores 95.7% on the same test
-split — though that set is in-distribution for betlang, and Warp runs
-heuristics before its model in production.
+On a strictly out-of-distribution eval (NL2SH-ALFA test instructions and
+commands plus real bash history, with exact matches and train-template
+overlaps excluded), the model scores 98.3% overall — statistically tied
+with Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
+`warpdotdev/Warp` `crates/input_classifier`) at 98.7% on the same samples,
+at ~390x smaller size. Warp additionally runs heuristics before its model
+in production.
 
 ## Limitations
 

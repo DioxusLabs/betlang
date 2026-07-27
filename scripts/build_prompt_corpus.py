@@ -11,9 +11,11 @@ Labels:
   HuggingFaceH4/no_robots, developer questions from Stack Overflow titles,
   plus instruction-style prompts from Alpaca, Dolly, and the
   awesome-chatgpt-prompts personas.
-- ``shell_command``: real shell one-liners from the NL2Bash corpus and
-  example commands from tldr-pages (placeholders like ``{{path}}`` are
-  flattened to ``path``), plus synthetic hard negatives that embed English
+- ``shell_command``: real shell one-liners from the NL2Bash corpus, example
+  commands from tldr-pages (placeholders like ``{{path}}`` are flattened to
+  ``path``), bash tool calls mined from agent RL/SFT trajectories
+  (SWE-bench/SWE-smith-trajectories), real user shell history
+  (spignelon/bash_history), plus synthetic hard negatives that embed English
   phrases inside quoted command arguments (``git commit -m "..."``,
   ``echo "..."``, ``grep -r "..."``) so quoted prose does not flip the
   label.
@@ -213,6 +215,46 @@ def quoted_arg_commands(
     return commands
 
 
+def swe_smith_bash_commands(limit: int) -> list[str]:
+    """Bash tool calls mined from agent trajectories (SWE-smith)."""
+    trajectories = load_dataset("SWE-bench/SWE-smith-trajectories", split="tool", streaming=True)
+    commands: list[str] = []
+    for row in trajectories:
+        for message in json.loads(row["messages"]):
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if function.get("name") != "bash":
+                    continue
+                try:
+                    arguments = json.loads(function.get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    continue
+                command = (arguments.get("command") or "").strip()
+                if command:
+                    commands.append(command)
+                    if len(commands) >= limit:
+                        return commands
+    return commands
+
+
+def bash_history_commands(limit: int) -> list[str]:
+    """Real user shell history: messy, typo-ridden, realistic commands."""
+    history = load_dataset("spignelon/bash_history", split="train")
+    commands: list[str] = []
+    seen: set[str] = set()
+    for row in history:
+        command = row["text"].strip()
+        if len(command) < MIN_BYTES or command in seen:
+            continue
+        seen.add(command)
+        commands.append(command)
+        if len(commands) >= limit:
+            break
+    return commands
+
+
 def nl2bash_commands() -> list[str]:
     with urllib.request.urlopen(NL2BASH_URL) as response:
         body = response.read().decode("utf-8", "ignore")
@@ -245,8 +287,10 @@ def main() -> None:
     parser.add_argument("--dolly-limit", type=int, default=15_000)
     parser.add_argument("--oasst-limit", type=int, default=12_000)
     parser.add_argument("--sharegpt-limit", type=int, default=20_000)
-    parser.add_argument("--stackoverflow-limit", type=int, default=30_000)
-    parser.add_argument("--quoted-arg-limit", type=int, default=15_000)
+    parser.add_argument("--stackoverflow-limit", type=int, default=50_000)
+    parser.add_argument("--quoted-arg-limit", type=int, default=20_000)
+    parser.add_argument("--agent-bash-limit", type=int, default=60_000)
+    parser.add_argument("--bash-history-limit", type=int, default=60_000)
     args = parser.parse_args()
 
     rng = random.Random(SEED)
@@ -266,6 +310,8 @@ def main() -> None:
     )
 
     shell: list[str] = nl2bash_commands()
+    shell.extend(swe_smith_bash_commands(args.agent_bash_limit))
+    shell.extend(bash_history_commands(args.bash_history_limit))
     if args.tldr_dir is None:
         import io
         import tarfile

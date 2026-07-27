@@ -40,7 +40,8 @@ Runs on a laptop CPU in well under an hour; no GPU or teacher assets needed.
 1. **Corpus** — downloads real user prompts (oasst1 English first turns,
    ShareGPT first human turns, no_robots, Stack Overflow titles) plus
    instruction datasets (Alpaca, Dolly, awesome-chatgpt-prompts) for the
-   prompt class, and NL2Bash one-liners, tldr-pages example commands, and
+   prompt class, and NL2Bash one-liners, tldr-pages example commands, agent-trajectory bash tool calls
+   (SWE-smith), real user shell history, and
    synthetic quoted-English hard negatives for the shell class (English
    tldr pages only), writing one
    file per sample into deterministic, leakage-aware 90/5/5 splits (split
