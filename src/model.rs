@@ -20,6 +20,7 @@ mod activation;
 mod constants;
 mod embedded;
 mod layers;
+mod normalize;
 mod reader;
 mod runtime;
 #[cfg(test)]
@@ -27,11 +28,12 @@ mod tests;
 mod tokenizer;
 mod window;
 
-use self::{constants::CLASSES, runtime::Model, window::build_window};
+use self::{constants::CLASSES, normalize::normalize, runtime::Model, window::build_window};
 use crate::{Detection, Kind};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
-    let Some(window) = build_window(source) else {
+    let source = normalize(source);
+    let Some(window) = build_window(&source) else {
         return Detection::from_predictions(Vec::new());
     };
     let model = Model::get();

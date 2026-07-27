@@ -5,7 +5,7 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `029c94e4533d8d559b2351ed297de8b805bf51b260c8827a3aa8ba80575674c4`
+- SHA-256: `a39125a09bf39241378b541cf8ee47cb70cde833e5209194ffb8da1686e8db56`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
@@ -45,6 +45,11 @@ quoted strings, numbers, and paths collapsed), so near-duplicate variants
 never straddle splits, and each synthetic hard negative follows the split of
 the prompt its phrase came from.
 
+Inputs are canonicalized identically at training and inference time
+(`src/model/normalize.rs` mirrors the corpus builder): newlines normalized,
+tabs/non-breaking spaces mapped to spaces, BOM/zero-width and control
+characters removed, space runs collapsed, and edges trimmed.
+
 There is no teacher model: unlike the earlier source-language student, the
 2-class head trains directly on corpus labels with label smoothing.
 
@@ -54,17 +59,16 @@ Held-out test split of the training corpus (5% of samples, disjoint from
 train/valid; ~251k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.990154`
-- `prompt` recall `0.992277`
-- `shell_command` recall `0.988077`
+- `test_accuracy=0.991335`
+- `prompt` recall `0.992106`
+- `shell_command` recall `0.990580`
 
 On a strictly out-of-distribution eval (NL2SH-ALFA test instructions and
 commands plus real bash history, with exact matches and train-template
-overlaps excluded), the model scores 98.3% overall — statistically tied
-with Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
-`warpdotdev/Warp` `crates/input_classifier`) at 98.7% on the same samples,
-at ~390x smaller size. Warp additionally runs heuristics before its model
-in production.
+overlaps excluded), the model scores 97.0% overall vs 98.4% for Warp's
+public `bert_tiny_v3.onnx` classifier (17.6 MB, from `warpdotdev/Warp`
+`crates/input_classifier`) on the same samples, at ~390x smaller size.
+Warp additionally runs heuristics before its model in production.
 
 ## Limitations
 

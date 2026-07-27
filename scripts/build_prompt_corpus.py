@@ -52,7 +52,14 @@ TLDR_TARBALL = "https://github.com/tldr-pages/tldr/archive/refs/heads/main.tar.g
 
 
 def normalize(text: str) -> str | None:
-    text = text.replace("\r\n", "\n").strip()
+    """Canonicalize text with the same transforms as the Rust runtime
+    (``src/model/normalize.rs``): newline normalization, tab/NBSP to space,
+    zero-width/BOM and control-character removal, space-run collapse, trim."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\t", " ").replace("\u00a0", " ")
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", text)
+    text = re.sub(r"[\x00-\x09\x0b-\x1f]", "", text)
+    text = re.sub(r" {2,}", " ", text).strip()
     if len(text.encode("utf-8", "ignore")) < MIN_BYTES:
         return None
     encoded = text.encode("utf-8", "ignore")[:MAX_BYTES]
