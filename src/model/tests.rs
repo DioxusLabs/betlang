@@ -65,11 +65,9 @@ fn detects_prompt_from_instruction() {
 }
 
 #[test]
-fn detects_natural_language_from_prose() {
-    let detection = crate::detect(
-        "The rain had been falling since dawn, and by the time Clara reached the station the platform was nearly empty. She pulled her coat tighter and watched the lights of the last train recede into the fog.",
-    );
-    assert_eq!(top_kind(&detection), Some(Kind::NaturalLanguage));
+fn detects_shell_command_from_pipeline() {
+    let detection = crate::detect("ps aux | grep node | awk '{print $2}' | xargs kill -9");
+    assert_eq!(top_kind(&detection), Some(Kind::ShellCommand));
 }
 
 #[test]
@@ -388,28 +386,28 @@ fn fixture_path(path: &str) -> std::path::PathBuf {
 
 const KIND_FIXTURES: [(Kind, &str); 12] = [
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/conversation.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/curl-jq.txt",
     ),
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/encyclopedia.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/docker-run.txt",
     ),
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/history.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/find-cleanup.txt",
     ),
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/narrative.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/git-log.txt",
     ),
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/news.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/ps-kill.txt",
     ),
     (
-        Kind::NaturalLanguage,
-        "tests/fixtures/natural_language/review.txt",
+        Kind::ShellCommand,
+        "tests/fixtures/shell_command/tar-backup.txt",
     ),
     (Kind::Prompt, "tests/fixtures/prompt/act-as.txt"),
     (Kind::Prompt, "tests/fixtures/prompt/explain.txt"),

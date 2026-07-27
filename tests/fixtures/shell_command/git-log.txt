@@ -1,0 +1,1 @@
+git log --oneline --graph --decorate --all | head -50

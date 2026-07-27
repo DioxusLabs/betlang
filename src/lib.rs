@@ -6,7 +6,7 @@ mod model;
 
 pub use kind::{Kind, ParseKindError};
 
-/// Prompt-vs-natural-language detection result.
+/// Prompt-vs-shell-command detection result.
 ///
 /// Use [`Detection::kind`] to read the top kind and [`Detection::top_kinds`]
 /// to iterate over ranked probability/kind pairs. [`Detection::kind`] returns
@@ -61,7 +61,7 @@ impl Detection {
     }
 }
 
-/// Detect whether bytes-like input is natural language or an LLM prompt.
+/// Detect whether bytes-like input is an LLM prompt or a shell command.
 ///
 /// Use [`Kind::slug`] to read the model label slug. [`Detection::kind`]
 /// returns [`None`] when the input is empty, effectively whitespace only, or too

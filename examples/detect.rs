@@ -1,5 +1,5 @@
 //! Classify a file, stdin, or — given a directory — every file under the
-//! tree as natural language or an LLM prompt, with a breakdown.
+//! tree as an LLM prompt or a shell command, with a breakdown.
 //!
 //! ```text
 //! cargo run --release --example detect -- notes.txt              # single file

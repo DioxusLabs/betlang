@@ -2,7 +2,7 @@
 
 The model shipped in `assets/magika/source-student-q4.bin` is a 45,448-byte
 weights-only MSQ1 wordseq payload trained for the fixed 2-label production
-head (`natural_language`, `prompt`). It uses the v3 word-unit tokenizer.
+head (`prompt`, `shell_command`). It uses the v3 word-unit tokenizer.
 
 Unlike the earlier source-language student, there is no Magika teacher: the
 2-class model trains from scratch on hard corpus labels.
@@ -11,7 +11,7 @@ Unlike the earlier source-language student, there is no Magika teacher: the
 
 | File | Purpose |
 |---|---|
-| `build_prompt_corpus.py` | Downloads public Hugging Face datasets and writes the labelled `natural_language` / `prompt` corpus. |
+| `build_prompt_corpus.py` | Downloads public datasets and writes the labelled `prompt` / `shell_command` corpus. |
 | `train_prompt_student.py` | Standalone trainer: caches v3 unit ids per split, trains the production architecture with hard labels + QAT, and exports the MSQ1 payload. |
 | `train_magika_qat_student.py` | Quantized layer definitions, wordseq architectures, v3 tokenizer, and the metadata-free MSQ1 exporter. Imported by the prompt trainer. |
 | `train_magika_source_student.py` | Byte-window feature extraction helpers (`magika_features`) shared with the runtime. |
@@ -37,11 +37,11 @@ accuracy.
 
 Runs on a laptop CPU in well under an hour; no GPU or teacher assets needed.
 
-1. **Corpus** — downloads Alpaca, Dolly, awesome-chatgpt-prompts (prompt
-   class) and WikiText-103, AG News, IMDB, Yelp (natural-language class),
-   writing one file per sample into deterministic 90/5/5 splits. Long prose
-   samples also contribute a random 1-2 sentence slice so sample length does
-   not become a proxy for the label:
+1. **Corpus** — downloads real user prompts (oasst1 English first turns,
+   ShareGPT first human turns, no_robots) plus instruction datasets (Alpaca,
+   Dolly, awesome-chatgpt-prompts) for the prompt class, and NL2Bash
+   one-liners plus tldr-pages example commands for the shell class, writing
+   one file per sample into deterministic 90/5/5 splits:
 
    ```bash
    python3 scripts/build_prompt_corpus.py --output /tmp/betlang-prompt-corpus
@@ -66,7 +66,7 @@ Runs on a laptop CPU in well under an hour; no GPU or teacher assets needed.
 
 Run the Rust test suite: it loads the embedded payload and checks golden
 predictions for both classes against the fixtures in
-`tests/fixtures/{natural_language,prompt}/`:
+`tests/fixtures/{prompt,shell_command}/`:
 
 ```bash
 cargo test

@@ -1,0 +1,1 @@
+find /var/log -name "*.log" -mtime +30 -exec rm {} \;

@@ -18,7 +18,7 @@ impl fmt::Display for ParseKindError {
 
 impl Error for ParseKindError {}
 
-/// Kind of text predicted by the embedded student model.
+/// Kind of input predicted by the embedded student model.
 ///
 /// Kinds parse from their model label slugs with [`str::parse`].
 ///
@@ -33,12 +33,12 @@ impl Error for ParseKindError {}
 #[repr(u8)]
 #[non_exhaustive]
 pub enum Kind {
-    /// Model label `"natural_language"`: prose that is not addressed to a
-    /// model — narrative text, articles, reviews, conversation.
-    NaturalLanguage = 0,
-    /// Model label `"prompt"`: text written to instruct a language model —
-    /// task requests, questions for an assistant, role-play setups.
-    Prompt = 1,
+    /// Model label `"prompt"`: natural-language input meant for a language
+    /// model — task requests, questions, instructions, role-play setups.
+    Prompt = 0,
+    /// Model label `"shell_command"`: input meant for a shell — commands,
+    /// pipelines, one-liners.
+    ShellCommand = 1,
 }
 
 impl Kind {
@@ -47,12 +47,12 @@ impl Kind {
     /// Model label slug for this detected kind.
     ///
     /// ```
-    /// assert_eq!(betlang::Kind::Prompt.slug(), "prompt");
+    /// assert_eq!(betlang::Kind::ShellCommand.slug(), "shell_command");
     /// ```
     pub const fn slug(self) -> &'static str {
         match self {
-            Self::NaturalLanguage => "natural_language",
             Self::Prompt => "prompt",
+            Self::ShellCommand => "shell_command",
         }
     }
 
@@ -63,8 +63,8 @@ impl Kind {
 
     pub(crate) fn from_model_index(index: usize) -> Option<Self> {
         match index {
-            0 => Some(Self::NaturalLanguage),
-            1 => Some(Self::Prompt),
+            0 => Some(Self::Prompt),
+            1 => Some(Self::ShellCommand),
             _ => None,
         }
     }
@@ -74,8 +74,8 @@ impl Kind {
 ///
 /// ```
 /// assert_eq!(
-///     "natural_language".parse::<betlang::Kind>()?,
-///     betlang::Kind::NaturalLanguage
+///     "shell_command".parse::<betlang::Kind>()?,
+///     betlang::Kind::ShellCommand
 /// );
 /// # Ok::<(), betlang::ParseKindError>(())
 /// ```
@@ -84,8 +84,8 @@ impl FromStr for Kind {
 
     fn from_str(slug: &str) -> Result<Self, Self::Err> {
         Ok(match slug {
-            "natural_language" => Self::NaturalLanguage,
             "prompt" => Self::Prompt,
+            "shell_command" => Self::ShellCommand,
             _ => return Err(ParseKindError),
         })
     }

@@ -35,8 +35,8 @@ QAT_SCALE_COUNT = 6
 FIXED_EXPORT_ARCHITECTURE = "wordseq-b1024-k3-m2048-tiny-3conv-hidden"
 FIXED_EXPORT_TOKENIZER_VERSION = 3
 FIXED_EXPORT_LABELS = [
-    "natural_language",
     "prompt",
+    "shell_command",
 ]
 FIXED_EXPORT_SLUGS = FIXED_EXPORT_LABELS
 FIXED_EXPORT_LAYER_SPECS = [

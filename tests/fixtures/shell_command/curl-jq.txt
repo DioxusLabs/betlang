@@ -1,0 +1,1 @@
+curl -s https://api.example.com/v1/status -H "Authorization: Bearer token123" | jq .data

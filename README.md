@@ -3,11 +3,11 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU detection of natural language vs LLM prompts with a tiny ~45kb model.
-Given a piece of text, betlang predicts whether it is ordinary prose
-(`natural_language`) or text written to instruct a language model (`prompt`) —
-the same kind of routing decision Warp-style tools make when deciding whether
-input should go to an AI.
+CPU detection of LLM prompts vs shell commands with a tiny ~45kb model.
+Given a line of input, betlang predicts whether it is natural language meant
+for a language model (`prompt`) or a command meant for a shell
+(`shell_command`) — the routing decision Warp makes when deciding whether
+terminal input should go to Agent Mode or be executed.
 
 ```toml
 [dependencies]
@@ -32,11 +32,10 @@ Slugs parse through the standard `FromStr` implementation:
 assert_eq!("prompt".parse::<betlang::Kind>(), Ok(betlang::Kind::Prompt));
 ```
 
-- `natural_language` — prose that is not addressed to a model: articles, news,
-  reviews, narrative and conversational text.
-- `prompt` — text written to instruct a language model: task requests,
+- `prompt` — natural-language input for a language model: task requests,
   questions for an assistant, role-play setups, instructions with pasted
   context.
+- `shell_command` — input meant for a shell: commands, pipelines, one-liners.
 
 These are the model's 2 output labels. Runtime detections expose them
 one-to-one with no label aggregation.

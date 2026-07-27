@@ -5,34 +5,34 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `acb7d673d5717698eae4a385ef8d8e6ba2cd735d9edfe0ca99be6731ebaade17`
+- SHA-256: `5c7a689935398887f7e76b23de18e9c84128e6c4d600136429625bf893c1d373`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
-  (`natural_language`, `prompt`)
+  (`prompt`, `shell_command`)
 
 ## Intended Use
 
-Betlang is intended for fast routing of text input: deciding whether a piece
-of text is ordinary prose or a prompt written for a language model, in the
-style of Warp's natural-language input detection. It is suitable as a
-best-effort content classifier for routing input to an AI assistant. It is not
-intended for security decisions, content moderation, or any use where a
-misclassification is costly.
+Betlang is intended for fast routing of terminal-style input: deciding
+whether input is a natural-language prompt for a language model or a shell
+command, in the style of Warp's Agent Mode auto-detection. It is suitable as
+a best-effort classifier for routing input to an AI assistant vs a shell. It
+is not intended for security decisions, command validation, or any use where
+a misclassification is costly.
 
 ## Training Source
 
 The model is trained from scratch with hard labels on a corpus assembled by
 `scripts/build_prompt_corpus.py` from public Hugging Face datasets:
 
-- `prompt`: instructions from `tatsu-lab/alpaca` (with and without their task
-  input blocks), `databricks/databricks-dolly-15k` (instruction-only plus a
-  subset with pasted context), and the `fka/awesome-chatgpt-prompts` persona
-  prompts.
-- `natural_language`: paragraphs from WikiText-103, AG News headlines and
-  summaries, and IMDB and Yelp reviews. Long prose samples also contribute a
-  random 1-2 sentence slice so the class covers short texts and the model
-  cannot use length as a proxy for the label.
+- `prompt`: real user prompts from `OpenAssistant/oasst1` (English first
+  turns), ShareGPT first human turns (`RyokoAI/ShareGPT52K`), and
+  `HuggingFaceH4/no_robots`, plus instruction-style prompts from
+  `tatsu-lab/alpaca`, `databricks/databricks-dolly-15k`, and the
+  `fka/awesome-chatgpt-prompts` personas.
+- `shell_command`: real bash one-liners from the NL2Bash corpus
+  (TellinaTool/nl2bash) and example commands from tldr-pages with
+  `{{placeholder}}` markers flattened.
 
 There is no teacher model: unlike the earlier source-language student, the
 2-class head trains directly on corpus labels with label smoothing.
@@ -40,19 +40,20 @@ There is no teacher model: unlike the earlier source-language student, the
 ## Evaluation
 
 Held-out test split of the training corpus (5% of samples, disjoint from
-train/valid; 105k samples total). Metrics are printed by
+train/valid; ~148k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.983271`
-- `natural_language` recall `0.976090`
-- `prompt` recall `0.995040`
+- `test_accuracy=0.992114`
+- `prompt` recall `0.988925`
+- `shell_command` recall `0.994816`
 
 ## Limitations
 
-- Prompts are themselves natural language; the boundary is stylistic. Polite
-  imperative prose (recipes, how-to steps) can read as a prompt, and prompts
-  phrased as plain narrative can read as prose.
-- The corpus is English-heavy; other languages are underrepresented.
+- The boundary is fuzzy for one-word inputs and command names used in prose;
+  Warp pairs a similar classifier with keyword allowlists, shell-history
+  matching, and completion-engine heuristics for this reason.
+- The corpus is English- and bash-heavy; other languages and exotic shells
+  are underrepresented.
 - Inputs shorter than 8 non-whitespace bytes return no prediction.
 
 ## Quantization
