@@ -41,8 +41,10 @@ Runs on a laptop CPU in well under an hour; no GPU or teacher assets needed.
    ShareGPT first human turns, no_robots, Stack Overflow titles) plus
    instruction datasets (Alpaca, Dolly, awesome-chatgpt-prompts) for the
    prompt class, and NL2Bash one-liners, tldr-pages example commands, and
-   synthetic quoted-English hard negatives for the shell class, writing one
-   file per sample into deterministic 90/5/5 splits:
+   synthetic quoted-English hard negatives for the shell class (English
+   tldr pages only), writing one
+   file per sample into deterministic, leakage-aware 90/5/5 splits (split
+   assignment hashes a near-duplicate group key, not the raw text):
 
    ```bash
    python3 scripts/build_prompt_corpus.py --output /tmp/betlang-prompt-corpus

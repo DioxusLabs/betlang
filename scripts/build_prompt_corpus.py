@@ -18,8 +18,13 @@ Labels:
   ``echo "..."``, ``grep -r "..."``) so quoted prose does not flip the
   label.
 
-Within each label samples are deduplicated by content hash. Splits use a
-deterministic seed so rebuilds are reproducible.
+Within each label samples are deduplicated by content hash. Split assignment
+is leakage-aware: every sample is assigned to train/valid/test by hashing a
+group key rather than the raw text, so near-duplicates land in the same
+split. Prompts group by case/punctuation-normalized text, shell commands by
+their command template (quoted strings, numbers, and paths collapsed), and
+each synthetic hard negative follows the split of the prompt its phrase came
+from. Only English tldr pages are used. Rebuilds are deterministic.
 """
 
 from __future__ import annotations
@@ -52,14 +57,38 @@ def normalize(text: str) -> str | None:
     return encoded.decode("utf-8", "ignore").strip()
 
 
-def assign_split(rng: random.Random) -> str:
-    return rng.choices(SPLITS, weights=SPLIT_WEIGHTS, k=1)[0]
+def split_for_key(key: str) -> str:
+    """Deterministic split from a group key: near-duplicates share a key and
+    therefore always land in the same split."""
+    fraction = int(hashlib.sha256(key.encode("utf-8")).hexdigest()[:8], 16) / 0x1_0000_0000
+    bound = 0.0
+    for split, weight in zip(SPLITS, SPLIT_WEIGHTS):
+        bound += weight
+        if fraction < bound:
+            return split
+    return SPLITS[-1]
 
 
-def write_samples(output: Path, label: str, source: str, texts: list[str], rng: random.Random) -> int:
+def prompt_group_key(text: str) -> str:
+    """Group prompts by case/whitespace/punctuation-normalized text so
+    trivial variants share a split."""
+    return re.sub(r"[^a-z0-9 ]", "", " ".join(text.lower().split()))
+
+
+def shell_group_key(command: str) -> str:
+    """Group shell commands by their template: quoted strings, numbers, and
+    path-like tokens are collapsed so variants of one command share a split."""
+    template = re.sub(r"\"[^\"]*\"|'[^']*'", "S", command.lower())
+    template = re.sub(r"\S*/\S*", "P", template)
+    template = re.sub(r"\d+", "N", template)
+    return " ".join(template.split())
+
+
+def write_samples(output: Path, label: str, source: str, samples: list[tuple[str, str]]) -> int:
+    """Write deduplicated ``(text, split)`` samples for one label."""
     seen: set[str] = set()
     written = 0
-    for text in texts:
+    for text, split in samples:
         normalized = normalize(text)
         if normalized is None:
             continue
@@ -67,7 +96,6 @@ def write_samples(output: Path, label: str, source: str, texts: list[str], rng: 
         if digest in seen:
             continue
         seen.add(digest)
-        split = assign_split(rng)
         path = output / "files" / split / label / f"{source}-{digest[:16]}.txt"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(normalized, encoding="utf-8")
@@ -165,14 +193,21 @@ QUOTED_ARG_TEMPLATES = (
 )
 
 
-def quoted_arg_commands(phrases: list[str], rng: random.Random, limit: int) -> list[str]:
-    """Hard negatives: shell commands whose quoted argument is English prose."""
-    commands: list[str] = []
+def quoted_arg_commands(
+    phrases: list[str], rng: random.Random, limit: int
+) -> list[tuple[str, str]]:
+    """Hard negatives: shell commands whose quoted argument is English prose.
+
+    Each command inherits the split of the prompt its phrase came from, so
+    no phrase text crosses split boundaries.
+    """
+    commands: list[tuple[str, str]] = []
     for phrase in phrases:
         phrase = " ".join(phrase.split())
         if not (16 <= len(phrase) <= 90) or '"' in phrase or "\\" in phrase:
             continue
-        commands.append(rng.choice(QUOTED_ARG_TEMPLATES).format(phrase))
+        command = rng.choice(QUOTED_ARG_TEMPLATES).format(phrase)
+        commands.append((command, split_for_key(prompt_group_key(phrase))))
         if len(commands) >= limit:
             break
     return commands
@@ -191,7 +226,7 @@ def tldr_commands(pages_dir: Path) -> list[str]:
     are stripped so the command reads like real input.
     """
     commands: list[str] = []
-    for page in pages_dir.glob("pages*/**/*.md"):
+    for page in pages_dir.glob("**/pages/**/*.md"):
         for line in page.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = line.strip()
             if not (line.startswith("`") and line.endswith("`")):
@@ -223,7 +258,12 @@ def main() -> None:
         args.sharegpt_limit,
         args.stackoverflow_limit,
     )
-    prompt_count = write_samples(args.output, "prompt", "prompt", prompts, rng)
+    prompt_count = write_samples(
+        args.output,
+        "prompt",
+        "prompt",
+        [(text, split_for_key(prompt_group_key(text))) for text in prompts],
+    )
 
     shell: list[str] = nl2bash_commands()
     if args.tldr_dir is None:
@@ -240,11 +280,13 @@ def main() -> None:
     else:
         shell.extend(tldr_commands(args.tldr_dir))
 
+    shell_samples = [(command, split_for_key(shell_group_key(command))) for command in shell]
+
     hard_negative_source = list(prompts)
     rng.shuffle(hard_negative_source)
-    shell.extend(quoted_arg_commands(hard_negative_source, rng, args.quoted_arg_limit))
+    shell_samples.extend(quoted_arg_commands(hard_negative_source, rng, args.quoted_arg_limit))
 
-    shell_count = write_samples(args.output, "shell_command", "shell", shell, rng)
+    shell_count = write_samples(args.output, "shell_command", "shell", shell_samples)
 
     print(json.dumps({"prompt": prompt_count, "shell_command": shell_count}))
 

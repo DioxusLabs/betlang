@@ -5,7 +5,7 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `26bf4d5193e910b176b8298f99db66c1d7d1d705667b2f29c5622f2a07a3d8b9`
+- SHA-256: `aac486a486b290b6b7e4e183e51a4b9765a6ae0f7edeebb32fd3aad6325fe748`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
@@ -32,10 +32,16 @@ The model is trained from scratch with hard labels on a corpus assembled by
   prompts from `tatsu-lab/alpaca`, `databricks/databricks-dolly-15k`, and
   the `fka/awesome-chatgpt-prompts` personas.
 - `shell_command`: real bash one-liners from the NL2Bash corpus
-  (TellinaTool/nl2bash), example commands from tldr-pages with
+  (TellinaTool/nl2bash), example commands from English tldr-pages with
   `{{placeholder}}` markers flattened, and synthetic hard negatives that
   embed English phrases inside quoted command arguments
   (`git commit -m "..."`, `echo "..."`, `grep -r "..."`).
+
+Split assignment is leakage-aware: samples are assigned to train/valid/test
+by hashing a group key (normalized prompt text; shell command template with
+quoted strings, numbers, and paths collapsed), so near-duplicate variants
+never straddle splits, and each synthetic hard negative follows the split of
+the prompt its phrase came from.
 
 There is no teacher model: unlike the earlier source-language student, the
 2-class head trains directly on corpus labels with label smoothing.
@@ -43,12 +49,17 @@ There is no teacher model: unlike the earlier source-language student, the
 ## Evaluation
 
 Held-out test split of the training corpus (5% of samples, disjoint from
-train/valid; ~193k samples total). Metrics are printed by
+train/valid; ~153k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.991941`
-- `prompt` recall `0.990270`
-- `shell_command` recall `0.993679`
+- `test_accuracy=0.990169`
+- `prompt` recall `0.991324`
+- `shell_command` recall `0.988164`
+
+For reference, Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
+`warpdotdev/Warp` `crates/input_classifier`) scores 95.7% on the same test
+split — though that set is in-distribution for betlang, and Warp runs
+heuristics before its model in production.
 
 ## Limitations
 
