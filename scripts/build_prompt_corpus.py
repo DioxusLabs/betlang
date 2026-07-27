@@ -8,11 +8,15 @@ Labels:
 
 - ``prompt``: text a user would send to an AI assistant. Real user prompts
   from OpenAssistant (oasst1 first turns), ShareGPT first human turns, and
-  HuggingFaceH4/no_robots, plus instruction-style prompts from Alpaca, Dolly,
-  and the awesome-chatgpt-prompts personas.
+  HuggingFaceH4/no_robots, developer questions from Stack Overflow titles,
+  plus instruction-style prompts from Alpaca, Dolly, and the
+  awesome-chatgpt-prompts personas.
 - ``shell_command``: real shell one-liners from the NL2Bash corpus and
   example commands from tldr-pages (placeholders like ``{{path}}`` are
-  flattened to ``path``).
+  flattened to ``path``), plus synthetic hard negatives that embed English
+  phrases inside quoted command arguments (``git commit -m "..."``,
+  ``echo "..."``, ``grep -r "..."``) so quoted prose does not flip the
+  label.
 
 Within each label samples are deduplicated by content hash. Splits use a
 deterministic seed so rebuilds are reproducible.
@@ -71,8 +75,25 @@ def write_samples(output: Path, label: str, source: str, texts: list[str], rng: 
     return written
 
 
-def prompt_texts(limit_alpaca: int, limit_dolly: int, limit_oasst: int, limit_sharegpt: int) -> list[str]:
+def prompt_texts(
+    limit_alpaca: int,
+    limit_dolly: int,
+    limit_oasst: int,
+    limit_sharegpt: int,
+    limit_stackoverflow: int,
+) -> list[str]:
     texts: list[str] = []
+
+    stackoverflow = load_dataset("pacovaldez/stackoverflow-questions", split="train", streaming=True)
+    count = 0
+    for row in stackoverflow:
+        title = row["title"].strip()
+        if len(title) < 16:
+            continue
+        texts.append(title)
+        count += 1
+        if count >= limit_stackoverflow:
+            break
 
     no_robots = load_dataset("HuggingFaceH4/no_robots", split="train")
     texts.extend(row["prompt"] for row in no_robots)
@@ -128,6 +149,35 @@ def prompt_texts(limit_alpaca: int, limit_dolly: int, limit_oasst: int, limit_sh
     return texts
 
 
+QUOTED_ARG_TEMPLATES = (
+    'git commit -m "{}"',
+    'git commit --amend -m "{}"',
+    'echo "{}"',
+    'echo "{}" >> notes.txt',
+    'grep -r "{}" .',
+    'grep -in "{}" src/main.rs',
+    'rg "{}" --type py',
+    'notify-send "{}"',
+    'curl -X POST https://api.example.com/messages -d \'{{"text": "{}"}}\'',
+    'osascript -e \'display notification "{}"\'',
+    'sed -i "s/TODO/{}/" README.md',
+    'gh pr create --title "{}"',
+)
+
+
+def quoted_arg_commands(phrases: list[str], rng: random.Random, limit: int) -> list[str]:
+    """Hard negatives: shell commands whose quoted argument is English prose."""
+    commands: list[str] = []
+    for phrase in phrases:
+        phrase = " ".join(phrase.split())
+        if not (16 <= len(phrase) <= 90) or '"' in phrase or "\\" in phrase:
+            continue
+        commands.append(rng.choice(QUOTED_ARG_TEMPLATES).format(phrase))
+        if len(commands) >= limit:
+            break
+    return commands
+
+
 def nl2bash_commands() -> list[str]:
     with urllib.request.urlopen(NL2BASH_URL) as response:
         body = response.read().decode("utf-8", "ignore")
@@ -160,17 +210,20 @@ def main() -> None:
     parser.add_argument("--dolly-limit", type=int, default=15_000)
     parser.add_argument("--oasst-limit", type=int, default=12_000)
     parser.add_argument("--sharegpt-limit", type=int, default=20_000)
+    parser.add_argument("--stackoverflow-limit", type=int, default=30_000)
+    parser.add_argument("--quoted-arg-limit", type=int, default=15_000)
     args = parser.parse_args()
 
     rng = random.Random(SEED)
 
-    prompt_count = write_samples(
-        args.output,
-        "prompt",
-        "prompt",
-        prompt_texts(args.alpaca_limit, args.dolly_limit, args.oasst_limit, args.sharegpt_limit),
-        rng,
+    prompts = prompt_texts(
+        args.alpaca_limit,
+        args.dolly_limit,
+        args.oasst_limit,
+        args.sharegpt_limit,
+        args.stackoverflow_limit,
     )
+    prompt_count = write_samples(args.output, "prompt", "prompt", prompts, rng)
 
     shell: list[str] = nl2bash_commands()
     if args.tldr_dir is None:
@@ -186,6 +239,10 @@ def main() -> None:
             shell.extend(tldr_commands(Path(tmp)))
     else:
         shell.extend(tldr_commands(args.tldr_dir))
+
+    hard_negative_source = list(prompts)
+    rng.shuffle(hard_negative_source)
+    shell.extend(quoted_arg_commands(hard_negative_source, rng, args.quoted_arg_limit))
 
     shell_count = write_samples(args.output, "shell_command", "shell", shell, rng)
 

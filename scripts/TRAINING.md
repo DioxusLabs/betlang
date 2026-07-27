@@ -26,7 +26,7 @@ length_buckets: yes (batches sorted by unit length, trimmed per batch)
 classes:        fixed 2-label production head
 loss:           softmax cross-entropy, label_smoothing 0.05
 LR:             cosine 8e-4 -> 5%, AdamW grad-clip 1.0
-epochs:         20, qat_start_epoch=10
+epochs:         24, qat_start_epoch=12
 seed:           2
 ```
 
@@ -38,10 +38,11 @@ accuracy.
 Runs on a laptop CPU in well under an hour; no GPU or teacher assets needed.
 
 1. **Corpus** — downloads real user prompts (oasst1 English first turns,
-   ShareGPT first human turns, no_robots) plus instruction datasets (Alpaca,
-   Dolly, awesome-chatgpt-prompts) for the prompt class, and NL2Bash
-   one-liners plus tldr-pages example commands for the shell class, writing
-   one file per sample into deterministic 90/5/5 splits:
+   ShareGPT first human turns, no_robots, Stack Overflow titles) plus
+   instruction datasets (Alpaca, Dolly, awesome-chatgpt-prompts) for the
+   prompt class, and NL2Bash one-liners, tldr-pages example commands, and
+   synthetic quoted-English hard negatives for the shell class, writing one
+   file per sample into deterministic 90/5/5 splits:
 
    ```bash
    python3 scripts/build_prompt_corpus.py --output /tmp/betlang-prompt-corpus
