@@ -1,6 +1,6 @@
 fn main() {
-    let detection = betlang::detect("fn main() { println!(\"hi\"); }\n");
-    let language = detection.language().expect("language prediction");
+    let detection = betlang::detect("Write a short poem about the ocean.");
+    let kind = detection.kind().expect("kind prediction");
 
-    println!("{}", language.slug());
+    println!("{}", kind.slug());
 }

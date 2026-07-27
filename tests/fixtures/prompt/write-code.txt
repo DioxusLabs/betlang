@@ -1,0 +1,1 @@
+Write a Python function that takes a list of integers and returns a new list containing only the even numbers, sorted in descending order. Include a short docstring and a couple of usage examples.

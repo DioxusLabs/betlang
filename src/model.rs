@@ -3,7 +3,7 @@
 //! Loads `assets/magika/source-student-q4.bin` (weights-only MSQ1 export) and
 //! runs a forward pass: byte-window tokenization -> word-unit tokenization
 //! -> HashEmbedding lookup (K=3) -> 3 conv stages with max-pool -> global
-//! max+avg pool -> 2 dense layers -> 48-class softmax logits.
+//! max+avg pool -> 2 dense layers -> 2-class softmax logits.
 //!
 //! Model architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 //! - 1024-bin x 24-dim shared HashEmbedding table (4-bit, ~12 KB)
@@ -14,7 +14,7 @@
 //! - QConv1D k=3 128->128ch (2-bit)
 //! - GlobalMax + GlobalAvg -> 256-dim
 //! - QDense 256->96 (2-bit) + GELU
-//! - QDense 96->48 (4-bit)
+//! - QDense 96->2 (4-bit)
 
 mod activation;
 mod constants;
@@ -28,7 +28,7 @@ mod tokenizer;
 mod window;
 
 use self::{constants::CLASSES, runtime::Model, window::build_window};
-use crate::{Detection, Language};
+use crate::{Detection, Kind};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
     let Some(window) = build_window(source) else {
@@ -55,12 +55,12 @@ fn detection_from_logits(logits: &[f32; CLASSES]) -> Detection {
         return Detection::from_predictions(Vec::new());
     }
 
-    debug_assert_eq!(CLASSES, Language::MODEL_LABEL_COUNT);
+    debug_assert_eq!(CLASSES, Kind::MODEL_LABEL_COUNT);
     let mut predictions = Vec::with_capacity(logits.len());
     for (index, &logit) in logits.iter().enumerate() {
-        let language = Language::from_model_index(index).expect("model label index");
+        let kind = Kind::from_model_index(index).expect("model label index");
         let probability = (logit - max).exp() / denominator;
-        predictions.push((probability, language));
+        predictions.push((probability, kind));
     }
 
     predictions.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.slug().cmp(b.1.slug())));

@@ -35,54 +35,8 @@ QAT_SCALE_COUNT = 6
 FIXED_EXPORT_ARCHITECTURE = "wordseq-b1024-k3-m2048-tiny-3conv-hidden"
 FIXED_EXPORT_TOKENIZER_VERSION = 3
 FIXED_EXPORT_LABELS = [
-    "asm",
-    "batch",
-    "c",
-    "clojure",
-    "cmake",
-    "cobol",
-    "cpp",
-    "cs",
-    "css",
-    "dart",
-    "dockerfile",
-    "elixir",
-    "erlang",
-    "gemfile",
-    "gemspec",
-    "go",
-    "gradle",
-    "groovy",
-    "haskell",
-    "html",
-    "ini",
-    "java",
-    "javascript",
-    "json",
-    "julia",
-    "kotlin",
-    "lisp",
-    "lua",
-    "markdown",
-    "objectivec",
-    "ocaml",
-    "perl",
-    "php",
-    "powershell",
-    "python",
-    "r",
-    "ruby",
-    "rust",
-    "scala",
-    "shell",
-    "sql",
-    "swift",
-    "toml",
-    "typescript",
-    "vba",
-    "verilog",
-    "xml",
-    "yaml",
+    "natural_language",
+    "prompt",
 ]
 FIXED_EXPORT_SLUGS = FIXED_EXPORT_LABELS
 FIXED_EXPORT_LAYER_SPECS = [
@@ -91,7 +45,7 @@ FIXED_EXPORT_LAYER_SPECS = [
     ("q_conv_1", [("kernel", [5, 64, 128], "ternary", 2, 10240)], [("bias", [128], 512)]),
     ("q_conv_2", [("kernel", [3, 128, 128], "ternary", 2, 12288)], [("bias", [128], 512)]),
     ("q_dense_0", [("kernel", [256, 96], "ternary", 2, 6144)], [("bias", [96], 384)]),
-    ("q_output", [("kernel", [96, 48], "int4", 4, 2304)], [("bias", [48], 192)]),
+    ("q_output", [("kernel", [96, 2], "int4", 4, 96)], [("bias", [2], 8)]),
 ]
 
 
@@ -5005,7 +4959,7 @@ def export_model(
     if tokenizer_version != FIXED_EXPORT_TOKENIZER_VERSION:
         raise ValueError(f"metadata-free MSQ1 export requires tokenizer v{FIXED_EXPORT_TOKENIZER_VERSION}")
     if labels != FIXED_EXPORT_LABELS:
-        raise ValueError("metadata-free MSQ1 export requires the fixed 48-label production head")
+        raise ValueError("metadata-free MSQ1 export requires the fixed 2-label production head")
     if slugs != FIXED_EXPORT_SLUGS:
         raise ValueError("metadata-free MSQ1 export requires the fixed production slug mapping")
 

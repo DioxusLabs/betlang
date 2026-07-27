@@ -3,15 +3,12 @@ use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, 
 const MAGIKA_BLOCK_SIZE: usize = 4_096;
 
 fn bench_detect(c: &mut Criterion) {
-    let short = include_str!("../snippets/demo.rs");
+    let short = include_str!("../snippets/demo-prompt.txt");
     let full = full_window_source(short);
 
     let mut group = c.benchmark_group("detect");
     for (name, source) in [("short", short), ("full_window", full.as_str())] {
-        assert_eq!(
-            betlang::detect(source).language(),
-            Some(betlang::Language::Rust)
-        );
+        assert_eq!(betlang::detect(source).kind(), Some(betlang::Kind::Prompt));
         group.throughput(Throughput::BytesDecimal(source.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), source, |b, source| {
             b.iter(|| black_box(betlang::detect(black_box(source))));

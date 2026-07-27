@@ -3,7 +3,11 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU source-language detection for code with a tiny 50kb model. Try it in browser [here](https://dioxuslabs.github.io/dioxus-code/#playground)
+CPU detection of natural language vs LLM prompts with a tiny ~45kb model.
+Given a piece of text, betlang predicts whether it is ordinary prose
+(`natural_language`) or text written to instruct a language model (`prompt`) —
+the same kind of routing decision Warp-style tools make when deciding whether
+input should go to an AI.
 
 ```toml
 [dependencies]
@@ -11,52 +15,40 @@ betlang = "0.1.1"
 ```
 
 ```rust
-let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+let detection = betlang::detect("Write a short poem about the ocean.");
 
-assert_eq!(detection.language(), Some(betlang::Language::Rust));
+assert_eq!(detection.kind(), Some(betlang::Kind::Prompt));
 ```
 
-Use `betlang::detect(source)` for UTF-8 source strings or byte slices. It
-returns a `Detection`; call `Detection::language()` to read the top language.
-Call `Detection::top_languages()` when you need ranked probabilities.
+Use `betlang::detect(source)` for UTF-8 strings or byte slices. It returns a
+`Detection`; call `Detection::kind()` to read the top kind. Call
+`Detection::top_kinds()` when you need ranked probabilities.
 
-## Supported Languages
+## Kinds
 
 Slugs parse through the standard `FromStr` implementation:
 
 ```rust
-assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
+assert_eq!("prompt".parse::<betlang::Kind>(), Ok(betlang::Kind::Prompt));
 ```
 
-`asm`, `batch`, `c`, `clojure`, `cmake`, `cobol`, `cpp`, `cs`, `css`, `dart`,
-`dockerfile`, `elixir`, `erlang`, `gemfile`, `gemspec`, `go`, `gradle`,
-`groovy`, `haskell`, `html`, `ini`, `java`, `javascript`, `json`, `julia`,
-`kotlin`, `lisp`, `lua`, `markdown`, `objectivec`, `ocaml`, `perl`, `php`,
-`powershell`, `python`, `r`, `ruby`, `rust`, `scala`, `shell`, `sql`, `swift`,
-`toml`, `typescript`, `vba`, `verilog`, `xml`, `yaml`.
+- `natural_language` — prose that is not addressed to a model: articles, news,
+  reviews, narrative and conversational text.
+- `prompt` — text written to instruct a language model: task requests,
+  questions for an assistant, role-play setups, instructions with pasted
+  context.
 
-These are the model's 48 output labels. Runtime detections expose them
+These are the model's 2 output labels. Runtime detections expose them
 one-to-one with no label aggregation.
-
-The confusion matrix uses the same labels:
-
-![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-overall.png)
 
 ## Model
 
-The embedded model is `assets/magika/source-student-q4.bin`, a 47,840-byte
-weights-only MSQ1 payload with SHA-256:
-
-```text
-8493d2d3757572c8661141e414b1c0755aa08d4c4e5382dfbbc6b73b02d89083
-```
+The embedded model is `assets/magika/source-student-q4.bin`, a 45,448-byte
+weights-only MSQ1 payload.
 
 Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`, tokenizer version 3.
-On the held-out filesystem-label test split it reaches
-`test_fs_accuracy=0.942353` with `macro_recall=0.939690`. Probabilities are
-calibrated: ambiguous inputs report split scores instead of a confident label.
-
-See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
+See [MODEL_CARD.md](MODEL_CARD.md) for the exact hash, training recipe, and
+evaluation summary, and `scripts/TRAINING.md` for how to reproduce it.
 
 ## Performance
 
@@ -70,15 +62,7 @@ are available through `cargo bench`. Current baseline numbers are tracked in
 
 ## License And Attribution
 
-Betlang is licensed under MIT. The embedded student model was trained from
-outputs of Google's Magika teacher model; Magika is published by Google under
-Apache-2.0. Keep this attribution with redistributed model artifacts.
-
-## Confusion By File Size
-
-The shipped wordseq model is evaluated below on the held-out test split. Each
-panel is a row-normalized confusion matrix for one file-size bucket: actual
-labels are rows, predicted labels are columns, and the diagonal is correct
-classification.
-
-![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-by-size.png)
+Betlang is licensed under MIT. The model architecture and quantized runtime
+descend from a student of Google's Magika teacher model; Magika is published
+by Google under Apache-2.0. Keep this attribution with redistributed model
+artifacts.

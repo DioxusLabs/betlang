@@ -20,7 +20,7 @@ pub(crate) const CONV2_KERNEL: usize = 3;
 pub(crate) const CONV2: usize = 128;
 pub(crate) const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 pub(crate) const DENSE: usize = 96;
-pub(crate) const CLASSES: usize = 48;
+pub(crate) const CLASSES: usize = 2;
 
 const EMBED_SCRATCH: usize = MAX_UNITS * EMBED;
 const POOL0_SCRATCH: usize = (MAX_UNITS / CONV0_POOL) * CONV0;

@@ -1,77 +1,77 @@
 #![warn(missing_docs)]
 #![doc = include_str!("../README.md")]
 
-mod language;
+mod kind;
 mod model;
 
-pub use language::{Language, ParseLanguageError};
+pub use kind::{Kind, ParseKindError};
 
-/// Source-language detection result.
+/// Prompt-vs-natural-language detection result.
 ///
-/// Use [`Detection::language`] to read the top language and
-/// [`Detection::top_languages`] to iterate over ranked probability/language
-/// pairs. [`Detection::language`] returns [`None`] when the input is empty,
-/// effectively whitespace only, or too short to build the model window.
+/// Use [`Detection::kind`] to read the top kind and [`Detection::top_kinds`]
+/// to iterate over ranked probability/kind pairs. [`Detection::kind`] returns
+/// [`None`] when the input is empty, effectively whitespace only, or too
+/// short to build the model window.
 ///
 /// ```
-/// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+/// let detection = betlang::detect("Write a short poem about the ocean.");
 ///
-/// assert_eq!(detection.language(), Some(betlang::Language::Rust));
+/// assert_eq!(detection.kind(), Some(betlang::Kind::Prompt));
 /// ```
 #[derive(Debug)]
 pub struct Detection {
-    predictions: Vec<(f32, Language)>,
+    predictions: Vec<(f32, Kind)>,
 }
 
 impl Detection {
-    /// Return the most likely detected language.
+    /// Return the most likely detected kind.
     ///
     /// Returns [`None`] when the input is empty, effectively whitespace only, or
     /// too short to build the model window.
     ///
     /// ```
-    /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+    /// let detection = betlang::detect("Write a short poem about the ocean.");
     ///
-    /// assert_eq!(detection.language(), Some(betlang::Language::Rust));
+    /// assert_eq!(detection.kind(), Some(betlang::Kind::Prompt));
     /// ```
-    pub fn language(&self) -> Option<Language> {
-        self.predictions.first().map(|(_, language)| *language)
+    pub fn kind(&self) -> Option<Kind> {
+        self.predictions.first().map(|(_, kind)| *kind)
     }
 
-    /// Return detected languages sorted from most likely to least likely.
+    /// Return detected kinds sorted from most likely to least likely.
     ///
-    /// The iterator yields `(probability, language)` pairs, one per model
-    /// output language.
+    /// The iterator yields `(probability, kind)` pairs, one per model output
+    /// kind.
     ///
     /// ```
-    /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
-    /// let Some((probability, language)) = detection.top_languages().next() else {
-    ///     panic!("expected a language prediction");
+    /// let detection = betlang::detect("Write a short poem about the ocean.");
+    /// let Some((probability, kind)) = detection.top_kinds().next() else {
+    ///     panic!("expected a kind prediction");
     /// };
     ///
-    /// assert_eq!(language, betlang::Language::Rust);
+    /// assert_eq!(kind, betlang::Kind::Prompt);
     /// assert!(probability > 0.0);
     /// ```
-    pub fn top_languages(&self) -> impl Iterator<Item = (f32, Language)> + '_ {
+    pub fn top_kinds(&self) -> impl Iterator<Item = (f32, Kind)> + '_ {
         self.predictions.iter().copied()
     }
 
-    pub(crate) fn from_predictions(predictions: Vec<(f32, Language)>) -> Self {
+    pub(crate) fn from_predictions(predictions: Vec<(f32, Kind)>) -> Self {
         Self { predictions }
     }
 }
 
-/// Detect the source language for bytes-like input.
+/// Detect whether bytes-like input is natural language or an LLM prompt.
 ///
-/// Use [`Language::slug`] to read the model label slug. [`Detection::language`]
+/// Use [`Kind::slug`] to read the model label slug. [`Detection::kind`]
 /// returns [`None`] when the input is empty, effectively whitespace only, or too
 /// short to build the model window. The input may be a UTF-8 string, raw byte
 /// slice, or another type that can be borrowed as bytes.
 ///
 /// ```
-/// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+/// let detection = betlang::detect("Write a short poem about the ocean.");
 ///
-/// assert_eq!(detection.language(), Some(betlang::Language::Rust));
+/// assert_eq!(detection.kind(), Some(betlang::Kind::Prompt));
 /// ```
 pub fn detect(source: impl AsRef<[u8]>) -> Detection {
     model::detect(source.as_ref())

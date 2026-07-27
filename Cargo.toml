@@ -4,12 +4,12 @@ version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "Tiny source-language detection for code."
+description = "Tiny natural-language vs LLM-prompt detection for text."
 readme = "README.md"
 repository = "https://github.com/ealmloff/betlang"
 homepage = "https://github.com/ealmloff/betlang"
 documentation = "https://docs.rs/betlang"
-keywords = ["language", "detection", "code", "magika"]
+keywords = ["prompt", "detection", "nlp", "classifier"]
 categories = ["development-tools", "text-processing"]
 include = [
     "/Cargo.lock",
@@ -19,12 +19,10 @@ include = [
     "/MODEL_CARD.md",
     "/README.md",
     "/RELEASING.md",
-    "/assets/confusion-by-size.png",
-    "/assets/confusion-overall.png",
     "/assets/magika/source-student-q4.bin",
     "/benches/detect.rs",
     "/examples/*.rs",
-    "/snippets/demo.rs",
+    "/snippets/demo-prompt.txt",
     "/src/**",
     "/tests/**",
 ]

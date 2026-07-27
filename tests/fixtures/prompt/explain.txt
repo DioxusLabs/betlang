@@ -1,0 +1,1 @@
+Explain the difference between supervised and unsupervised machine learning to a complete beginner. Use simple analogies and keep the explanation under 200 words.
