@@ -5,7 +5,7 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `c1c42a31761c0f38f3e67c7a2b319bd852830fcd3c8d8299261f86376ad9f83f`
+- SHA-256: `540e2e0e79021cb57a2efb7ff19a10da86d70192f3b0d0857bb78685ed50f434`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
@@ -37,8 +37,10 @@ The model is trained from scratch with hard labels on a corpus assembled by
   (TellinaTool/nl2bash), example commands from English tldr-pages with
   `{{placeholder}}` markers flattened, bash tool calls mined from agent
   RL/SFT trajectories (`SWE-bench/SWE-smith-trajectories`), real user shell
-  history (`spignelon/bash_history`), NL2SH-ALFA training commands, and
-  synthetic hard negatives that
+  history (`spignelon/bash_history`), NL2SH-ALFA training commands, command
+  lines mined from real GitHub shell scripts (`bigcode/the-stack-smol-xl`,
+  with one in ten repositories held out for the OOD benchmark and never
+  trained on), and synthetic hard negatives that
   embed English phrases inside quoted command arguments
   (`git commit -m "..."`, `echo "..."`, `grep -r "..."`).
 
@@ -59,21 +61,23 @@ There is no teacher model: unlike the earlier source-language student, the
 ## Evaluation
 
 Held-out test split of the training corpus (5% of samples, disjoint from
-train/valid; ~288k samples total). Metrics are printed by
+train/valid; ~348k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.990885`
-- `prompt` recall `0.993067`
-- `shell_command` recall `0.988423`
+- `test_accuracy=0.988323`
+- `prompt` recall `0.986550`
+- `shell_command` recall `0.989819`
 
-`scripts/ood_benchmark.py` builds a ~4.2k-sample out-of-distribution
+`scripts/ood_benchmark.py` builds a ~7.1k-sample out-of-distribution
 benchmark from held-out sources (HelpSteer2 and hh-rlhf prompts, NL2SH-ALFA
-test pairs, InterCode-Corrections commands, unseen bash history), excluding
-exact matches and train-template overlaps. On it the shipped artifact
-scores 99.3% (prompt recall 0.993, shell recall 1.000) vs 99.1% for Warp's
-public `bert_tiny_v3.onnx` classifier (17.6 MB, from `warpdotdev/Warp`
-`crates/input_classifier`), at ~390x smaller size. Warp additionally runs
-heuristics before its model in production.
+test pairs, InterCode-Corrections commands, unseen bash history, and
+command lines from GitHub shell-script repositories reserved for the
+benchmark and never trained on), excluding exact matches and
+train-template overlaps. On it the shipped artifact scores 98.7% overall
+(prompt recall 0.987, shell recall 0.986) vs 97.3% for Warp's public
+`bert_tiny_v3.onnx` classifier (17.6 MB, from `warpdotdev/Warp`
+`crates/input_classifier`; prompt 0.991, shell 0.954), at ~390x smaller
+size. Warp additionally runs heuristics before its model in production.
 
 ## Limitations
 

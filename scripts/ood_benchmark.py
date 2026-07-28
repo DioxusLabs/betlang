@@ -7,7 +7,10 @@ Sources are disjoint from the training corpus builder:
 - ``prompt``: nvidia/HelpSteer2 prompts, Anthropic/hh-rlhf first human turns,
   and NL2SH-ALFA test-set instructions.
 - ``shell_command``: NL2SH-ALFA test-set commands, InterCode-Corrections gold
-  commands, and a slice of real bash history (spignelon/bash_history).
+  commands, a slice of real bash history (spignelon/bash_history), and
+  command lines from held-out GitHub shell-script repositories
+  (the-stack-smol-xl repos hashed into the benchmark bucket, which the
+  corpus builder never trains on).
 
 Any sample whose exact content or near-duplicate group key (same keys as
 ``build_prompt_corpus.py``) appears in the training corpus is excluded, so
@@ -35,7 +38,12 @@ from pathlib import Path
 
 from datasets import load_dataset
 
-from build_prompt_corpus import normalize, prompt_group_key, shell_group_key
+from build_prompt_corpus import (
+    normalize,
+    prompt_group_key,
+    shell_group_key,
+    stack_shell_commands,
+)
 
 LABELS = ("prompt", "shell_command")
 SEED = 11
@@ -59,7 +67,9 @@ def first_human_turn(conversation: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def collect(limit_prompts: int, limit_shell_history: int) -> list[tuple[str, str]]:
+def collect(
+    limit_prompts: int, limit_shell_history: int, limit_stack_shell: int
+) -> list[tuple[str, str]]:
     samples: list[tuple[str, str]] = []
 
     helpsteer = load_dataset("nvidia/HelpSteer2", split="train")
@@ -97,15 +107,26 @@ def collect(limit_prompts: int, limit_shell_history: int) -> list[tuple[str, str
     pool = sorted({row["text"].strip() for row in history if len(row["text"].strip()) >= 8})
     random.Random(SEED).shuffle(pool)
     samples.extend(("shell_command", command) for command in pool[:limit_shell_history])
+
+    samples.extend(
+        ("shell_command", command)
+        for command in stack_shell_commands(limit_stack_shell, heldout=True)
+    )
     return samples
 
 
-def build(output: Path, corpus: Path, limit_prompts: int, limit_shell_history: int) -> None:
+def build(
+    output: Path,
+    corpus: Path,
+    limit_prompts: int,
+    limit_shell_history: int,
+    limit_stack_shell: int,
+) -> None:
     hashes, keys = training_index(corpus)
     shutil.rmtree(output, ignore_errors=True)
     written = {label: 0 for label in LABELS}
     seen: set[str] = set()
-    for label, text in collect(limit_prompts, limit_shell_history):
+    for label, text in collect(limit_prompts, limit_shell_history, limit_stack_shell):
         normalized = normalize(text)
         if normalized is None:
             continue
@@ -153,9 +174,16 @@ def main() -> None:
     parser.add_argument("--detect-binary", type=Path, default=None)
     parser.add_argument("--prompt-limit", type=int, default=4_000)
     parser.add_argument("--shell-history-limit", type=int, default=4_000)
+    parser.add_argument("--stack-shell-limit", type=int, default=4_000)
     args = parser.parse_args()
 
-    build(args.output, args.corpus, args.prompt_limit, args.shell_history_limit)
+    build(
+        args.output,
+        args.corpus,
+        args.prompt_limit,
+        args.shell_history_limit,
+        args.stack_shell_limit,
+    )
     if args.detect_binary is not None:
         score(args.output, args.detect_binary)
 

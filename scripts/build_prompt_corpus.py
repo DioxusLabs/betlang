@@ -269,6 +269,61 @@ def bash_history_commands(limit: int) -> list[str]:
     return commands
 
 
+SCRIPT_SKIP_PREFIXES = (
+    "#", "if ", "if[", "then", "else", "elif ", "fi", "for ", "while ",
+    "until ", "do", "done", "case ", "esac", "function ", "{", "}", "(", ")",
+    "[[", "[ ", "!", "::", "::=", "-",
+)
+ASSIGNMENT_RE = re.compile(r"^(?:local |export |declare |readonly )?[A-Za-z_][A-Za-z0-9_]*[+]?=")
+
+
+def script_command_lines(content: str) -> list[str]:
+    """Command-like lines from a shell script body: comments, shebangs,
+    control-flow keywords, bare assignments, and continuations are dropped."""
+    commands: list[str] = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line.endswith("\\") or not (8 <= len(line) <= 200):
+            continue
+        lowered = line.lower()
+        if any(lowered.startswith(prefix) for prefix in SCRIPT_SKIP_PREFIXES):
+            continue
+        if ASSIGNMENT_RE.match(line) or line.endswith(("{", "(", "then", "do", ";;")):
+            continue
+        if line.count('"') % 2 or line.count("'") % 2 or line.count("`") % 2:
+            continue
+        commands.append(line)
+    return commands
+
+
+def stack_repo_is_heldout(repo: str) -> bool:
+    """Repos hashed into bucket 0 are reserved for the OOD benchmark and
+    never enter the training corpus."""
+    return int(hashlib.sha256(repo.encode("utf-8")).hexdigest()[:8], 16) % 10 == 0
+
+
+def stack_shell_commands(limit: int, heldout: bool = False) -> list[str]:
+    """Command lines mined from real GitHub shell scripts (the-stack-smol-xl),
+    partitioned by repository so benchmark repos never overlap training."""
+    scripts = load_dataset(
+        "bigcode/the-stack-smol-xl", data_dir="data/shell", split="train", streaming=True
+    )
+    commands: list[str] = []
+    seen: set[str] = set()
+    for row in scripts:
+        repo = row["max_stars_repo_name"] or "unknown"
+        if stack_repo_is_heldout(repo) != heldout:
+            continue
+        for command in script_command_lines(row["content"]):
+            if command in seen:
+                continue
+            seen.add(command)
+            commands.append(command)
+            if len(commands) >= limit:
+                return commands
+    return commands
+
+
 def nl2sh_alfa_train(limit: int) -> tuple[list[str], list[str]]:
     """NL2SH-ALFA training pairs: imperative sysadmin English (prompt class)
     and the matching bash commands (shell class). Hard positives for the
@@ -321,6 +376,7 @@ def main() -> None:
     parser.add_argument("--agent-bash-limit", type=int, default=60_000)
     parser.add_argument("--bash-history-limit", type=int, default=60_000)
     parser.add_argument("--alfa-limit", type=int, default=30_000)
+    parser.add_argument("--stack-shell-limit", type=int, default=60_000)
     args = parser.parse_args()
 
     rng = random.Random(SEED)
@@ -345,6 +401,7 @@ def main() -> None:
     shell.extend(alfa_commands)
     shell.extend(swe_smith_bash_commands(args.agent_bash_limit))
     shell.extend(bash_history_commands(args.bash_history_limit))
+    shell.extend(stack_shell_commands(args.stack_shell_limit))
     if args.tldr_dir is None:
         import io
         import tarfile
