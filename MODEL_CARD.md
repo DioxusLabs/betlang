@@ -5,7 +5,7 @@
 - File: `assets/magika/source-student-q4.bin`
 - Format: weights-only MSQ1 quantized tensor payload
 - Size: 45,448 bytes
-- SHA-256: `a39125a09bf39241378b541cf8ee47cb70cde833e5209194ffb8da1686e8db56`
+- SHA-256: `c1c42a31761c0f38f3e67c7a2b319bd852830fcd3c8d8299261f86376ad9f83f`
 - Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
 - Tokenizer: word-unit tokenizer version 3
 - Output head: 2 model labels exposed one-to-one as public `Kind` variants
@@ -30,12 +30,15 @@ The model is trained from scratch with hard labels on a corpus assembled by
   `HuggingFaceH4/no_robots`, and developer questions from Stack Overflow
   titles (`pacovaldez/stackoverflow-questions`), plus instruction-style
   prompts from `tatsu-lab/alpaca`, `databricks/databricks-dolly-15k`, and
-  the `fka/awesome-chatgpt-prompts` personas.
+  the `fka/awesome-chatgpt-prompts` personas, and imperative sysadmin
+  English from NL2SH-ALFA training instructions (hard positives: terse
+  verb-first requests full of shell vocabulary).
 - `shell_command`: real bash one-liners from the NL2Bash corpus
   (TellinaTool/nl2bash), example commands from English tldr-pages with
   `{{placeholder}}` markers flattened, bash tool calls mined from agent
   RL/SFT trajectories (`SWE-bench/SWE-smith-trajectories`), real user shell
-  history (`spignelon/bash_history`), and synthetic hard negatives that
+  history (`spignelon/bash_history`), NL2SH-ALFA training commands, and
+  synthetic hard negatives that
   embed English phrases inside quoted command arguments
   (`git commit -m "..."`, `echo "..."`, `grep -r "..."`).
 
@@ -56,20 +59,21 @@ There is no teacher model: unlike the earlier source-language student, the
 ## Evaluation
 
 Held-out test split of the training corpus (5% of samples, disjoint from
-train/valid; ~251k samples total). Metrics are printed by
+train/valid; ~288k samples total). Metrics are printed by
 `scripts/train_prompt_student.py` at export time; for the shipped artifact:
 
-- `test_accuracy=0.991335`
-- `prompt` recall `0.992106`
-- `shell_command` recall `0.990580`
+- `test_accuracy=0.990885`
+- `prompt` recall `0.993067`
+- `shell_command` recall `0.988423`
 
-On a strictly out-of-distribution eval (NL2SH-ALFA test instructions and
-commands plus real bash history, with exact matches, train-template
-overlaps, and non-text junk excluded), the model scores 98.8% overall —
-identical to Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
-`warpdotdev/Warp` `crates/input_classifier`) on the same samples, at ~390x
-smaller size.
-Warp additionally runs heuristics before its model in production.
+`scripts/ood_benchmark.py` builds a ~4.2k-sample out-of-distribution
+benchmark from held-out sources (HelpSteer2 and hh-rlhf prompts, NL2SH-ALFA
+test pairs, InterCode-Corrections commands, unseen bash history), excluding
+exact matches and train-template overlaps. On it the shipped artifact
+scores 99.3% (prompt recall 0.993, shell recall 1.000) vs 99.1% for Warp's
+public `bert_tiny_v3.onnx` classifier (17.6 MB, from `warpdotdev/Warp`
+`crates/input_classifier`), at ~390x smaller size. Warp additionally runs
+heuristics before its model in production.
 
 ## Limitations
 

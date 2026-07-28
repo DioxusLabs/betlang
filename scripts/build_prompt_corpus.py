@@ -199,6 +199,13 @@ QUOTED_ARG_TEMPLATES = (
     'osascript -e \'display notification "{}"\'',
     'sed -i "s/TODO/{}/" README.md',
     'gh pr create --title "{}"',
+    'wall "{}"',
+    'say "{}"',
+    'figlet "{}"',
+    'cowsay "{}"',
+    'tmux display-message "{}"',
+    'git tag -a v1.2.0 -m "{}"',
+    'logger -p user.notice "{}"',
 )
 
 
@@ -262,6 +269,21 @@ def bash_history_commands(limit: int) -> list[str]:
     return commands
 
 
+def nl2sh_alfa_train(limit: int) -> tuple[list[str], list[str]]:
+    """NL2SH-ALFA training pairs: imperative sysadmin English (prompt class)
+    and the matching bash commands (shell class). Hard positives for the
+    prompt side: terse verb-first requests full of shell vocabulary."""
+    rows = load_dataset("westenfelder/NL2SH-ALFA", "train", split="train")
+    instructions: list[str] = []
+    commands: list[str] = []
+    for row in rows:
+        instructions.append(row["nl"].strip())
+        commands.append(row["bash"].strip())
+        if len(instructions) >= limit:
+            break
+    return instructions, commands
+
+
 def nl2bash_commands() -> list[str]:
     with urllib.request.urlopen(NL2BASH_URL) as response:
         body = response.read().decode("utf-8", "ignore")
@@ -298,6 +320,7 @@ def main() -> None:
     parser.add_argument("--quoted-arg-limit", type=int, default=20_000)
     parser.add_argument("--agent-bash-limit", type=int, default=60_000)
     parser.add_argument("--bash-history-limit", type=int, default=60_000)
+    parser.add_argument("--alfa-limit", type=int, default=30_000)
     args = parser.parse_args()
 
     rng = random.Random(SEED)
@@ -309,6 +332,8 @@ def main() -> None:
         args.sharegpt_limit,
         args.stackoverflow_limit,
     )
+    alfa_instructions, alfa_commands = nl2sh_alfa_train(args.alfa_limit)
+    prompts.extend(alfa_instructions)
     prompt_count = write_samples(
         args.output,
         "prompt",
@@ -317,6 +342,7 @@ def main() -> None:
     )
 
     shell: list[str] = nl2bash_commands()
+    shell.extend(alfa_commands)
     shell.extend(swe_smith_bash_commands(args.agent_bash_limit))
     shell.extend(bash_history_commands(args.bash_history_limit))
     if args.tldr_dir is None:
