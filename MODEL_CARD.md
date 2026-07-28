@@ -64,10 +64,11 @@ train/valid; ~251k samples total). Metrics are printed by
 - `shell_command` recall `0.990580`
 
 On a strictly out-of-distribution eval (NL2SH-ALFA test instructions and
-commands plus real bash history, with exact matches and train-template
-overlaps excluded), the model scores 97.0% overall vs 98.4% for Warp's
-public `bert_tiny_v3.onnx` classifier (17.6 MB, from `warpdotdev/Warp`
-`crates/input_classifier`) on the same samples, at ~390x smaller size.
+commands plus real bash history, with exact matches, train-template
+overlaps, and non-text junk excluded), the model scores 98.8% overall —
+identical to Warp's public `bert_tiny_v3.onnx` classifier (17.6 MB, from
+`warpdotdev/Warp` `crates/input_classifier`) on the same samples, at ~390x
+smaller size.
 Warp additionally runs heuristics before its model in production.
 
 ## Limitations
