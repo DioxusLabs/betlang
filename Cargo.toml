@@ -48,6 +48,7 @@ harness = false
 
 [workspace]
 resolver = "3"
+members = ["refract"]
 
 [package.metadata.docs.rs]
 all-features = true
