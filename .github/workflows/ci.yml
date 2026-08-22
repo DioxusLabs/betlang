@@ -21,6 +21,22 @@ jobs:
   test:
     uses: dioxuslabs/dioxus-ci/.github/workflows/test.yml@v0.1.0
 
+  test-macos:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/test.yml@v0.1.0
+    with:
+      runs-on: macos-14
+
+  check-wasm:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    name: Check (wasm32)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dioxuslabs/dioxus-ci/actions/setup-dioxus@v0.1.0
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo check --workspace --all-features --target wasm32-unknown-unknown
+
   fmt:
     uses: dioxuslabs/dioxus-ci/.github/workflows/fmt.yml@v0.1.0
 
