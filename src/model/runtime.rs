@@ -15,13 +15,13 @@ pub(crate) struct Model {
     pub(crate) embedding: Box<[f32]>,
     /// `[k][in_c][out_c]` — inner kernel row is contiguous over out_channels.
     /// Retained for the naive test oracle; inference uses the packed copies.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) conv0_kernel: Box<[f32]>,
     pub(crate) conv0_bias: [f32; CONV0],
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) conv1_kernel: Box<[f32]>,
     pub(crate) conv1_bias: [f32; CONV1],
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) conv2_kernel: Box<[f32]>,
     pub(crate) conv2_bias: [f32; CONV2],
     /// (POOLED, DENSE) flattened.
@@ -96,10 +96,13 @@ impl Model {
 
         Self {
             embedding,
+            #[cfg(test)]
             conv0_kernel,
             conv0_bias,
+            #[cfg(test)]
             conv1_kernel,
             conv1_bias,
+            #[cfg(test)]
             conv2_kernel,
             conv2_bias,
             dense0_kernel,

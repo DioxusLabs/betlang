@@ -206,7 +206,7 @@ fn plan_stages<S: Simd>(
 /// 3. transform back per tile, add bias, and max-pool GELU into `dst` via
 ///    the endpoint identity (`pool == 1` stores plain GELU rows).
 macro_rules! wino_stage {
-    ($name:ident, $global_name:ident, $n:expr, $input:ident, $output:ident) => {
+    ($name:ident, $n:expr, $input:ident, $output:ident) => {
         #[allow(clippy::too_many_arguments)]
         #[inline(always)]
         fn $name<S: Simd>(
@@ -254,10 +254,13 @@ macro_rules! wino_stage {
                 }
             }
         }
+    };
+    ($name:ident, $global_name:ident, $n:expr, $input:ident, $output:ident) => {
+        wino_stage!($name, $n, $input, $output);
 
         /// The same stage fused into the global max/sum pool over the first
         /// `valid_rows` outputs (used by the final conv).
-        #[allow(clippy::too_many_arguments, dead_code)]
+        #[allow(clippy::too_many_arguments)]
         #[inline(always)]
         fn $global_name<S: Simd>(
             simd: S,
@@ -313,8 +316,8 @@ macro_rules! wino_stage {
     };
 }
 
-wino_stage!(stage_w0, stage_w0_global, 10, input_w0_fn, output_w0_fn);
-wino_stage!(stage_w1, stage_w1_global, 8, input_w1_fn, output_w1_fn);
+wino_stage!(stage_w0, 10, input_w0_fn, output_w0_fn);
+wino_stage!(stage_w1, 8, input_w1_fn, output_w1_fn);
 wino_stage!(stage_w2, stage_w2_global, 6, input_w2_fn, output_w2_fn);
 
 // Monomorphizable wrappers so the macro can pass the transforms as values.
