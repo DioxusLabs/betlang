@@ -1,11 +1,16 @@
-type LanguageScore = {
+export interface LanguageScore {
   readonly slug: string;
   readonly probability: number;
-};
+}
 
-function normalize(scores: LanguageScore[]): LanguageScore[] {
-  const total = scores.reduce((sum, score) => sum + score.probability, 0);
-  return scores.map((score) => ({
+export type ScoreMap = Map<string, LanguageScore>;
+
+export function normalize(scores: LanguageScore[]): LanguageScore[] {
+  const total: number = scores.reduce(
+    (sum: number, score: LanguageScore) => sum + score.probability,
+    0,
+  );
+  return scores.map((score: LanguageScore): LanguageScore => ({
     slug: score.slug,
     probability: score.probability / total,
   }));

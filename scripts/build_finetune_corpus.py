@@ -9,7 +9,9 @@ this script rebuilds a corpus with the same layout — `files/{train,valid,test}
 1. `bigcode/the-stack-smol-xl` (ungated) for most programming languages.
 2. `bigcode/the-stack` (gated; needs an HF token with accepted terms) for the
    config/data formats missing from smol-xl: yaml, json, toml, ini, xml,
-   swift, cobol, plus extra ruby rows filtered for Gemfile/gemspec.
+   swift, cobol, plus extra ruby rows filtered for Gemfile/gemspec. With
+   `--no-gated`, these labels are harvested from public GitHub repo tarballs
+   instead and no HF token is needed.
 3. GitHub repo tarballs for objectivec (.m) and gradle (.gradle), which have
    no per-language subset in The Stack.
 4. A small synthetic set targeting the Markdown/YAML ambiguity from issue #5:
@@ -115,6 +117,10 @@ GITHUB_SOURCES = {
             "robbiehanson/CocoaAsyncSocket",
             "TTTAttributedLabel/TTTAttributedLabel",
             "jessesquires/JSQMessagesViewController",
+            "facebook/react-native", "protocolbuffers/protobuf",
+            "material-components/material-components-ios",
+            "sparkle-project/Sparkle", "MacDownApp/macdown",
+            "sequelpro/sequelpro",
         ],
         (".m",),
     ),
@@ -128,8 +134,162 @@ GITHUB_SOURCES = {
             "micronaut-projects/micronaut-core",
             "spockframework/spock",
             "nebula-plugins/gradle-lint-plugin",
+            "elastic/elasticsearch", "hibernate/hibernate-orm",
+            "ReactiveX/RxJava", "square/okhttp", "square/retrofit",
+            "grails/grails-core", "apache/groovy", "realm/realm-java",
+            "bumptech/glide", "google/dagger",
         ],
         (".gradle",),
+    ),
+}
+
+# Ungated fallback for the gated the-stack labels (--no-gated): GitHub repo
+# tarballs, label -> (repos, extensions). Repos are picked so the repo-name
+# hash covers all three splits for every label, with high-volume repos first
+# so the split caps fill with few downloads. Content dedup plus the caps keep
+# any single repo from dominating; files keep the canonical label extension.
+UNGATED_GITHUB_SOURCES = {
+    "yaml": (
+        [
+            "bitnami/charts", "kubernetes/examples", "actions/starter-workflows",
+            "fluxcd/flux2", "istio/istio", "grafana/helm-charts",
+            "conda-forge/staged-recipes", "argoproj/argo-workflows",
+            "kubevirt/kubevirt", "kubernetes-sigs/kustomize",
+            "aws/karpenter-provider-aws", "kubernetes/ingress-nginx",
+            "jaegertracing/jaeger", "elastic/helm-charts",
+            "GoogleCloudPlatform/microservices-demo", "docker/awesome-compose",
+            "geerlingguy/ansible-for-devops", "home-assistant/operating-system",
+            "helm/charts", "prometheus-community/helm-charts", "argoproj/argo-cd",
+            "kyverno/kyverno", "external-secrets/external-secrets",
+            "open-telemetry/opentelemetry-collector",
+            "openshift/release", "bioconda/bioconda-recipes", "openshift/origin",
+            "ansible/awx", "rancher/rancher", "compose-spec/compose-spec",
+            "rails/rails", "symfony/symfony", "home-assistant/core",
+            "esphome/esphome", "zulip/zulip", "OAI/OpenAPI-Specification",
+            "github/docs", "getsentry/sentry",
+        ],
+        (".yaml", ".yml"),
+    ),
+    "json": (
+        [
+            "SchemaStore/schemastore", "json-schema-org/JSON-Schema-Test-Suite",
+            "mdn/browser-compat-data", "dariusk/corpora", "vega/vega-lite",
+            "spdx/license-list-data", "github/gemoji", "mledoze/countries",
+            "chartjs/Chart.js", "babel/babel", "prettier/prettier",
+            "microsoft/vscode",
+            "webpack/webpack", "muan/emojilib", "gothinkster/realworld",
+            "Azure/azure-quickstart-templates", "PokeAPI/api-data", "vega/vega",
+            "mozilla/webextension-polyfill",
+        ],
+        (".json",),
+    ),
+    "toml": (
+        [
+            "toml-lang/toml-test", "rust-lang/cargo", "bevyengine/bevy",
+            "embassy-rs/embassy", "zed-industries/zed", "pola-rs/polars",
+            "apache/arrow-rs", "apache/opendal", "vectordotdev/vector",
+            "tokio-rs/tokio", "helix-editor/helix", "astral-sh/ruff",
+            "astral-sh/uv", "pypa/hatch", "pdm-project/pdm",
+            "RustCrypto/hashes", "RustCrypto/traits", "tauri-apps/tauri",
+            "denoland/deno", "nushell/nushell", "starship/starship",
+            "clap-rs/clap", "serde-rs/serde", "launchbadge/sqlx",
+            "SeaQL/sea-orm", "PyO3/pyo3", "leptos-rs/leptos",
+            "rust-lang/rust-analyzer", "gfx-rs/wgpu",
+            "MaterializeInc/materialize", "bytecodealliance/wasmtime",
+            "juspay/hyperswitch", "solana-labs/solana", "python-poetry/poetry",
+            "rust-lang/crates.io", "meilisearch/meilisearch", "hyperium/hyper",
+            "sharkdp/bat", "rayon-rs/rayon", "rust-itertools/itertools",
+            "SergioBenitez/Rocket",
+            "paritytech/substrate", "surrealdb/surrealdb", "wasmerio/wasmer",
+            "anza-xyz/agave", "yewstack/yew",
+        ],
+        (".toml",),
+    ),
+    "ini": (
+        [
+            "libretro/retroarch-joypad-autoconfig", "libretro/common-overlays",
+            "pypa/setuptools", "wine-mirror/wine", "openstack/neutron",
+            "openstack/cinder", "openstack/keystone", "openstack/glance",
+            "saltstack/salt", "django/django", "sqlalchemy/sqlalchemy",
+            "celery/celery", "scrapy/scrapy", "pycqa/pylint", "pycqa/flake8",
+            "python-pillow/Pillow", "pallets/flask", "tox-dev/tox",
+            "python/mypy", "hrydgard/ppsspp", "RPCS3/rpcs3", "PCSX2/pcsx2",
+            "stenzek/duckstation", "mgba-emu/mgba", "TASEmulators/BizHawk",
+            "cemu-project/Cemu", "project-slippi/Ishiiruka", "libretro/RetroArch",
+            "dolphin-emu/dolphin", "Tinob/Ishiiruka", "citra-emu/citra",
+            "scummvm/scummvm", "dolphin-emu/hwtests", "Rosalie241/RMG",
+            "pytest-dev/pytest", "openstack/nova", "pypa/pip",
+            "pypa/virtualenv", "supervisor/supervisor", "benoitc/gunicorn",
+            "mamedev/mame", "openstack/swift", "openstack/heat",
+            "openstack/ironic", "python/cpython",
+        ],
+        (".ini", ".cfg"),
+    ),
+    "xml": (
+        [
+            "galaxyproject/tools-iuc", "apache/ofbiz-framework", "apache/ant",
+            "mybatis/mybatis-3", "checkstyle/checkstyle", "apache/maven",
+            "apache/tomcat", "apache/jmeter", "apache/poi",
+            "liquibase/liquibase", "apache/logging-log4j2",
+            "OpenAPITools/openapi-generator", "wildfly/wildfly",
+            "apache/camel", "apache/struts", "apache/dubbo", "apache/karaf",
+            "apache/lucene", "hazelcast/hazelcast", "apache/cocoon",
+            "spring-projects/spring-batch",
+            "apache/cayenne", "apache/ws-axiom", "apache/archiva",
+            "apache/manifoldcf", "apache/lens",
+            "signalapp/Signal-Android", "TeamNewPipe/NewPipe",
+            "nextcloud/android", "AntennaPod/AntennaPod",
+            "wordpress-mobile/WordPress-Android", "openhab/openhab-addons",
+            "eclipse-platform/eclipse.platform.ui", "keycloak/keycloak",
+            "jenkinsci/jenkins",
+        ],
+        (".xml",),
+    ),
+    "swift": (
+        [
+            "Alamofire/Alamofire", "vapor/vapor", "ReactiveX/RxSwift",
+            "onevcat/Kingfisher", "SnapKit/SnapKit",
+            "pointfreeco/swift-composable-architecture", "apple/swift-nio",
+            "apple/swift-package-manager", "danielgindi/Charts",
+            "realm/SwiftLint", "krzyzanowskim/CryptoSwift", "airbnb/lottie-ios",
+            "SwifterSwift/SwifterSwift", "apple/swift-collections",
+            "nicklockwood/SwiftFormat", "apple/swift-syntax",
+            "apple/swift-foundation", "swiftlang/swift-format", "mxcl/PromiseKit",
+            "quick/Quick", "quick/Nimble", "yonaskolb/XcodeGen", "tuist/tuist",
+            "groue/GRDB.swift", "stephencelis/SQLite.swift", "mac-cain13/R.swift",
+            "grpc/grpc-swift", "apple/swift-protobuf",
+            "apple/swift-argument-parser", "kean/Nuke", "daltoniam/Starscream",
+            "socketio/socket.io-client-swift", "MessageKit/MessageKit",
+            "realm/realm-swift", "apple/swift-log", "apple/swift-crypto",
+            "apple/swift-numerics",
+            "apple/swift-testing", "aws-amplify/amplify-swift",
+            "SwiftGen/SwiftGen", "Moya/Moya", "SwiftyJSON/SwiftyJSON",
+            "peripheryapp/periphery", "Kitura/Kitura", "apple/swift-atomics",
+            "apple/swift-corelibs-foundation", "stripe/stripe-ios",
+            "firebase/firebase-ios-sdk", "apple/swift-algorithms",
+            "malcommac/SwiftDate", "uber/needle",
+        ],
+        (".swift",),
+    ),
+    "cobol": (
+        [
+            "openmainframeproject/cobol-programming-course",
+            "spgennard/vscode_cobol", "eclipse-che4z/che-che4z-lsp-for-cobol",
+            "OCamlPro/gnucobol", "GitMensch/gnucobol", "shamrice/COBOL-Examples",
+            "azac/cobol-on-wheelchair", "mainframed/DEF-CON-25",
+            "IBM/db2-samples", "moshix/cobol", "Martinfx/Cobol",
+            "openmainframeproject/cobol-check",
+            "avishek-sen-gupta/cobol-rekt", "IBM/Bank-of-Z",
+            "simotin13/cobol-examples",
+            "J-AugustoManzano/cobol", "cloudflare/cobweb",
+            "IonicaBizau/node.cobol", "walmartlabs/zECS", "vernieri/CoBanking",
+            "majormilan/cobweb", "openmainframeproject/cobol-programming-course",
+            "olegkunitsyn/gnucobol-debug", "neopragma/cobol-unit-test",
+            "spgennard/vscode_cobol",
+            "zosconnect/zosconnect-sample-cobol-apirequester",
+            "neopragma/cobol-samples", "Nacho512/COBOL-LIBRARIES",
+        ],
+        (".cob", ".cbl", ".cpy"),
     ),
 }
 
@@ -157,6 +317,10 @@ TRAIN_CAP = 3000
 VALID_CAP = 375
 TEST_CAP = 750
 SPLIT_CAPS = {"train": TRAIN_CAP, "valid": VALID_CAP, "test": TEST_CAP}
+# GitHub tarball harvesting additionally caps files per (repo, split) so a
+# single high-volume repo cannot fill a label's split with one homogeneous
+# style (e.g. one repo's generated XML dialect standing in for all XML).
+PER_REPO_CAPS = {"train": 300, "valid": 150, "test": 250}
 MIN_BYTES = 8
 MAX_BYTES = 256 * 1024
 
@@ -236,7 +400,7 @@ EXT_FOR_LABEL = {
 }
 
 
-def read_hf_token(explicit: str | None) -> str:
+def read_hf_token(explicit: str | None, required: bool = True) -> str | None:
     if explicit:
         return explicit
     env = os.environ.get("HF_TOKEN")
@@ -245,7 +409,9 @@ def read_hf_token(explicit: str | None) -> str:
     token_path = Path.home() / ".cache" / "huggingface" / "token"
     if token_path.exists():
         return token_path.read_text().strip()
-    raise SystemExit("no HF token: pass --hf-token, set HF_TOKEN, or run `hf auth login`")
+    if required:
+        raise SystemExit("no HF token: pass --hf-token, set HF_TOKEN, or run `hf auth login`")
+    return None
 
 
 def split_for_repo(repo: str) -> str:
@@ -304,7 +470,7 @@ class CorpusWriter:
         return "\n".join(lines)
 
 
-def hf_download(repo: str, filename: str, token: str, dest: Path) -> Path:
+def hf_download(repo: str, filename: str, token: str | None, dest: Path) -> Path:
     from huggingface_hub import hf_hub_download
 
     path = hf_hub_download(
@@ -325,7 +491,7 @@ def iter_jsonl(path: Path):
                 yield json.loads(line)
 
 
-def harvest_smol_xl(writer: CorpusWriter, token: str, scratch: Path, rng: random.Random) -> None:
+def harvest_smol_xl(writer: CorpusWriter, token: str | None, scratch: Path, rng: random.Random) -> None:
     for lang, label in SMOL_XL_LANGS.items():
         marker = scratch / f"smolxl.{lang}.done"
         if marker.exists():
@@ -413,32 +579,52 @@ def harvest_stack(writer: CorpusWriter, token: str, scratch: Path, rng: random.R
         marker.write_text("done\n")
 
 
-def harvest_github(writer: CorpusWriter, scratch: Path) -> None:
-    for label, (repos, extensions) in GITHUB_SOURCES.items():
+def harvest_github(
+    writer: CorpusWriter,
+    scratch: Path,
+    sources: dict[str, tuple[list[str], tuple[str, ...]]] | None = None,
+) -> None:
+    for label, (repos, extensions) in (sources or GITHUB_SOURCES).items():
         for repo in repos:
             marker = scratch / f"github.{repo.replace('/', '__')}.done"
             if marker.exists():
                 print(f"github {repo}: already harvested", flush=True)
                 continue
             split = split_for_repo(repo)
+            if writer.counts[(split, label)] >= SPLIT_CAPS[split]:
+                print(f"github {repo} -> {label} ({split}): cap reached, skipping", flush=True)
+                marker.write_text("skipped\n")
+                continue
             url = f"https://codeload.github.com/{repo}/tar.gz/HEAD"
             print(f"github {repo} -> {label} ({split}): downloading", flush=True)
             added = 0
-            with urllib.request.urlopen(url) as response:
-                stream = io.BufferedReader(response, buffer_size=1 << 20)
-                with tarfile.open(fileobj=stream, mode="r|gz") as tar:
-                    for member in tar:
-                        if not member.isfile() or member.size > MAX_BYTES:
-                            continue
-                        if not member.name.endswith(extensions):
-                            continue
-                        extracted = tar.extractfile(member)
-                        if extracted is None:
-                            continue
-                        content = extracted.read()
-                        ext = EXT_FOR_LABEL[label]
-                        if writer.add(label, split, content, ext):
-                            added += 1
+            repo_cap = PER_REPO_CAPS[split]
+            try:
+                with urllib.request.urlopen(url) as response:
+                    stream = io.BufferedReader(response, buffer_size=1 << 20)
+                    with tarfile.open(fileobj=stream, mode="r|gz") as tar:
+                        for member in tar:
+                            if added >= repo_cap:
+                                break
+                            if writer.counts[(split, label)] >= SPLIT_CAPS[split]:
+                                break
+                            if not member.isfile() or member.size > MAX_BYTES:
+                                continue
+                            if not member.name.endswith(extensions):
+                                continue
+                            extracted = tar.extractfile(member)
+                            if extracted is None:
+                                continue
+                            content = extracted.read()
+                            ext = EXT_FOR_LABEL[label]
+                            if writer.add(label, split, content, ext):
+                                added += 1
+            except urllib.error.HTTPError as error:
+                print(f"github {repo}: HTTP {error.code}, skipping", flush=True)
+                marker.write_text("error\n")
+                continue
+            except (tarfile.ReadError, EOFError) as error:
+                print(f"github {repo}: truncated stream after {added} adds ({error})", flush=True)
             print(f"github {repo} -> {label}: added {added}", flush=True)
             marker.write_text("done\n")
 
@@ -590,9 +776,16 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--hf-token", default=None)
     parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument(
+        "--no-gated",
+        action="store_true",
+        help="skip the gated bigcode/the-stack shards and harvest the affected "
+        "labels (yaml/json/toml/ini/xml/swift/cobol) from public GitHub repo "
+        "tarballs instead; no HF token needed (smol-xl is ungated)",
+    )
     args = parser.parse_args()
 
-    token = read_hf_token(args.hf_token)
+    token = read_hf_token(args.hf_token, required=not args.no_gated)
     rng = random.Random(args.seed)
     files_root = args.output / "files"
     scratch = args.output / "scratch"
@@ -607,7 +800,10 @@ def main() -> int:
                 writer.counts[(split_dir.name, label_dir.name)] += 1
 
     harvest_smol_xl(writer, token, scratch, rng)
-    harvest_stack(writer, token, scratch, rng)
+    if args.no_gated:
+        harvest_github(writer, scratch, UNGATED_GITHUB_SOURCES)
+    else:
+        harvest_stack(writer, token, scratch, rng)
     harvest_github(writer, scratch)
     harvest_raw_files(writer, scratch)
     if not (scratch / "synthetic.done").exists():

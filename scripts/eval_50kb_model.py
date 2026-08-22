@@ -127,6 +127,12 @@ def main() -> int:
     if fs_labels is not None:
         fs_acc = float((preds == fs_labels).mean())
         print(f"{args.split}_fs_accuracy={fs_acc:.6f}")
+        recalls = []
+        for c in range(classes):
+            mask = fs_labels == c
+            if mask.any():
+                recalls.append(float((preds[mask] == c).mean()))
+        print(f"{args.split}_fs_macro_recall={float(np.mean(recalls)):.6f}")
 
         # Per-segment breakdown: mapped vs unmapped
         meta = json.loads((args.cache_dir / f"{args.split}.fs_labels.json").read_text())

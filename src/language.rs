@@ -20,7 +20,7 @@ impl fmt::Display for ParseLanguageError {
 
 impl Error for ParseLanguageError {}
 
-/// Source language predicted by the embedded Magika student model.
+/// Source language predicted by the embedded detection model.
 ///
 /// Languages parse from their model label slugs with [`str::parse`].
 ///
