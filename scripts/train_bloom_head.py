@@ -2,18 +2,20 @@
 """Train the betlang Shannon n-gram Bloom binary head.
 
 Stage 1 (deterministic, no learned weights): the Magika byte window is encoded
-into a fixed-width binary signature. For every byte position and every n-gram
+into a compact binary signature. For every byte position and every n-gram
 order n in ORDERS, a Zobrist hash (XOR of per-offset random 64-bit codes,
 which is a Shannon-style random binary code for each (byte, offset) symbol) is
-folded into a per-(half, order) counting-Bloom block; bucket counts pass
-through fixed thermometer thresholds (quantized log-frequency, i.e. Shannon
-surprisal). The result is a BITS-wide binary feature vector computed with
-table lookups + XOR + integer compares only.
+folded into one or more small counting-Bloom views per (half, order) group; a
+view takes a power-of-two number of buckets from a bit-field of the hash, so a
+group can expose several independent folds of the same n-gram stream. Bucket
+counts pass through per-plane thermometer thresholds (quantized log-frequency,
+i.e. Shannon surprisal). The result is a BITS-wide binary feature vector
+computed with table lookups + XOR + integer compares only.
 
 Stage 2 (learned): a binary {-1,+1} linear head over the signature, trained
 with a straight-through estimator against Magika teacher marginals (BCE) plus
-hard labels. Inference is XNOR + popcount per class, followed by an affine
-calibration for probabilities.
+hard labels. Inference is XNOR + popcount per class with a per-(class, plane)
+int8 scale, followed by an affine calibration for probabilities.
 
 Usage:
   python scripts/train_bloom_head.py --cache-dir CACHE --output model.bin
@@ -42,45 +44,90 @@ HALF = 1024
 CLASSES = 48
 
 ORDERS = (1, 2, 3, 4, 5, 6, 7, 8)
-BLOCK_BITS = 4096
+# Bucket space of the raw hash fold (12 bits); views fold it further down.
+BASE_BITS = 4096
 NGRAM_GROUPS = 2 * len(ORDERS)  # (half, order) counting groups
 # Word-unit groups (per half): casefolded identifier unigrams (two
 # independent hash folds), bigrams, trigrams, and line-start unigrams.
-WORD_KIND_LEVELS = (
-    (1, 2, 4, 8),  # unigram, first fold
-    (1, 2),        # bigram
-    (1, 2, 4, 8),  # unigram, second fold
-    (1, 2),        # trigram
-    (1, 2, 4, 8),  # line-start unigram
-)
-WORD_GROUPS = 2 * len(WORD_KIND_LEVELS)
+WORD_KINDS = 5
+WORD_GROUPS = 2 * WORD_KINDS
 # Wordseq-unit n-gram groups over the production tokenizer-v3 unit stream
 # (words / punct runs / numbers / brackets / indents), one group per order.
 UNIT_ORDERS = (1, 2, 3, 4)
-UNIT_LEVELS = ((1, 2, 4, 8), (1, 2), (1,), (1,))
 UNIT_GROUPS = len(UNIT_ORDERS)
 GROUPS = NGRAM_GROUPS + WORD_GROUPS + UNIT_GROUPS
-COUNT_BUCKETS = GROUPS * BLOCK_BITS
-# Count thermometer levels per order: low orders carry frequency information
-# (log-TF), high orders are presence-only.
-ORDER_LEVELS = tuple(
-    (1, 2, 4, 8) if order <= 3 else (1, 2) if order <= 5 else (1,)
-    for order in ORDERS
-)
-PLANES: list[tuple[int, int]] = []  # (group, count threshold)
+COUNT_BUCKETS = GROUPS * BASE_BITS
+
+# Compact per-group signature spec: {group kind -> (width, levels, views)}.
+# `width` power-of-two buckets per view; `levels` count thermometer
+# thresholds (quantized log-frequency); `views` independent hash bit-field
+# folds (Bloom-style multiple hashes). Low orders carry frequency
+# information (log-TF) and get wider views, high orders are presence-only.
+NGRAM_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
+    1: (64, (1, 2, 4, 8), 1),
+    2: (128, (1, 2, 4), 1),
+    3: (128, (1, 2), 1),
+    4: (128, (1,), 1),
+    5: (64, (1,), 1),
+    6: (64, (1,), 1),
+    7: (64, (1,), 1),
+    8: (64, (1,), 1),
+}
+WORD_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
+    0: (64, (1, 2, 4), 1),  # unigram, first fold
+    1: (64, (1,), 1),       # bigram
+    2: (64, (1,), 1),       # unigram, second fold
+    3: (64, (1,), 1),       # trigram
+    4: (64, (1, 2), 1),     # line-start unigram
+}
+UNIT_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
+    0: (64, (1, 2, 4), 1),
+    1: (64, (1,), 1),
+    2: (64, (1,), 1),
+    3: (64, (1,), 1),
+}
+
+
+def view_shift(width: int, view: int) -> int:
+    """Bit offset into the 12-bit base hash for this view's fold."""
+    lb = width.bit_length() - 1
+    return min(view * lb, 12 - lb)
+
+
+def group_spec(group: int) -> tuple[int, tuple[int, ...], int]:
+    if group < NGRAM_GROUPS:
+        return NGRAM_SPEC[group // 2 + 1]
+    if group < NGRAM_GROUPS + WORD_GROUPS:
+        return WORD_SPEC[(group - NGRAM_GROUPS) // 2]
+    return UNIT_SPEC[group - NGRAM_GROUPS - WORD_GROUPS]
+
+
+# (group, shift, count threshold, width) per signature bit-plane, nested as
+# group-major (n-gram (order, half), word (kind, half), unit order) with
+# levels and views inside. Must match the artifact plane table exactly.
+PLANES: list[tuple[int, int, int, int]] = []
 for _oi, _order in enumerate(ORDERS):
     for _half in range(2):
-        for _level in ORDER_LEVELS[_oi]:
-            PLANES.append((2 * _oi + _half, _level))
-for _kind, _levels in enumerate(WORD_KIND_LEVELS):
-    for _half in range(2):
+        _width, _levels, _views = NGRAM_SPEC[_order]
         for _level in _levels:
-            PLANES.append((NGRAM_GROUPS + 2 * _kind + _half, _level))
-for _oi, _levels in enumerate(UNIT_LEVELS):
+            for _view in range(_views):
+                PLANES.append((2 * _oi + _half, view_shift(_width, _view), _level, _width))
+for _kind in range(WORD_KINDS):
+    for _half in range(2):
+        _width, _levels, _views = WORD_SPEC[_kind]
+        for _level in _levels:
+            for _view in range(_views):
+                PLANES.append((NGRAM_GROUPS + 2 * _kind + _half,
+                               view_shift(_width, _view), _level, _width))
+for _oi, _order in enumerate(UNIT_ORDERS):
+    _width, _levels, _views = UNIT_SPEC[_oi]
     for _level in _levels:
-        PLANES.append((NGRAM_GROUPS + WORD_GROUPS + _oi, _level))
-BLOCKS = len(PLANES)  # 78 planes
-BITS = BLOCKS * BLOCK_BITS  # 319488
+        for _view in range(_views):
+            PLANES.append((NGRAM_GROUPS + WORD_GROUPS + _oi,
+                           view_shift(_width, _view), _level, _width))
+BLOCKS = len(PLANES)
+BITS = sum(width for _, _, _, width in PLANES)
+assert BITS % 64 == 0, "plane widths must pack to whole words"
 WORDS = BITS // 64
 
 ZOBRIST_SEED = 0xBE7A_1AB5_5EED_0001
@@ -148,11 +195,11 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
     """Encode (n, 2048) token windows into packed (n, WORDS) u64 signatures.
 
     Each (half, order) group is a counting Bloom block: n-gram Zobrist hashes
-    are folded into BLOCK_BITS buckets and *counted*; the signature exposes the
-    counts through fixed thermometer thresholds (1/2/4/8 for orders <= 3,
-    presence for higher orders). n-grams never cross the begin/end half
-    boundary and any n-gram containing the PAD token is skipped. Unit n-grams
-    run over the tokenizer-v3 unit stream (-1 = padding) without halving.
+    are folded into BASE_BITS buckets and *counted*; each plane then folds the
+    counts into its view's small buckets and exposes them through its
+    thermometer threshold. n-grams never cross the begin/end half boundary and
+    any n-gram containing the PAD token is skipped. Unit n-grams run over the
+    tokenizer-v3 unit stream (-1 = padding) without halving.
     """
     n = tokens.shape[0]
     tok = tokens.astype(np.int64)
@@ -182,8 +229,8 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
             acc_valid &= svalid
             group = 2 * order_index + half
             folded = rotl64(acc, 7 * order_index + half)
-            bucket = (folded & np.uint64(BLOCK_BITS - 1)).astype(np.int64)
-            bucket += group * BLOCK_BITS
+            bucket = (folded & np.uint64(BASE_BITS - 1)).astype(np.int64)
+            bucket += group * BASE_BITS
             bucket = np.where(acc_valid, bucket, COUNT_BUCKETS)
             rows = np.arange(n)[:, None] * stride
             indices.append((rows + bucket).reshape(-1))
@@ -208,8 +255,8 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
 
         def fold_bucket(hashes: np.ndarray, rot: int, group: int,
                         emit: np.ndarray) -> np.ndarray:
-            bucket = (rotl64(hashes, rot) & np.uint64(BLOCK_BITS - 1)).astype(np.int64)
-            bucket += group * BLOCK_BITS
+            bucket = (rotl64(hashes, rot) & np.uint64(BASE_BITS - 1)).astype(np.int64)
+            bucket += group * BASE_BITS
             return rows_flat + np.where(emit, bucket, COUNT_BUCKETS)
 
         for i in range(HALF):
@@ -254,19 +301,27 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
         acc_uvalid &= svalid
         group = NGRAM_GROUPS + WORD_GROUPS + order_index
         folded = rotl64(acc_u, 11 * order_index + 5)
-        bucket = (folded & np.uint64(BLOCK_BITS - 1)).astype(np.int64)
-        bucket += group * BLOCK_BITS
+        bucket = (folded & np.uint64(BASE_BITS - 1)).astype(np.int64)
+        bucket += group * BASE_BITS
         bucket = np.where(acc_uvalid, bucket, COUNT_BUCKETS)
         indices.append((rows + bucket).reshape(-1))
 
     flat = np.concatenate(indices)
     counts = np.bincount(flat, minlength=n * stride).reshape(n, stride)
-    counts = counts[:, :COUNT_BUCKETS].reshape(n, GROUPS, BLOCK_BITS)
+    counts = counts[:, :COUNT_BUCKETS].reshape(n, GROUPS, BASE_BITS)
 
     bits = np.zeros((n, BITS), dtype=np.uint8)
-    for plane_index, (group, level) in enumerate(PLANES):
-        lo = plane_index * BLOCK_BITS
-        bits[:, lo:lo + BLOCK_BITS] = counts[:, group] >= level
+    view_cache: dict[tuple[int, int, int], np.ndarray] = {}
+    at = 0
+    for group, shift, level, width in PLANES:
+        key = (group, shift, width)
+        if key not in view_cache:
+            c = counts[:, group].astype(np.int32)
+            idx = (np.arange(BASE_BITS) >> shift) & (width - 1)
+            perm = np.argsort(idx, kind="stable")
+            view_cache[key] = c[:, perm].reshape(n, width, BASE_BITS // width).sum(axis=2)
+        bits[:, at:at + width] = view_cache[key] >= level
+        at += width
 
     packed = np.packbits(bits, axis=1, bitorder="little")
     return packed.view(np.uint64).reshape(n, WORDS)
@@ -409,64 +464,37 @@ def sign_ste(x: torch.Tensor) -> torch.Tensor:
 
 
 class BloomHead(nn.Module):
-    """Optional block-diagonal binary hidden layer + binary linear output.
+    """Binary {-1,+1} linear head over the compact Bloom signature.
 
-    With hidden units per block H > 0, each of the BLOCKS feature blocks gets H
-    binary units connected only to that block's BLOCK_BITS presence bits
-    (XNOR/popcount + BN-folded threshold at inference), and the output layer is
-    binary over the 2*BLOCKS*H hidden bits. With H == 0 this is a plain binary
-    linear head over the raw signature.
-
-    The output layer uses per-(class, block) scales (XNOR-net style): the
-    per-block bipolar dot products (computed with XOR + popcount at inference)
-    are combined with a small float scale per block, which recovers most of
-    the accuracy lost by weight binarization at negligible float cost
-    (CLASSES*BLOCKS multiply-adds per file).
+    The head uses per-(class, plane) scales (XNOR-net style): the per-plane
+    bipolar dot products (computed with XOR + popcount at inference) are
+    combined with a small scale per plane, which recovers most of the accuracy
+    lost by weight binarization at negligible cost (the scales quantize to
+    int8 with one float step per class for export).
     """
 
-    def __init__(self, hidden_per_block: int = 0, float_head: bool = False) -> None:
+    def __init__(self, float_head: bool = False) -> None:
         super().__init__()
-        self.hidden_per_block = hidden_per_block
         self.float_head = float_head
-        if hidden_per_block > 0:
-            self.hidden_latent = nn.Parameter(
-                torch.empty(BLOCKS, BLOCK_BITS, hidden_per_block))
-            nn.init.uniform_(self.hidden_latent, -0.1, 0.1)
-            hidden = BLOCKS * hidden_per_block
-            self.bn = nn.BatchNorm1d(hidden)
-            self.latent = nn.Parameter(torch.empty(CLASSES, hidden))
-            self.width = hidden
-            self.block_width = hidden_per_block
-        else:
-            self.bn = None
-            self.latent = nn.Parameter(torch.empty(CLASSES, BITS))
-            self.width = BITS
-            self.block_width = BLOCK_BITS
+        self.latent = nn.Parameter(torch.empty(CLASSES, BITS))
         nn.init.uniform_(self.latent, -0.1, 0.1)
         self.block_scale = nn.Parameter(torch.full((CLASSES, BLOCKS), 4.0))
         self.bias = nn.Parameter(torch.zeros(CLASSES))
+        bounds = [0]
+        for _, _, _, width in PLANES:
+            bounds.append(bounds[-1] + width)
+        self.bounds = [(bounds[i], bounds[i + 1]) for i in range(BLOCKS)]
 
     def eff_scale(self) -> torch.Tensor:
-        """Effective per-(class, block) scale, fan-in normalized."""
-        return self.block_scale / math.sqrt(self.width)
-
-    def features(self, feats: torch.Tensor) -> torch.Tensor:
-        if self.hidden_per_block == 0:
-            return feats
-        blocks = feats.view(-1, BLOCKS, BLOCK_BITS).transpose(0, 1)
-        w = sign_ste(self.hidden_latent)
-        z = torch.bmm(blocks, w)  # (BLOCKS, n, H)
-        z = z.transpose(0, 1).reshape(feats.shape[0], -1)
-        return sign_ste(self.bn(z))
+        """Effective per-(class, plane) scale, fan-in normalized."""
+        return self.block_scale / math.sqrt(BITS)
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
-        x = self.features(feats)
         # Float head is a diagnostic-only upper bound for the binary head.
         w = self.latent if self.float_head else sign_ste(self.latent)
-        # Per-block bipolar dot products: (BLOCKS, n, K) @ (BLOCKS, K, CLASSES)
-        xb = x.view(-1, BLOCKS, self.block_width).transpose(0, 1)
-        wb = w.view(CLASSES, BLOCKS, self.block_width).permute(1, 2, 0)
-        d = torch.bmm(xb, wb).permute(1, 2, 0)  # (n, CLASSES, BLOCKS)
+        # Per-plane bipolar dot products (planes have unequal widths).
+        dots = [feats[:, lo:hi] @ w[:, lo:hi].T for lo, hi in self.bounds]
+        d = torch.stack(dots, dim=2)  # (n, CLASSES, BLOCKS)
         return (d * self.eff_scale().unsqueeze(0)).sum(dim=2) + self.bias
 
 
@@ -476,21 +504,6 @@ def unpack_batch(packed: np.ndarray) -> torch.Tensor:
                         axis=1, bitorder="little")
     bits = raw.astype(np.float32)
     return torch.from_numpy(bits * 2.0 - 1.0)
-
-
-def reestimate_bn(model: BloomHead, feats: np.ndarray, count: int, batch: int,
-                  batches: int, rng: np.random.Generator) -> None:
-    """Recompute BN running stats (binary nets drift from the training EMA)."""
-    if model.bn is None:
-        return
-    model.bn.reset_running_stats()
-    model.bn.momentum = None
-    model.train()
-    with torch.no_grad():
-        for _ in range(batches):
-            idx = np.sort(rng.choice(count, size=min(batch, count), replace=False))
-            model.features(unpack_batch(np.asarray(feats[idx])))
-    model.bn.momentum = 0.1
 
 
 def evaluate(model: BloomHead, feats: np.ndarray, data: Split, batch: int) -> tuple[float, float]:
@@ -512,17 +525,16 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--cache-dir", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--epochs", type=int, default=12)
+    p.add_argument("--epochs", type=int, default=300)
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--learning-rate", type=float, default=2e-3)
-    p.add_argument("--warmup-steps", type=int, default=400)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--warmup-steps", type=int, default=1000)
     p.add_argument("--ema-decay", type=float, default=0.998)
-    p.add_argument("--soft-loss-weight", type=float, default=0.7)
-    p.add_argument("--hard-loss-weight", type=float, default=0.3)
+    p.add_argument("--soft-loss-weight", type=float, default=0.5)
+    p.add_argument("--hard-loss-weight", type=float, default=0.5)
     p.add_argument("--hard-labels", choices=("teacher", "fs"), default="fs",
                    help="hard CE targets: teacher argmax or filesystem labels")
-    p.add_argument("--hidden-per-block", type=int, default=32)
-    p.add_argument("--augment-fraction", type=float, default=0.0,
+    p.add_argument("--augment-fraction", type=float, default=0.35,
                    help="extra short prefix-crop samples as a fraction of train "
                         "count (hard fs labels only)")
     p.add_argument("--float-head", action="store_true",
@@ -562,7 +574,7 @@ def main() -> None:
         print(f"augmented={n_aug}", flush=True)
     total = count + n_aug
 
-    model = BloomHead(args.hidden_per_block, args.float_head)
+    model = BloomHead(args.float_head)
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         (no_decay if "latent" in name or "block_scale" in name else decay).append(param)
@@ -633,7 +645,6 @@ def main() -> None:
         eval_state = dict(raw_state)
         eval_state.update({k: v.clone() for k, v in ema.items()})
         model.load_state_dict(eval_state)
-        reestimate_bn(model, train_feats, count, args.batch_size, 32, rng)
         parity, fs_acc = evaluate(model, valid_feats, valid, args.batch_size)
         star = ""
         if fs_acc > best_fs:
@@ -690,86 +701,51 @@ def pack_rows(bits01: np.ndarray) -> bytes:
     return np.packbits(buf, axis=1, bitorder="little").tobytes()
 
 
-def export(model: BloomHead, output: Path) -> None:
-    """MBL3: header, per-block calibration, folded hidden layer, packed output weights."""
-    model.eval()
-    hidden = model.hidden_per_block
-    blob = bytearray(b"MBL3")
-    blob += struct.pack("<IIII", BLOCK_BITS, BLOCKS, hidden, CLASSES)
-    blob += model.eff_scale().detach().numpy().astype("<f4").tobytes()
-    blob += model.bias.detach().numpy().astype("<f4").tobytes()
+def quantized_scales(model: BloomHead) -> tuple[np.ndarray, np.ndarray]:
+    """Per-(class, plane) int8 scales plus the per-class f32 step."""
+    eff = model.eff_scale().detach().numpy().astype(np.float64)
+    step = np.abs(eff).max(axis=1) / 127.0
+    step = np.where(step <= 0.0, 1e-12, step)
+    q = np.clip(np.round(eff / step[:, None]), -127, 127).astype(np.int8)
+    return q, step.astype(np.float32)
 
-    if hidden > 0:
-        # (BLOCKS, BLOCK_BITS, H) -> unit-major rows (BLOCKS*H, BLOCK_BITS)
-        w = (model.hidden_latent.detach().numpy() >= 0).astype(np.uint8)
-        rows = w.transpose(0, 2, 1).reshape(BLOCKS * hidden, BLOCK_BITS)
-        bn = model.bn
-        gamma = bn.weight.detach().numpy()
-        beta = bn.bias.detach().numpy()
-        mu = bn.running_mean.detach().numpy()
-        sigma = np.sqrt(bn.running_var.detach().numpy() + bn.eps)
-        # sign(gamma*(z-mu)/sigma + beta), z = B - 2*mismatch
-        tau = mu - beta * sigma / np.where(np.abs(gamma) < 1e-12, 1e-12, gamma)
-        thr = np.floor((BLOCK_BITS - tau) / 2.0).astype(np.int64)
-        flips = (gamma < 0).astype(np.uint8)
-        flip_thr = np.ceil((BLOCK_BITS - tau) / 2.0).astype(np.int64) - 1
-        thr = np.clip(np.where(flips == 1, flip_thr, thr), -1, BLOCK_BITS)
-        blob += pack_rows(rows)
-        blob += thr.astype("<i2").tobytes()
-        blob += pack_rows(flips.reshape(1, -1))
-        out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
-        blob += pack_rows(out_w)
-    else:
-        out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
-        blob += pack_rows(out_w)
+
+def export(model: BloomHead, output: Path) -> None:
+    """MBL4: header, plane table, int8 scales, biases, packed head rows."""
+    model.eval()
+    blob = bytearray(b"MBL4")
+    blob += struct.pack("<III", BITS, BLOCKS, CLASSES)
+    for group, shift, level, width in PLANES:
+        blob += struct.pack("<BBBB", group, shift, level, width.bit_length() - 1)
+    q, step = quantized_scales(model)
+    blob += q.tobytes()
+    blob += step.astype("<f4").tobytes()
+    blob += model.bias.detach().numpy().astype("<f4").tobytes()
+    out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
+    blob += pack_rows(out_w)
 
     output.write_bytes(bytes(blob))
     print(f"exported {len(blob)} bytes to {output}", flush=True)
 
 
 def simulate(model: BloomHead, feats: np.ndarray) -> np.ndarray:
-    """Pure-integer inference over packed signatures; returns logits."""
+    """Integer XOR/popcount inference over packed signatures; returns logits.
+
+    Mirrors the Rust runtime: per-plane bipolar dot products accumulate as
+    int8-scale * int, with one float multiply per class at the end.
+    """
     n = feats.shape[0]
-    hidden = model.hidden_per_block
-    scale = model.eff_scale().detach().numpy().astype(np.float64)
-    bias = model.bias.detach().numpy().astype(np.float64)
+    q, step = quantized_scales(model)
+    bias = model.bias.detach().numpy().astype(np.float32)
     x_bits = np.unpackbits(feats.view(np.uint8).reshape(n, BITS // 8), axis=1,
                            bitorder="little").astype(np.uint8)
-    if hidden > 0:
-        w = (model.hidden_latent.detach().numpy() >= 0).astype(np.uint8)
-        rows = w.transpose(0, 2, 1).reshape(BLOCKS * hidden, BLOCK_BITS)
-        bn = model.bn
-        gamma = bn.weight.detach().numpy()
-        beta = bn.bias.detach().numpy()
-        mu = bn.running_mean.detach().numpy()
-        sigma = np.sqrt(bn.running_var.detach().numpy() + bn.eps)
-        tau = mu - beta * sigma / np.where(np.abs(gamma) < 1e-12, 1e-12, gamma)
-        thr = np.floor((BLOCK_BITS - tau) / 2.0).astype(np.int64)
-        flips = (gamma < 0).astype(np.uint8)
-        flip_thr = np.ceil((BLOCK_BITS - tau) / 2.0).astype(np.int64) - 1
-        thr = np.clip(np.where(flips == 1, flip_thr, thr), -1, BLOCK_BITS)
-
-        xb = x_bits.reshape(n, BLOCKS, BLOCK_BITS)
-        wb = rows.reshape(BLOCKS, hidden, BLOCK_BITS)
-        mismatch = np.empty((n, BLOCKS, hidden), dtype=np.int64)
-        for b in range(BLOCKS):
-            mismatch[:, b] = (xb[:, b, None, :] != wb[None, b]).sum(axis=2)
-        bits = (mismatch.reshape(n, -1) <= thr[None, :]).astype(np.uint8)
-        bits ^= flips[None, :]
-        h_bits = bits
-        out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
-        block_width = hidden
-    else:
-        h_bits = x_bits
-        out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
-        block_width = BLOCK_BITS
-    hb = h_bits.reshape(n, BLOCKS, block_width)
-    wb_out = out_w.reshape(CLASSES, BLOCKS, block_width)
-    mismatches = np.empty((n, CLASSES, BLOCKS), dtype=np.int64)
-    for b in range(BLOCKS):
-        mismatches[:, :, b] = (hb[:, None, b, :] != wb_out[None, :, b, :]).sum(axis=2)
-    z = block_width - 2 * mismatches
-    return (scale[None, :, :] * z).sum(axis=2) + bias[None, :]
+    out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
+    acc = np.zeros((n, CLASSES), dtype=np.int64)
+    for plane, (lo, hi) in enumerate(model.bounds):
+        mismatches = (x_bits[:, None, lo:hi] != out_w[None, :, lo:hi]).sum(axis=2)
+        z = (hi - lo) - 2 * mismatches
+        acc += q[None, :, plane].astype(np.int64) * z
+    return step[None, :] * acc.astype(np.float32) + bias[None, :]
 
 
 if __name__ == "__main__":

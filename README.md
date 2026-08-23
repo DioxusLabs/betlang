@@ -11,7 +11,7 @@ betlang = "0.1.1"
 ```
 
 ```rust
-let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+let detection = betlang::detect("fn main() {\n    println!(\"hello, world!\");\n}\n");
 
 assert_eq!(detection.language(), Some(betlang::Language::Rust));
 ```
@@ -44,34 +44,37 @@ The confusion matrix uses the same labels:
 
 ## Model
 
-The embedded model is `assets/magika/source-bloom.bin`, a 1,932,116-byte
-weights-only MBL3 payload with SHA-256:
+The embedded model is `assets/magika/source-bloom.bin`, a 26,808-byte
+weights-only MBL4 payload (1.8x smaller than the 47,840-byte convolutional
+student it replaces) with SHA-256:
 
 ```text
-4d01e7996aee5a9cd5c3582fa97ca025390276cdea022b7594f46ec69da57616
+7d78f5778248096b450155c9e56ae5d0281b6932dbf1d6b98142b518a5aca1f0
 ```
 
 Architecture: a deterministic counting-Bloom n-gram signature (byte n-grams,
-case-folded words, and tokenizer-v3 unit n-grams hashed into 78 binary planes
-of 4,096 bits) followed by a binary {-1,+1} linear head evaluated entirely
-with XOR + popcount plus one float multiply-add per (class, plane). On the
-rebuilt held-out filesystem-label test split it reaches
-`test_fs_accuracy=0.947959` versus `0.944888` for the previous convolutional
-student on the same split.
+case-folded words, and tokenizer-v3 unit n-grams hashed into 50 compact
+binary planes totalling 3,968 bits) followed by a binary {-1,+1} linear head
+evaluated entirely with XOR + popcount plus one int8 multiply per (class,
+plane) and one float multiply-add per class. On the rebuilt held-out
+filesystem-label test split it reaches `test_fs_accuracy=0.899` versus
+`0.945` for the previous 47,840-byte convolutional student on the same
+split — the accuracy cost of shipping a 1.8x smaller artifact that runs
+entirely on binary CPU ops.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
 ## Performance
 
 Betlang uses a fixed 4096-byte Magika window. The byte window is hashed into a
-319,488-bit binary signature and the 48 logits are computed with XOR +
+3,968-bit binary signature and the 48 logits are computed with XOR +
 popcount over packed u64 words. The model is loaded once per process and then
 reused through a `OnceLock`.
 
 Benchmark entry points are available through `cargo bench`. Current baseline
-numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md); the binary model is
-~24x faster than the previous convolutional student on short inputs and ~90x
-faster on full 4 KiB windows on the same host.
+numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md); the compact binary
+model is ~310x faster than the previous convolutional student on short inputs
+and ~740x faster on full 4 KiB windows on the same host.
 
 ## License And Attribution
 

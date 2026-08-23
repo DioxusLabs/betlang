@@ -1,11 +1,13 @@
 # Training the betlang Bloom binary model
 
-The model shipped in `assets/magika/source-bloom.bin` is a 1,932,116-byte
-weights-only MBL3 payload: a deterministic counting-Bloom n-gram signature
-(78 planes x 4,096 bits = 319,488 bits) plus a binary {-1,+1} linear head
-evaluated with XOR + popcount. On the rebuilt ungated held-out
-filesystem-label test split it scores **0.947959 fs_accuracy** versus
-**0.944888** for the previous wordseq MSQ1 student on the same split.
+The model shipped in `assets/magika/source-bloom.bin` is a 26,808-byte
+weights-only MBL4 payload: a deterministic compact counting-Bloom n-gram
+signature (50 planes of 64-128 bits = 3,968 bits) plus a binary {-1,+1}
+linear head evaluated with XOR + popcount. On the rebuilt ungated held-out
+filesystem-label test split it scores **0.899176 fs_accuracy** versus
+**0.944888** for the previous 47,840-byte wordseq MSQ1 student on the same
+split — the compact artifact trades ~4.6 points of accuracy for a 1.8x
+smaller model that runs entirely on binary CPU ops.
 
 The corpus, cache, and evaluation split are rebuilt entirely from ungated
 public sources (`--no-gated`), so metrics are not comparable to numbers
@@ -16,30 +18,33 @@ evaluated on the identical rebuilt split.
 
 | File | Purpose |
 |---|---|
-| `train_bloom_head.py` | Bloom signature encoder, binary-head trainer, MBL3 exporter, and integer simulator for the shipped model. |
-| `export_bloom_golden.py` | Loads an MBL3 artifact, runs the integer simulator on sample files, and writes `tests/fixtures/bloom-golden.bin` for the Rust parity test. |
+| `train_bloom_head.py` | Compact Bloom signature encoder, binary-head trainer, MBL4 exporter, and integer simulator for the shipped model. |
+| `export_bloom_golden.py` | Loads an MBL4 artifact, runs the integer simulator on sample files, and writes `tests/fixtures/bloom-golden.bin` for the Rust parity test. |
 | `build_finetune_corpus.py` | Rebuilds the training corpus from The Stack (smol-xl), GitHub repo tarballs, and synthetic ambiguous Markdown/YAML samples. |
 | `make_pruned48_config.py` | Generates the pruned 48-label teacher config from the `magika` pip package config. |
 | `build_fs_labels.py` | Builds `{split}.fs_labels.mmap` (filesystem truth with teacher fallback) aligned to the cache. |
 | `train_magika_qat_student.py` | Legacy wordseq trainer; still used with `--prepare-cache-only` to build the teacher cache (tokens, teacher marginals, v3 units). |
 | `train_magika_source_student.py` | Magika teacher loader, byte-window feature extraction, cache iteration helpers. Imported by the cache builder. |
 | `eval_50kb_model.py` | Evaluates a legacy MSQ1 `.bin` on a cache split (used for the baseline comparison row). |
+| `confusion_bloom.py` | Renders `assets/confusion-overall.png` and `assets/confusion-by-size.png` for an exported MBL4 artifact. |
 | `cache_self_distill.py`, `train_v2_student.py`, `hard_gen_*.py`, `confusion_by_size.py` | Legacy wordseq recipe tooling, kept for reference. |
 
 ## Recipe
 
 ```
-signature:      counting-Bloom, 78 planes x 4096 bits (319,488 bits)
+signature:      compact counting-Bloom, 50 planes of 64-128 bits (3,968 bits)
 features:       byte n-grams orders 1-8 (begin/end halves), case-folded words
                 (2 hash folds), word bigrams/trigrams, line-start words,
-                tokenizer-v3 unit n-grams orders 1-4
-binarization:   thermometer thresholds over bucket counts (1/2/4/8)
+                tokenizer-v3 unit n-grams orders 1-4; each 4,096-bucket
+                count block is folded into small power-of-two views taken
+                from different hash bit fields
+binarization:   thermometer thresholds over folded bucket counts (1/2/4/8)
 head:           binary {-1,+1} linear, straight-through estimator,
-                per-(class, plane) float scale + per-class bias
+                per-(class, plane) int8 scale + per-class f32 step and bias
 soft targets:   Magika v3.3 raw head marginals, per-class sigmoid BCE (0.5)
 hard targets:   filesystem labels, CE with 0.05 label smoothing (0.5)
 optimizer:      Adam 1e-3, 1000 warmup steps, cosine decay, grad-clip
-epochs:         30, EMA weights for evaluation, best checkpoint by valid fs
+epochs:         300, EMA weights for evaluation, best checkpoint by valid fs
 seed:           2
 ```
 
@@ -85,31 +90,30 @@ seed:           2
      --cache-dir /tmp/betlang-cache
    ```
 
-4. **Train + export** — encode Bloom signatures (cached to
-   `{split}.bloom319488_v6.mmap` on first run) and train the binary head:
+4. **Train + export** — encode compact Bloom signatures (cached to
+   `{split}.bloom3968_v6.mmap` on first run) and train the binary head:
 
    ```bash
    python3 scripts/train_bloom_head.py \
      --cache-dir /tmp/betlang-cache \
      --output assets/magika/source-bloom.bin \
-     --hidden-per-block 0 \
-     --epochs 30 \
+     --epochs 300 \
      --hard-labels fs \
      --soft-loss-weight 0.5 \
      --hard-loss-weight 0.5 \
      --learning-rate 1e-3 \
      --warmup-steps 1000 \
-     --augment-fraction 0.15 \
+     --augment-fraction 0.35 \
      --threads 8
    ```
 
-   `--augment-fraction 0.15` mixes in short prefix crops (12–1,024 bytes,
+   `--augment-fraction 0.35` mixes in short prefix crops (12–1,024 bytes,
    hard labels only) so tiny standalone snippets are represented in training.
 
-   Training runs on CPU (no GPU needed; ~2 hours on 8 cores). After the last
-   epoch the script prints test metrics and verifies the exported artifact
-   with its integer simulator (`argmax agreement=1.0000` is expected — the
-   export is lossless).
+   Training runs on CPU (no GPU needed; ~2.5 hours on 8 cores). After the
+   last epoch the script prints test metrics and verifies the exported
+   artifact with its integer simulator (`argmax agreement=1.0000` is
+   expected — the export is lossless).
 
 5. **Golden vectors** — regenerate the Rust parity fixture whenever the
    artifact changes:
@@ -127,12 +131,13 @@ seed:           2
 
 ## Expected metrics
 
-Printed by `train_bloom_head.py` after the final epoch:
+Printed by `train_bloom_head.py` after the final epoch (quantized-artifact
+numbers, which the exported model reproduces exactly):
 
 ```
-test_teacher_parity=0.929505
-test_fs_accuracy=0.947959
-test_fs_macro_recall=0.923254
+test_teacher_parity=0.885892
+test_fs_accuracy=0.899176
+test_fs_macro_recall=0.879002
 ```
 
 Baseline for the previous MSQ1 student on the same rebuilt cache:

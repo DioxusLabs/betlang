@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render the README confusion-matrix PNGs for an exported Bloom MBL3 model.
+"""Render the README confusion-matrix PNGs for an exported Bloom MBL4 model.
 
 Evaluates the artifact on a cache split with the vectorized integer simulator,
 aligns cache rows to raw file sizes by hashing token windows against the
@@ -31,27 +31,29 @@ from confusion_by_size import (  # noqa: E402
     render_overall_png,
     render_size_png,
 )
-from export_bloom_golden import load_mbl3  # noqa: E402
-from train_bloom_head import BITS, BLOCK_BITS, BLOCKS, CLASSES, WORDS  # noqa: E402
+from export_bloom_golden import load_mbl4  # noqa: E402
+from train_bloom_head import BITS, CLASSES, PLANES, WORDS  # noqa: E402
 
 
-def batch_logits(model: dict[str, np.ndarray | int], signatures: np.ndarray) -> np.ndarray:
-    """Vectorized XOR/popcount forward for hidden-free MBL3 artifacts."""
-    assert int(model["hidden"]) == 0, "confusion_bloom only supports hidden==0"
+def batch_logits(model: dict[str, np.ndarray], signatures: np.ndarray) -> np.ndarray:
+    """Vectorized XOR/popcount forward for MBL4 artifacts."""
     n = signatures.shape[0]
     bits = np.unpackbits(
         signatures.view(np.uint8).reshape(n, -1), axis=1, bitorder="little"
     )[:, :BITS]
-    head = np.asarray(model["head_w"]).reshape(CLASSES, int(model["head_words"]))
     w_bits = np.unpackbits(
-        head.view(np.uint8).reshape(CLASSES, -1), axis=1, bitorder="little"
+        model["head"].view(np.uint8).reshape(CLASSES, -1), axis=1, bitorder="little"
     )[:, :BITS]
-    x_pm = 2 * bits.reshape(n, BLOCKS, BLOCK_BITS).astype(np.int32) - 1
-    w_pm = 2 * w_bits.reshape(CLASSES, BLOCKS, BLOCK_BITS).astype(np.int32) - 1
-    z = np.einsum("nbk,cbk->ncb", x_pm, w_pm, optimize=True)
-    scale = np.asarray(model["scale"], dtype=np.float64)
-    bias = np.asarray(model["bias"], dtype=np.float64)
-    return (scale[None] * z).sum(axis=2) + bias[None]
+    x_pm = 2 * bits.astype(np.int32) - 1
+    w_pm = 2 * w_bits.astype(np.int32) - 1
+    acc = np.zeros((n, CLASSES), dtype=np.int64)
+    at = 0
+    for plane, (_, _, _, width) in enumerate(PLANES):
+        z = x_pm[:, at:at + width] @ w_pm[:, at:at + width].T
+        acc += model["q"][None, :, plane].astype(np.int64) * z
+        at += width
+    step = model["step"].astype(np.float32)
+    return step[None, :] * acc.astype(np.float32) + model["bias"][None, :].astype(np.float32)
 
 
 def main() -> int:
@@ -83,7 +85,7 @@ def main() -> int:
         )
     )
 
-    model = load_mbl3(args.model)
+    model = load_mbl4(args.model)
     preds = np.empty(count, dtype=np.int64)
     for start in range(0, count, args.batch_size):
         stop = min(start + args.batch_size, count)

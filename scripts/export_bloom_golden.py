@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Export golden vectors for the Rust MBL3 Bloom runtime parity test.
+"""Export golden vectors for the Rust MBL4 Bloom runtime parity test.
 
 For each sample source file this script mirrors the full production pipeline
 in Python — byte window construction, tokenizer-v3 word units, Bloom signature
-encoding, and integer inference over the exported MBL3 artifact — and writes
+encoding, and integer inference over the exported MBL4 artifact — and writes
 the raw source bytes plus expected logits to a fixture consumed by
 `bloom_matches_python_golden_vectors` in src/model/tests.rs.
 
@@ -36,10 +36,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from train_bloom_head import (  # noqa: E402
     BITS,
-    BLOCK_BITS,
     BLOCKS,
     CLASSES,
     PAD,
+    PLANES,
     TOKEN_LENGTH,
     encode_windows,
     zobrist_tables,
@@ -71,38 +71,30 @@ def build_token_window(source: bytes) -> np.ndarray | None:
     return tokens
 
 
-def load_mbl3(path: Path) -> dict[str, np.ndarray | int]:
+def load_mbl4(path: Path) -> dict[str, np.ndarray]:
     blob = path.read_bytes()
-    assert blob[:4] == b"MBL3", "bad magic"
-    block_bits, planes, hidden, classes = struct.unpack_from("<IIII", blob, 4)
-    assert block_bits == BLOCK_BITS and planes == BLOCKS and classes == CLASSES
-    cur = 20
-    scale = np.frombuffer(blob, dtype="<f4", count=classes * planes,
-                          offset=cur).reshape(classes, planes)
-    cur += 4 * classes * planes
+    assert blob[:4] == b"MBL4", "bad magic"
+    bits, planes, classes = struct.unpack_from("<III", blob, 4)
+    assert bits == BITS and planes == BLOCKS and classes == CLASSES
+    cur = 16
+    table = []
+    for _ in range(planes):
+        group, shift, level, width_log2 = struct.unpack_from("<BBBB", blob, cur)
+        table.append((group, shift, level, 1 << width_log2))
+        cur += 4
+    assert table == [tuple(plane) for plane in PLANES], "plane table drift"
+    q = np.frombuffer(blob, dtype=np.int8, count=classes * planes,
+                      offset=cur).reshape(classes, planes)
+    cur += classes * planes
+    step = np.frombuffer(blob, dtype="<f4", count=classes, offset=cur)
+    cur += 4 * classes
     bias = np.frombuffer(blob, dtype="<f4", count=classes, offset=cur)
     cur += 4 * classes
-    model: dict[str, np.ndarray | int] = {"hidden": hidden, "scale": scale, "bias": bias}
-    if hidden > 0:
-        units = planes * hidden
-        rows = units * (BLOCK_BITS // 64)
-        model["hidden_w"] = np.frombuffer(blob, dtype="<u8", count=rows, offset=cur)
-        cur += 8 * rows
-        model["hidden_thr"] = np.frombuffer(blob, dtype="<i2", count=units, offset=cur)
-        cur += 2 * units
-        flip_words = (units + 63) // 64
-        model["hidden_flip"] = np.frombuffer(blob, dtype="<u8", count=flip_words, offset=cur)
-        cur += 8 * flip_words
-        head_bits = units
-    else:
-        head_bits = BITS
-    head_words = (head_bits + 63) // 64
-    model["head_w"] = np.frombuffer(blob, dtype="<u8", count=classes * head_words, offset=cur)
-    cur += 8 * classes * head_words
+    words = bits // 64
+    head = np.frombuffer(blob, dtype="<u8", count=classes * words, offset=cur)
+    cur += 8 * classes * words
     assert cur == len(blob), f"trailing bytes: {len(blob) - cur}"
-    model["head_bits"] = head_bits
-    model["head_words"] = head_words
-    return model
+    return {"q": q, "step": step, "bias": bias, "head": head.reshape(classes, words)}
 
 
 def unpack_bits(words: np.ndarray, nbits: int) -> np.ndarray:
@@ -110,38 +102,21 @@ def unpack_bits(words: np.ndarray, nbits: int) -> np.ndarray:
     return raw[:nbits]
 
 
-def forward(model: dict[str, np.ndarray | int], signature: np.ndarray) -> np.ndarray:
+def forward(model: dict[str, np.ndarray], signature: np.ndarray) -> np.ndarray:
     """Integer forward pass identical to BloomModel::logits."""
     x = unpack_bits(signature, BITS)
-    hidden = int(model["hidden"])
-    if hidden > 0:
-        units = BLOCKS * hidden
-        block_words = BLOCK_BITS // 64
-        hw = np.asarray(model["hidden_w"]).reshape(units, block_words)
-        thr = np.asarray(model["hidden_thr"])
-        flips = unpack_bits(np.asarray(model["hidden_flip"]), units)
-        xb = x.reshape(BLOCKS, BLOCK_BITS)
-        w_bits = np.unpackbits(
-            hw.view(np.uint8).reshape(units, -1), axis=1, bitorder="little"
-        )[:, :BLOCK_BITS]
-        mism = (xb[np.arange(units) // hidden] != w_bits).sum(axis=1)
-        head_in = ((mism <= thr).astype(np.uint8) ^ flips).astype(np.uint8)
-    else:
-        head_in = x
-    head_bits = int(model["head_bits"])
-    head_words = int(model["head_words"])
-    block_width = hidden if hidden > 0 else BLOCK_BITS
-    head = np.asarray(model["head_w"]).reshape(CLASSES, head_words)
     w_bits = np.unpackbits(
-        head.view(np.uint8).reshape(CLASSES, -1), axis=1, bitorder="little"
-    )[:, :head_bits]
-    hb = head_in.reshape(BLOCKS, block_width)
-    wb = w_bits.reshape(CLASSES, BLOCKS, block_width)
-    mism = (hb[None, :, :] != wb).sum(axis=2)  # (CLASSES, BLOCKS)
-    z = block_width - 2 * mism
-    scale = np.asarray(model["scale"], dtype=np.float64)
-    bias = np.asarray(model["bias"], dtype=np.float64)
-    return ((scale * z).sum(axis=1) + bias).astype(np.float32)
+        model["head"].view(np.uint8).reshape(CLASSES, -1), axis=1, bitorder="little"
+    )[:, :BITS]
+    acc = np.zeros(CLASSES, dtype=np.int64)
+    at = 0
+    for plane, (_, _, _, width) in enumerate(PLANES):
+        mism = (x[None, at:at + width] != w_bits[:, at:at + width]).sum(axis=1)
+        z = width - 2 * mism
+        acc += model["q"][:, plane].astype(np.int64) * z
+        at += width
+    step = model["step"].astype(np.float32)
+    return step * acc.astype(np.float32) + model["bias"].astype(np.float32)
 
 
 def main() -> int:
@@ -151,7 +126,7 @@ def main() -> int:
     parser.add_argument("sources", type=Path, nargs="+")
     args = parser.parse_args()
 
-    model = load_mbl3(args.model)
+    model = load_mbl4(args.model)
     tables = zobrist_tables()
 
     blob = bytearray(b"BGL1")

@@ -3,10 +3,10 @@
 ## Artifact
 
 - File: `assets/magika/source-bloom.bin`
-- Format: weights-only MBL3 binary payload
-- Size: 1,932,116 bytes
-- SHA-256: `4d01e7996aee5a9cd5c3582fa97ca025390276cdea022b7594f46ec69da57616`
-- Architecture: counting-Bloom n-gram signature + binary linear head
+- Format: weights-only MBL4 binary payload
+- Size: 26,808 bytes (1.8x smaller than the 47,840-byte convolutional student it replaces)
+- SHA-256: `7d78f5778248096b450155c9e56ae5d0281b6932dbf1d6b98142b518a5aca1f0`
+- Architecture: compact counting-Bloom n-gram signature + binary linear head
 - Tokenizer: raw byte n-grams plus word-unit tokenizer version 3
 - Output head: 48 model labels exposed one-to-one as public `Language` variants
 
@@ -23,13 +23,17 @@ dominated by integer XOR + popcount:
    folds), word bigram/trigram, line-start word, and tokenizer-v3 unit n-gram
    (orders 1–4) is hashed with a fixed SplitMix64-seeded Zobrist table into a
    4,096-bucket counting Bloom block.
-3. **Thermometer binarization** — each bucket count passes through fixed
-   thresholds (1/2/4/8 depending on the feature group), producing 78 binary
-   planes of 4,096 bits: a 319,488-bit signature packed into 4,992 u64 words.
+3. **Compact folding + thermometer binarization** — each 4,096-bucket block is
+   folded into one or more small power-of-two views (64–128 buckets, taken
+   from different bit fields of the hash), and each folded bucket count passes
+   through fixed thresholds (1/2/4/8 depending on the feature group). This
+   yields 50 compact binary planes totalling 3,968 bits packed into 62 u64
+   words.
 4. **Binary head** — each of the 48 classes holds a packed {-1,+1} weight row.
-   The logit is `bias + Σ_plane scale[class][plane] * (4096 - 2*popcount(x XOR w))`,
-   i.e. an XOR/popcount dot product with one float multiply-add per
-   (class, plane). A softmax over the 48 logits produces probabilities.
+   The logit is `bias + step[class] * Σ_plane q[class][plane] * (width - 2*popcount(x XOR w))`,
+   i.e. an XOR/popcount dot product with one int8 multiply per (class, plane)
+   and a single float multiply-add per class. A softmax over the 48 logits
+   produces probabilities.
 
 The encoder is exact integer arithmetic, so the Python trainer/simulator and
 the Rust runtime produce bit-identical signatures and matching logits
@@ -52,7 +56,7 @@ targets on a rebuilt public corpus (see `scripts/build_finetune_corpus.py`):
 - **Hard targets** — filesystem-extension labels with cross-entropy and 0.05
   label smoothing (weight 0.5).
 
-Training additionally mixes in short prefix crops (12–1,024 bytes, 15% of the
+Training additionally mixes in short prefix crops (12–1,024 bytes, 35% of the
 train count, hard labels only) so tiny standalone snippets see n-gram
 statistics that match real short files.
 
@@ -77,16 +81,19 @@ corpus avoids the gated `bigcode/the-stack` dataset, so these numbers are not
 comparable to metrics previously reported for the retired MSQ1 artifact on its
 own rebuilt split.
 
-| Model | fs_accuracy | macro_recall | teacher_parity |
-|---|---:|---:|---:|
-| Bloom binary head (shipped) | **0.947959** | 0.923254 | 0.929505 |
-| Previous wordseq MSQ1 student | 0.944888 | 0.937713 | 0.952408 |
+| Model | size (bytes) | fs_accuracy | macro_recall | teacher_parity |
+|---|---:|---:|---:|---:|
+| Compact Bloom binary head (shipped) | **26,808** | 0.899176 | 0.879002 | 0.885892 |
+| Previous wordseq MSQ1 student | 47,840 | 0.944888 | 0.937713 | 0.952408 |
+| Large Bloom binary head (not shipped) | 1,932,116 | 0.947959 | 0.923254 | 0.929505 |
 
-The binary model beats the previous student on filesystem-label accuracy while
-running on XOR/popcount instead of floating-point convolutions. Its macro
-recall and teacher parity are lower: the binary head optimizes filesystem
-truth directly rather than mimicking the teacher, so it disagrees with the
-teacher more often, mostly on ambiguous rows.
+The shipped compact model trades accuracy for size: it is 1.8x smaller than
+the previous convolutional student and runs on XOR/popcount instead of
+floating-point convolutions, at a ~4.6 point filesystem-accuracy cost. The
+same architecture recovers the accuracy when given more bits (the large
+319,488-bit variant reaches 0.948), so the signature width is a direct
+size/accuracy dial: on the same split a ~19 KB variant (2,752 bits) measured
+0.83 and a ~42 KB variant (6,528 bits) measured 0.927.
 
 Most remaining confusion sits on genuinely ambiguous pairs: `c`/`cpp`,
 `javascript`/`typescript`, `markdown`/`yaml`, `ini`/`toml`, `batch`/`shell`,

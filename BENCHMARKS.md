@@ -3,7 +3,7 @@
 Baselines are informational. They are useful for spotting large regressions, but
 not part of Betlang's semver contract.
 
-## 2026-08-22 (Bloom binary model)
+## 2026-08-23 (compact Bloom binary model, 26,808-byte MBL4)
 
 Environment:
 
@@ -18,13 +18,14 @@ cargo bench --bench detect
 
 | Case | Bytes | Median time | Throughput |
 |---|---:|---:|---:|
-| short | 496 | 595.51 µs/inference | 0.833 MB/s |
-| full window | 4970 | 610.22 µs/inference | 8.145 MB/s |
+| short | 496 | 45.674 µs/inference | 10.860 MB/s |
+| full window | 4970 | 73.806 µs/inference | 67.338 MB/s |
 
 The previous convolutional model measured on the same host, snippet, and
 command: short 14.201 ms/inference, full window 54.904 ms/inference — the
-binary XOR/popcount head is ~24x faster on short inputs and ~90x faster on a
-full 4 KiB window.
+compact binary XOR/popcount model is ~310x faster on short inputs and ~740x
+faster on a full 4 KiB window (and ~8-13x faster than the retired 319,488-bit
+large Bloom variant, which measured 595.51 µs short / 610.22 µs full window).
 
 ## 2026-05-15 (previous convolutional model)
 

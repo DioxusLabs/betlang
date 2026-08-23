@@ -1,25 +1,30 @@
-//! Shannon n-gram counting-Bloom binary model (MBL3) runtime.
+//! Shannon n-gram counting-Bloom binary model (MBL4) runtime.
 //!
-//! The encoder turns the 2048-token Magika window into a fixed-width binary
+//! The encoder turns the 2048-token Magika window into a compact binary
 //! signature using only table lookups, XOR, rotates, and integer compares:
 //! every byte n-gram (orders 1-8, computed separately for the begin/end half)
 //! is given a 64-bit Zobrist code — the XOR of per-offset random codes, i.e. a
-//! Shannon random block code over (symbol, offset) pairs — and folded into a
-//! per-(half, order) counting-Bloom block. Bucket counts pass through a fixed
-//! thermometer (1/2/4/8 for orders <= 3, 1/2 for 4-5, presence for 6-8), a
-//! quantized log-frequency — Shannon surprisal — encoding of each n-gram.
+//! Shannon random block code over (symbol, offset) pairs — and counted in one
+//! or more small counting-Bloom views per (half, order) group. A view takes
+//! `width` power-of-two buckets from a bit-field of the hash (`shift`), so a
+//! group can expose several independent folds of the same n-gram stream.
+//! Bucket counts pass through per-plane thermometer thresholds (quantized
+//! log-frequency — Shannon surprisal — of each n-gram), giving a few thousand
+//! signature bits instead of hundreds of thousands.
 //!
-//! The classifier is binary as well: an optional block-diagonal binary hidden
-//! layer (XOR + popcount + threshold per plane) followed by a binary dense
-//! layer, so inference is XOR/popcount end to end. The dense layer combines
-//! per-plane bipolar dot products with a small per-(class, plane) float scale
-//! (XNOR-net style calibration; CLASSES * PLANES multiply-adds per file).
+//! The classifier is a binary {-1,+1} linear head evaluated with XOR +
+//! popcount per (class, plane), combined with a per-(class, plane) int8 scale
+//! and a per-class f32 step (XNOR-net style calibration), so inference stays
+//! binary end to end with one float multiply per class.
+//!
+//! The view/plane layout is read from the artifact, not hard-coded: the
+//! trainer's plane table drives both feature encoding and the head.
 
 use std::sync::OnceLock;
 
 pub(crate) static BLOOM_BYTES: &[u8] = include_bytes!("../../assets/magika/source-bloom.bin");
 
-pub(crate) const BLOOM_MAGIC: [u8; 4] = *b"MBL3";
+pub(crate) const BLOOM_MAGIC: [u8; 4] = *b"MBL4";
 
 pub(crate) const TOKENS: usize = 2_048;
 pub(crate) const PAD_TOKEN: u16 = 256;
@@ -28,8 +33,6 @@ pub(crate) const HALF: usize = TOKENS / 2;
 pub(crate) const CLASSES: usize = 48;
 
 pub(crate) const MAX_ORDER: usize = 8;
-pub(crate) const BLOCK_BITS: usize = 4_096;
-pub(crate) const BLOCK_WORDS: usize = BLOCK_BITS / 64;
 pub(crate) const NGRAM_GROUPS: usize = 2 * MAX_ORDER;
 /// Word-unit counting groups per half: unigrams (two independent hash
 /// folds), bigrams, trigrams, and line-start unigrams.
@@ -38,37 +41,6 @@ pub(crate) const WORD_GROUPS: usize = 10;
 pub(crate) const UNIT_MAX_ORDER: usize = 4;
 pub(crate) const UNIT_GROUPS: usize = UNIT_MAX_ORDER;
 pub(crate) const GROUPS: usize = NGRAM_GROUPS + WORD_GROUPS + UNIT_GROUPS;
-pub(crate) const COUNT_BUCKETS: usize = GROUPS * BLOCK_BITS;
-
-/// Count thermometer levels per n-gram order (1-based order = index + 1).
-pub(crate) const ORDER_LEVELS: [&[u16]; MAX_ORDER] = [
-    &[1, 2, 4, 8],
-    &[1, 2, 4, 8],
-    &[1, 2, 4, 8],
-    &[1, 2],
-    &[1, 2],
-    &[1],
-    &[1],
-    &[1],
-];
-/// Count thermometer levels per word feature kind (uni fold 1, bigram,
-/// uni fold 2, trigram, line-start unigram).
-pub(crate) const WORD_LEVELS: [&[u16]; 5] = [
-    &[1, 2, 4, 8],
-    &[1, 2],
-    &[1, 2, 4, 8],
-    &[1, 2],
-    &[1, 2, 4, 8],
-];
-/// Count thermometer levels per wordseq-unit n-gram order.
-pub(crate) const UNIT_LEVELS: [&[u16]; UNIT_MAX_ORDER] = [&[1, 2, 4, 8], &[1, 2], &[1], &[1]];
-
-/// Total signature planes: one BLOCK_BITS-wide bit plane per (order, half,
-/// level) nested in that order, followed by word (kind, half, level) planes
-/// and wordseq-unit (order, level) planes.
-pub(crate) const PLANES: usize = 78;
-pub(crate) const BITS: usize = PLANES * BLOCK_BITS;
-pub(crate) const WORDS: usize = BITS / 64;
 
 const ZOBRIST_SEED: u64 = 0xBE7A_1AB5_5EED_0001;
 const UNIT_SEED: u64 = 0xBE7A_1AB5_5EED_0002;
@@ -126,159 +98,37 @@ fn casefold(symbol: u16) -> u16 {
     }
 }
 
-/// Encode a token window plus its tokenizer-v3 unit stream into the packed
-/// binary signature.
-pub(crate) fn encode_signature(tokens: &[u16; TOKENS], units: &[i32]) -> Box<[u64; WORDS]> {
-    static ZOBRIST: OnceLock<Box<[[u64; SYMBOLS]; TABLES]>> = OnceLock::new();
-    let tables = ZOBRIST.get_or_init(zobrist_tables);
+/// One counting-Bloom fold of a group's hash stream: `width` buckets taken
+/// from the hash bit-field starting at `shift`.
+struct View {
+    shift: u32,
+    mask: u64,
+    /// Start of this view's buckets in the per-inference counts buffer.
+    offset: usize,
+}
 
-    let mut counts = vec![0u16; COUNT_BUCKETS];
-    for half in 0..2 {
-        let htok = &tokens[half * HALF..(half + 1) * HALF];
-        for position in 0..HALF {
-            let mut acc = 0u64;
-            let mut valid = true;
-            for (order_index, table) in tables.iter().take(MAX_ORDER).enumerate() {
-                let symbol = if position >= order_index {
-                    htok[position - order_index]
-                } else {
-                    PAD_TOKEN
-                };
-                acc ^= table[symbol as usize];
-                valid &= symbol != PAD_TOKEN;
-                if valid {
-                    let rotated = acc.rotate_left((7 * order_index + half) as u32 & 63);
-                    let bucket = (rotated as usize) & (BLOCK_BITS - 1);
-                    let group = 2 * order_index + half;
-                    counts[group * BLOCK_BITS + bucket] =
-                        counts[group * BLOCK_BITS + bucket].saturating_add(1);
-                }
-            }
-        }
-
-        // Word-unit scan: rotate-XOR chain over casefolded identifier bytes,
-        // emitting unigrams (two folds), a bigram/trigram with the previous
-        // words of the same half, and a line-start unigram when the word
-        // begins a line.
-        let word_table = &tables[MAX_ORDER];
-        let uni_group = NGRAM_GROUPS + half;
-        let bi_group = NGRAM_GROUPS + 2 + half;
-        let uni2_group = NGRAM_GROUPS + 4 + half;
-        let tri_group = NGRAM_GROUPS + 6 + half;
-        let ls_group = NGRAM_GROUPS + 8 + half;
-        let mut bump = |group: usize, hash: u64, rot: usize| {
-            let bucket = (hash.rotate_left(rot as u32) as usize) & (BLOCK_BITS - 1);
-            counts[group * BLOCK_BITS + bucket] =
-                counts[group * BLOCK_BITS + bucket].saturating_add(1);
-        };
-        let mut acc_w = 0u64;
-        let mut prev_hash = 0u64;
-        let mut prev2_hash = 0u64;
-        let mut have_prev = false;
-        let mut have_prev2 = false;
-        let mut at_linestart = false;
-        for position in 0..HALF {
-            let symbol = htok[position];
-            if !is_word_symbol(symbol) {
-                acc_w = 0;
-                continue;
-            }
-            if position == 0 || !is_word_symbol(htok[position - 1]) {
-                at_linestart = position == 0
-                    || htok[position - 1] == u16::from(b'\n')
-                    || htok[position - 1] == u16::from(b'\r');
-            }
-            acc_w = acc_w.rotate_left(1) ^ word_table[casefold(symbol) as usize];
-            let at_end = position + 1 >= HALF || !is_word_symbol(htok[position + 1]);
-            if !at_end {
-                continue;
-            }
-            bump(uni_group, acc_w, 23 + half);
-            bump(uni2_group, acc_w, 41 + half);
-            let bg = prev_hash.rotate_left(17) ^ acc_w;
-            if have_prev {
-                bump(bi_group, bg, 29 + half);
-            }
-            if have_prev2 {
-                let tg = prev2_hash.rotate_left(34) ^ bg;
-                bump(tri_group, tg, 47 + half);
-            }
-            if at_linestart {
-                bump(ls_group, acc_w, 53 + half);
-            }
-            prev2_hash = prev_hash;
-            prev_hash = acc_w;
-            have_prev2 = have_prev;
-            have_prev = true;
-        }
-    }
-
-    // Wordseq-unit n-grams: SplitMix64 codes salted per offset, XOR-combined.
-    let salts = unit_salts();
-    for position in 0..units.len() {
-        let mut acc = 0u64;
-        for (order_index, salt) in salts.iter().enumerate() {
-            if position < order_index {
-                break;
-            }
-            acc ^= splitmix64(units[position - order_index] as u64 ^ salt);
-            let group = NGRAM_GROUPS + WORD_GROUPS + order_index;
-            let bucket =
-                (acc.rotate_left((11 * order_index + 5) as u32) as usize) & (BLOCK_BITS - 1);
-            counts[group * BLOCK_BITS + bucket] =
-                counts[group * BLOCK_BITS + bucket].saturating_add(1);
-        }
-    }
-
-    let mut signature = Box::new([0u64; WORDS]);
-    let mut plane = 0;
-    let mut emit = |group: usize, level: u16, plane: &mut usize| {
-        let block = &counts[group * BLOCK_BITS..(group + 1) * BLOCK_BITS];
-        let base = *plane * BLOCK_WORDS;
-        for (bucket, &count) in block.iter().enumerate() {
-            let bit = (count >= level) as u64;
-            signature[base + bucket / 64] |= bit << (bucket % 64);
-        }
-        *plane += 1;
-    };
-    for (order_index, levels) in ORDER_LEVELS.iter().enumerate() {
-        for half in 0..2 {
-            for &level in levels.iter() {
-                emit(2 * order_index + half, level, &mut plane);
-            }
-        }
-    }
-    for (kind, levels) in WORD_LEVELS.iter().enumerate() {
-        for half in 0..2 {
-            for &level in levels.iter() {
-                emit(NGRAM_GROUPS + 2 * kind + half, level, &mut plane);
-            }
-        }
-    }
-    for (order_index, levels) in UNIT_LEVELS.iter().enumerate() {
-        for &level in levels.iter() {
-            emit(NGRAM_GROUPS + WORD_GROUPS + order_index, level, &mut plane);
-        }
-    }
-    debug_assert_eq!(plane, PLANES);
-    signature
+/// One signature bit-plane: `counts[view] >= level` over the view's buckets.
+struct Plane {
+    view: usize,
+    level: u16,
+    width: usize,
+    /// Start of this plane's bits in the packed signature (multiple of 64).
+    word_offset: usize,
 }
 
 pub(crate) struct BloomModel {
-    hidden_per_block: usize,
-    /// `PLANES * hidden` rows of `BLOCK_WORDS` packed hidden weights.
-    hidden_weights: Box<[u64]>,
-    /// Per-unit mismatch thresholds: `bit = (mismatches <= thr) ^ flip`.
-    hidden_thresholds: Box<[i16]>,
-    /// Packed per-unit output flips.
-    hidden_flips: Box<[u64]>,
-    /// `CLASSES` rows of packed head weights over the head input bits.
+    /// Distinct (group, shift, width) folds, with per-group index ranges.
+    views: Box<[View]>,
+    group_views: [(u16, u16); GROUPS],
+    count_slots: usize,
+    planes: Box<[Plane]>,
+    /// Total signature bits (a multiple of 64).
+    bits: usize,
+    /// `CLASSES` rows of packed head weights over the signature bits.
     head_weights: Box<[u64]>,
-    head_words: usize,
-    /// Bits per head-input block (`BLOCK_BITS`, or `hidden_per_block`).
-    head_block_bits: usize,
-    /// `CLASSES * PLANES` per-(class, plane) scales.
-    scale: Box<[f32]>,
+    /// Per-(class, plane) int8 scale, applied as `step[class] * q`.
+    scale_q: Box<[i8]>,
+    scale_step: [f32; CLASSES],
     bias: [f32; CLASSES],
 }
 
@@ -308,74 +158,95 @@ fn read_words(bytes: &[u8], cur: &mut usize, count: usize) -> Box<[u64]> {
     out.into_boxed_slice()
 }
 
-fn read_i16s(bytes: &[u8], cur: &mut usize, count: usize) -> Box<[i16]> {
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let at = *cur + i * 2;
-        out.push(i16::from_le_bytes([bytes[at], bytes[at + 1]]));
-    }
-    *cur += count * 2;
-    out.into_boxed_slice()
-}
-
-fn words_for_bits(bits: usize) -> usize {
-    bits.div_ceil(64)
-}
-
 impl BloomModel {
     fn load() -> Self {
         let bytes = BLOOM_BYTES;
-        debug_assert!(bytes.starts_with(&BLOOM_MAGIC), "bad MBL3 magic");
+        debug_assert!(bytes.starts_with(&BLOOM_MAGIC), "bad MBL4 magic");
         let mut cur = BLOOM_MAGIC.len();
-        let block_bits = read_u32(bytes, &mut cur) as usize;
-        let planes = read_u32(bytes, &mut cur) as usize;
-        let hidden_per_block = read_u32(bytes, &mut cur) as usize;
+        let bits = read_u32(bytes, &mut cur) as usize;
+        let plane_count = read_u32(bytes, &mut cur) as usize;
         let classes = read_u32(bytes, &mut cur) as usize;
-        debug_assert_eq!(block_bits, BLOCK_BITS, "unexpected MBL3 block bits");
-        debug_assert_eq!(planes, PLANES, "unexpected MBL3 plane count");
-        debug_assert_eq!(classes, CLASSES, "unexpected MBL3 class count");
-        // Per-plane popcount subtotals require word-aligned head-input blocks.
-        debug_assert!(hidden_per_block.is_multiple_of(64) || hidden_per_block == 0);
+        debug_assert_eq!(classes, CLASSES, "unexpected MBL4 class count");
+        debug_assert!(bits.is_multiple_of(64), "unaligned MBL4 signature");
 
-        let mut scale = Vec::with_capacity(CLASSES * PLANES);
-        for _ in 0..CLASSES * PLANES {
-            scale.push(read_f32(bytes, &mut cur));
+        // Plane table: (group, shift, level, width_log2) per plane. Planes of
+        // the same (group, shift, width) share one counting view.
+        let mut views: Vec<(usize, View)> = Vec::new();
+        let mut group_views = [(0u16, 0u16); GROUPS];
+        let mut planes = Vec::with_capacity(plane_count);
+        let mut count_slots = 0usize;
+        let mut bit_at = 0usize;
+        for _ in 0..plane_count {
+            let group = bytes[cur] as usize;
+            let shift = bytes[cur + 1] as u32;
+            let level = bytes[cur + 2] as u16;
+            let width = 1usize << bytes[cur + 3];
+            cur += 4;
+            debug_assert!(group < GROUPS, "bad MBL4 group id");
+            debug_assert!(width >= 64, "plane narrower than a word");
+            let view = views
+                .iter()
+                .position(|&(g, ref v)| {
+                    g == group && v.shift == shift && v.mask == (width as u64 - 1)
+                })
+                .unwrap_or_else(|| {
+                    views.push((
+                        group,
+                        View {
+                            shift,
+                            mask: width as u64 - 1,
+                            offset: count_slots,
+                        },
+                    ));
+                    count_slots += width;
+                    views.len() - 1
+                });
+            planes.push(Plane {
+                view,
+                level,
+                width,
+                word_offset: bit_at / 64,
+            });
+            bit_at += width;
+        }
+        debug_assert_eq!(bit_at, bits, "MBL4 plane widths disagree with header");
+        // Views arrive grouped because the plane table nests levels inside
+        // each group; record each group's contiguous view range.
+        for (index, &(group, _)) in views.iter().enumerate() {
+            let range = &mut group_views[group];
+            if range.1 == 0 {
+                *range = (index as u16, index as u16 + 1);
+            } else {
+                debug_assert_eq!(range.1 as usize, index, "MBL4 group views not contiguous");
+                range.1 = index as u16 + 1;
+            }
+        }
+
+        let mut scale_q = Vec::with_capacity(CLASSES * plane_count);
+        for i in 0..CLASSES * plane_count {
+            scale_q.push(bytes[cur + i] as i8);
+        }
+        cur += CLASSES * plane_count;
+        let mut scale_step = [0.0f32; CLASSES];
+        for slot in scale_step.iter_mut() {
+            *slot = read_f32(bytes, &mut cur);
         }
         let mut bias = [0.0f32; CLASSES];
         for slot in bias.iter_mut() {
             *slot = read_f32(bytes, &mut cur);
         }
-
-        let (hidden_weights, hidden_thresholds, hidden_flips, head_bits);
-        if hidden_per_block > 0 {
-            let units = planes * hidden_per_block;
-            hidden_weights = read_words(bytes, &mut cur, units * BLOCK_WORDS);
-            hidden_thresholds = read_i16s(bytes, &mut cur, units);
-            hidden_flips = read_words(bytes, &mut cur, words_for_bits(units));
-            head_bits = units;
-        } else {
-            hidden_weights = Box::default();
-            hidden_thresholds = Box::default();
-            hidden_flips = Box::default();
-            head_bits = BITS;
-        }
-        let head_words = words_for_bits(head_bits);
-        let head_weights = read_words(bytes, &mut cur, CLASSES * head_words);
-        debug_assert_eq!(cur, bytes.len(), "unexpected MBL3 payload length");
+        let head_weights = read_words(bytes, &mut cur, CLASSES * (bits / 64));
+        debug_assert_eq!(cur, bytes.len(), "unexpected MBL4 payload length");
 
         Self {
-            hidden_per_block,
-            hidden_weights,
-            hidden_thresholds,
-            hidden_flips,
+            views: views.into_iter().map(|(_, view)| view).collect(),
+            group_views,
+            count_slots,
+            planes: planes.into_boxed_slice(),
+            bits,
             head_weights,
-            head_words,
-            head_block_bits: if hidden_per_block > 0 {
-                hidden_per_block
-            } else {
-                BLOCK_BITS
-            },
-            scale: scale.into_boxed_slice(),
+            scale_q: scale_q.into_boxed_slice(),
+            scale_step,
             bias,
         }
     }
@@ -385,51 +256,174 @@ impl BloomModel {
         MODEL.get_or_init(Self::load)
     }
 
-    /// Forward pass: encode, optional binary hidden layer, binary dense head.
-    pub(crate) fn logits(&self, tokens: &[u16; TOKENS], units: &[i32]) -> [f32; CLASSES] {
-        let signature = encode_signature(tokens, units);
-        let head_in: Vec<u64> = if self.hidden_per_block > 0 {
-            let units = PLANES * self.hidden_per_block;
-            let mut hidden = vec![0u64; words_for_bits(units)];
-            for unit in 0..units {
-                let plane = unit / self.hidden_per_block;
-                let block = &signature[plane * BLOCK_WORDS..(plane + 1) * BLOCK_WORDS];
-                let row = &self.hidden_weights[unit * BLOCK_WORDS..(unit + 1) * BLOCK_WORDS];
-                let mut mismatches = 0u32;
-                for (word, weight) in block.iter().zip(row.iter()) {
-                    mismatches += (word ^ weight).count_ones();
-                }
-                let flip = (self.hidden_flips[unit / 64] >> (unit % 64)) & 1;
-                let bit =
-                    ((mismatches as i32 <= self.hidden_thresholds[unit] as i32) as u64) ^ flip;
-                hidden[unit / 64] |= bit << (unit % 64);
-            }
-            hidden
-        } else {
-            signature.to_vec()
-        };
+    #[inline]
+    fn words(&self) -> usize {
+        self.bits / 64
+    }
 
-        let block_words = self.head_block_bits / 64;
+    #[inline]
+    fn bump(&self, counts: &mut [u16], group: usize, hash: u64) {
+        let (start, end) = self.group_views[group];
+        for view in &self.views[start as usize..end as usize] {
+            let bucket = ((hash >> view.shift) & view.mask) as usize;
+            counts[view.offset + bucket] = counts[view.offset + bucket].saturating_add(1);
+        }
+    }
+
+    /// Encode a token window plus its tokenizer-v3 unit stream into the packed
+    /// binary signature.
+    fn encode_signature(&self, tokens: &[u16; TOKENS], units: &[i32]) -> Vec<u64> {
+        static ZOBRIST: OnceLock<Box<[[u64; SYMBOLS]; TABLES]>> = OnceLock::new();
+        let tables = ZOBRIST.get_or_init(zobrist_tables);
+
+        let mut counts = vec![0u16; self.count_slots];
+        for half in 0..2 {
+            let htok = &tokens[half * HALF..(half + 1) * HALF];
+            for position in 0..HALF {
+                let mut acc = 0u64;
+                let mut valid = true;
+                for (order_index, table) in tables.iter().take(MAX_ORDER).enumerate() {
+                    let symbol = if position >= order_index {
+                        htok[position - order_index]
+                    } else {
+                        PAD_TOKEN
+                    };
+                    acc ^= table[symbol as usize];
+                    valid &= symbol != PAD_TOKEN;
+                    if valid {
+                        let rotated = acc.rotate_left((7 * order_index + half) as u32 & 63);
+                        self.bump(&mut counts, 2 * order_index + half, rotated);
+                    }
+                }
+            }
+
+            // Word-unit scan: rotate-XOR chain over casefolded identifier
+            // bytes, emitting unigrams (two folds), a bigram/trigram with the
+            // previous words of the same half, and a line-start unigram when
+            // the word begins a line.
+            let word_table = &tables[MAX_ORDER];
+            let uni_group = NGRAM_GROUPS + half;
+            let bi_group = NGRAM_GROUPS + 2 + half;
+            let uni2_group = NGRAM_GROUPS + 4 + half;
+            let tri_group = NGRAM_GROUPS + 6 + half;
+            let ls_group = NGRAM_GROUPS + 8 + half;
+            let mut acc_w = 0u64;
+            let mut prev_hash = 0u64;
+            let mut prev2_hash = 0u64;
+            let mut have_prev = false;
+            let mut have_prev2 = false;
+            let mut at_linestart = false;
+            for position in 0..HALF {
+                let symbol = htok[position];
+                if !is_word_symbol(symbol) {
+                    acc_w = 0;
+                    continue;
+                }
+                if position == 0 || !is_word_symbol(htok[position - 1]) {
+                    at_linestart = position == 0
+                        || htok[position - 1] == u16::from(b'\n')
+                        || htok[position - 1] == u16::from(b'\r');
+                }
+                acc_w = acc_w.rotate_left(1) ^ word_table[casefold(symbol) as usize];
+                let at_end = position + 1 >= HALF || !is_word_symbol(htok[position + 1]);
+                if !at_end {
+                    continue;
+                }
+                self.bump(
+                    &mut counts,
+                    uni_group,
+                    acc_w.rotate_left((23 + half) as u32),
+                );
+                self.bump(
+                    &mut counts,
+                    uni2_group,
+                    acc_w.rotate_left((41 + half) as u32),
+                );
+                let bg = prev_hash.rotate_left(17) ^ acc_w;
+                if have_prev {
+                    self.bump(&mut counts, bi_group, bg.rotate_left((29 + half) as u32));
+                }
+                if have_prev2 {
+                    let tg = prev2_hash.rotate_left(34) ^ bg;
+                    self.bump(&mut counts, tri_group, tg.rotate_left((47 + half) as u32));
+                }
+                if at_linestart {
+                    self.bump(&mut counts, ls_group, acc_w.rotate_left((53 + half) as u32));
+                }
+                prev2_hash = prev_hash;
+                prev_hash = acc_w;
+                have_prev2 = have_prev;
+                have_prev = true;
+            }
+        }
+
+        // Wordseq-unit n-grams: SplitMix64 codes salted per offset,
+        // XOR-combined.
+        let salts = unit_salts();
+        for position in 0..units.len() {
+            let mut acc = 0u64;
+            for (order_index, salt) in salts.iter().enumerate() {
+                if position < order_index {
+                    break;
+                }
+                acc ^= splitmix64(units[position - order_index] as u64 ^ salt);
+                let group = NGRAM_GROUPS + WORD_GROUPS + order_index;
+                self.bump(
+                    &mut counts,
+                    group,
+                    acc.rotate_left((11 * order_index + 5) as u32),
+                );
+            }
+        }
+
+        let mut signature = vec![0u64; self.words()];
+        for plane in self.planes.iter() {
+            let view = &self.views[plane.view];
+            let block = &counts[view.offset..view.offset + plane.width];
+            let base = plane.word_offset * 64;
+            for (bucket, &count) in block.iter().enumerate() {
+                let bit = (count >= plane.level) as u64;
+                let at = base + bucket;
+                signature[at / 64] |= bit << (at % 64);
+            }
+        }
+        signature
+    }
+
+    /// Forward pass: encode, then the binary dense head. All per-plane work is
+    /// XOR + popcount with an integer accumulator; each class ends with one
+    /// float multiply-add.
+    pub(crate) fn logits(&self, tokens: &[u16; TOKENS], units: &[i32]) -> [f32; CLASSES] {
+        let signature = self.encode_signature(tokens, units);
+
+        let words = self.words();
         let mut logits = [0.0f32; CLASSES];
         for (class, logit) in logits.iter_mut().enumerate() {
-            let row = &self.head_weights[class * self.head_words..(class + 1) * self.head_words];
-            let scales = &self.scale[class * PLANES..(class + 1) * PLANES];
-            let mut acc = self.bias[class];
-            for (block, &scale) in scales.iter().enumerate() {
-                let at = block * block_words;
+            let row = &self.head_weights[class * words..(class + 1) * words];
+            let scales = &self.scale_q[class * self.planes.len()..(class + 1) * self.planes.len()];
+            let mut acc = 0i32;
+            for (plane, &q) in self.planes.iter().zip(scales.iter()) {
+                let at = plane.word_offset;
+                let plane_words = plane.width / 64;
                 let mut mismatches = 0u32;
-                for (word, weight) in head_in[at..at + block_words]
+                for (word, weight) in signature[at..at + plane_words]
                     .iter()
-                    .zip(row[at..at + block_words].iter())
+                    .zip(row[at..at + plane_words].iter())
                 {
                     mismatches += (word ^ weight).count_ones();
                 }
-                let z = self.head_block_bits as i32 - 2 * mismatches as i32;
-                acc += scale * z as f32;
+                let z = plane.width as i32 - 2 * mismatches as i32;
+                acc += i32::from(q) * z;
             }
-            *logit = acc;
+            *logit = self.scale_step[class] * acc as f32 + self.bias[class];
         }
         logits
+    }
+
+    /// Total signature bits (used by tests).
+    #[cfg(test)]
+    pub(crate) fn signature_bits(&self) -> usize {
+        self.bits
     }
 }
 
