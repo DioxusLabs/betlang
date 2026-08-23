@@ -1,42 +1,28 @@
-//! Inference for the wordseq student.
+//! Inference for the Shannon-bit binary CNN detector.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (weights-only MSQ1 export) and
-//! runs a forward pass: byte-window tokenization -> word-unit tokenization
-//! -> HashEmbedding lookup (K=3) -> 3 conv stages with max-pool -> global
-//! max+avg pool -> 2 dense layers -> 48-class softmax logits.
-//!
-//! Model architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
-//! - 1024-bin x 24-dim shared HashEmbedding table (4-bit, ~12 KB)
-//! - QConv1D k=7 24->64ch (2-bit ternary)
-//! - MaxPool(4)
-//! - QConv1D k=5 64->128ch (2-bit)
-//! - MaxPool(2)
-//! - QConv1D k=3 128->128ch (2-bit)
-//! - GlobalMax + GlobalAvg -> 256-dim
-//! - QDense 256->96 (2-bit) + GELU
-//! - QDense 96->48 (4-bit)
+//! Loads `assets/bnn/source-bnn2.bin` (packed "BBN2" export) and runs a
+//! forward pass: raw Magika byte window -> canonical Shannon coding into two
+//! bitplanes (code bits + codeword boundaries) -> binary conv stages
+//! (XNOR + popcount, fixed-point combine, integer thresholds, OR-pooling)
+//! -> segmented popcount head -> 48-class softmax logits, averaged over a
+//! small ensemble of binary models.
 
-mod activation;
+mod bnn;
 mod constants;
-mod embedded;
-mod layers;
-mod reader;
-mod runtime;
 #[cfg(test)]
 mod tests;
-mod tokenizer;
 mod window;
 
-use self::{constants::CLASSES, runtime::Model, window::build_window};
+use self::{bnn::Bnn, constants::CLASSES, window::build_window};
 use crate::{Detection, Language};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
     let Some(window) = build_window(source) else {
         return Detection::from_predictions(Vec::new());
     };
-    let model = Model::get();
-    let units = model.tokenize_units(&window);
-    let logits = model.logits(&units);
+    let model = Bnn::get();
+    let planes = model.encode_planes(window.bytes());
+    let logits = model.logits(&planes);
     detection_from_logits(&logits)
 }
 

@@ -21,7 +21,7 @@ include = [
     "/RELEASING.md",
     "/assets/confusion-by-size.png",
     "/assets/confusion-overall.png",
-    "/assets/magika/source-student-q4.bin",
+    "/assets/bnn/source-bnn2.bin",
     "/benches/detect.rs",
     "/examples/*.rs",
     "/snippets/demo.rs",
@@ -29,13 +29,9 @@ include = [
     "/tests/**",
 ]
 
-[dependencies]
-fearless_simd = "0.4"
-
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 ignore = "0.4.25"
-rand = "0.8"
 rayon = "1.10"
 
 [lib]

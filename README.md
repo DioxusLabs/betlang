@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/betlang.svg)](https://crates.io/crates/betlang)
 [![Docs.rs](https://docs.rs/betlang/badge.svg)](https://docs.rs/betlang)
 
-CPU source-language detection for code with a tiny 50kb model. Try it in browser [here](https://dioxuslabs.github.io/dioxus-code/#playground)
+CPU source-language detection for code with a fully-binary CNN model. Try it in browser [here](https://dioxuslabs.github.io/dioxus-code/#playground)
 
 ```toml
 [dependencies]
@@ -38,47 +38,44 @@ assert_eq!("rust".parse::<betlang::Language>(), Ok(betlang::Language::Rust));
 These are the model's 48 output labels. Runtime detections expose them
 one-to-one with no label aggregation.
 
-The confusion matrix uses the same labels:
-
-![Betlang wordseq confusion](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-overall.png)
-
 ## Model
 
-The embedded model is `assets/magika/source-student-q4.bin`, a 47,840-byte
-weights-only MSQ1 payload with SHA-256:
+The embedded model is `assets/bnn/source-bnn2.bin`, a 1,165,464-byte packed
+"BBN2" payload with SHA-256:
 
 ```text
-8493d2d3757572c8661141e414b1c0755aa08d4c4e5382dfbbc6b73b02d89083
+fe36df96d9b6d268118b21b764c3be6dda33596e0fafeacd2bc0b26e3fc143ca
 ```
 
-Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`, tokenizer version 3.
+Architecture: an ensemble of five binary CNNs over Shannon-coded raw byte
+windows. The 2048-byte Magika begin/end window is entropy-coded with a
+canonical Shannon code learned from training byte frequencies, and the
+resulting bitstream (plus a codeword-boundary bitplane) feeds convolutions
+with binary weights and activations. All heavy compute is bitwise:
+XNOR + popcount convolutions, integer thresholds, OR-pooling, segmented
+popcounts, and an integer classifier head.
+
 On the held-out filesystem-label test split it reaches
-`test_fs_accuracy=0.942353` with `macro_recall=0.939690`. Probabilities are
-calibrated: ambiguous inputs report split scores instead of a confident label.
+`test_accuracy=0.941635` with `macro_recall=0.943226`, versus
+`test_accuracy=0.934972` / `macro_recall=0.934863` for the previous wordseq
+model on the same split. Ambiguous inputs report split scores instead of a
+confident label.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
 ## Performance
 
-Betlang uses a fixed 4096-byte Magika window and pads runtime inference to the
-same 2048-token shape used by evaluation. The model is loaded once per process
-and then reused through a `OnceLock`.
+Betlang uses a fixed 4096-byte Magika window and Shannon-codes the extracted
+2048-byte begin/end window into a fixed 16,384-bit stream. The model is loaded
+once per process and then reused through a `OnceLock`.
 
-Native CPU inference dispatches through `fearless_simd`. Benchmark entry points
-are available through `cargo bench`. Current baseline numbers are tracked in
+Inference is pure integer/bitwise CPU work (XNOR, popcount, integer
+accumulation, thresholds, bitwise OR pooling). Benchmark entry points are
+available through `cargo bench`. Current baseline numbers are tracked in
 [BENCHMARKS.md](BENCHMARKS.md).
 
 ## License And Attribution
 
-Betlang is licensed under MIT. The embedded student model was trained from
+Betlang is licensed under MIT. The embedded models were trained from
 outputs of Google's Magika teacher model; Magika is published by Google under
 Apache-2.0. Keep this attribution with redistributed model artifacts.
-
-## Confusion By File Size
-
-The shipped wordseq model is evaluated below on the held-out test split. Each
-panel is a row-normalized confusion matrix for one file-size bucket: actual
-labels are rows, predicted labels are columns, and the diagonal is correct
-classification.
-
-![Betlang wordseq confusion by file size](https://raw.githubusercontent.com/ealmloff/betlang/ee771279730cc12bc2c60ba4db34e38dd0b0ef9a/assets/confusion-by-size.png)
