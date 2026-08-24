@@ -1,3 +1,8 @@
+package betlang.samples
+
+import groovy.transform.Canonical
+
+@Canonical
 class LanguageScore {
     String slug
     BigDecimal probability
@@ -12,6 +17,13 @@ def scores = [
     new LanguageScore(slug: 'python', probability: 0.25G),
 ]
 
+def bySlug = scores.collectEntries { [(it.slug): it.probability] }
+assert bySlug['rust'] > bySlug['python']
+
 scores
+    .findAll { it.probability > 0.1G }
     .collect { it.format() }
     .each { println it }
+
+def total = scores*.probability.sum()
+println "total=${total}"

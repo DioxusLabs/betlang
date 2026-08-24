@@ -691,7 +691,7 @@ def render_size_png(path: Path, matrices: list[np.ndarray], labels: list[str], f
     axes_flat[len(BUCKETS)].axis("off")
 
     fig.suptitle(
-        "Betlang wordseq confusion matrices by file size",
+        "Betlang confusion matrices by file size",
         fontsize=24,
         weight="bold",
         y=0.995,
@@ -741,7 +741,7 @@ def render_overall_png(path: Path, matrix: np.ndarray, labels: list[str], fs_acc
     ax.set_xlabel("Predicted", fontsize=12, color=PRIMARY_TEXT)
     ax.set_ylabel("Actual", fontsize=12, color=PRIMARY_TEXT)
     fig.suptitle(
-        "Betlang wordseq overall confusion matrix",
+        "Betlang overall confusion matrix",
         fontsize=24,
         weight="bold",
         y=0.995,

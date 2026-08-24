@@ -2,13 +2,44 @@
 
 ## Artifact
 
-- File: `assets/magika/source-student-q4.bin`
-- Format: weights-only MSQ1 quantized tensor payload
-- Size: 47,840 bytes
-- SHA-256: `8493d2d3757572c8661141e414b1c0755aa08d4c4e5382dfbbc6b73b02d89083`
-- Architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
-- Tokenizer: word-unit tokenizer version 3
+- File: `assets/magika/source-bloom.bin`
+- Format: weights-only MBL5 binary payload
+- Size: 45,540 bytes (smaller than the 47,840-byte convolutional student it replaces)
+- SHA-256: `351f2818d55e3f24ec8a84b6af9cf7a15256fc084e1b56aa6899a2ee2fe0c24f`
+- Architecture: full-resolution counting-Bloom n-gram encoder + trainer-selected columns + binary linear head
+- Tokenizer: raw byte n-grams plus word-unit tokenizer version 3
 - Output head: 48 model labels exposed one-to-one as public `Language` variants
+
+## Architecture
+
+The model replaces the previous quantized convolutional student with a
+deterministic binary feature encoder and a binary linear head. Inference is
+dominated by integer XOR + popcount:
+
+1. **Byte window** — the first and last 1,024 bytes of the (whitespace-stripped
+   within a 4,096-byte block) input, identical to the Magika feature window.
+2. **Shannon/Zobrist encoding** — every byte n-gram (orders 1–8, begin and end
+   halves separately), case-folded identifier word (two independent hash
+   folds), word bigram/trigram, line-start word, and tokenizer-v3 unit n-gram
+   (orders 1–4) is hashed with a fixed SplitMix64-seeded Zobrist table into a
+   4,096-bucket counting Bloom block (30 blocks total).
+3. **Column selection + thermometer binarization** — each bucket count passes
+   through fixed thresholds (1/2/4/8 depending on the feature group), giving
+   319,488 candidate bits that are nearly free to compute — but every stored
+   column costs 48 head bits plus a 16-bit bucket id in the artifact. The
+   trainer therefore selects the 5,376 most informative columns
+   (model-aligned saliency, chosen in u64-aligned 64-column chunks) and the
+   artifact stores only their (plane, bucket) coordinates; the runtime
+   gathers exactly those buckets into a packed 5,376-bit signature.
+4. **Binary head** — each of the 48 classes holds a packed {-1,+1} weight row.
+   The logit is `bias + step[class] * Σ_plane q[class][plane] * (width - 2*popcount(x XOR w))`,
+   i.e. an XOR/popcount dot product with one int8 multiply per (class, plane)
+   and a single float multiply-add per class. A softmax over the 48 logits
+   produces probabilities.
+
+The encoder is exact integer arithmetic, so the Python trainer/simulator and
+the Rust runtime produce bit-identical signatures and matching logits
+(verified by golden vectors in `tests/fixtures/bloom-golden.bin`).
 
 ## Intended Use
 
@@ -19,32 +50,25 @@ decisions, malware classification, or legal identification of file provenance.
 
 ## Training Source
 
-The student was originally trained from Google's Magika v3.3 teacher
-predictions over a source-language corpus assembled from extension-suffixed
-files (the `bigorig` split, extracted from a GitHub partial-clone blob index of
-roughly 6,000 popular code repositories).
+The head is trained with straight-through-estimator binarization against two
+targets on a rebuilt public corpus (see `scripts/build_finetune_corpus.py`):
 
-The shipped artifact is that model fine-tuned from its exported checkpoint on a
-rebuilt public corpus (see `scripts/build_finetune_corpus.py`): per-language
-samples from `bigcode/the-stack-smol-xl` and `bigcode/the-stack`, GitHub repo
-files for labels absent from The Stack, and a small synthetic set targeting the
-Markdown/YAML bare-list ambiguity reported in issue #5, including train-only
-bare `- item` lists.
+- **Soft targets** — Google's Magika v3.3 teacher raw per-class head marginals,
+  distilled one-vs-all with per-class sigmoid cross-entropy (weight 0.5).
+- **Hard targets** — filesystem-extension labels with cross-entropy and 0.05
+  label smoothing (weight 0.5).
 
-The fine-tune distills the same Magika v3.3 teacher one-vs-all: per-class
-binary cross-entropy against the teacher's raw head-label marginals, plus a
-hard term against the teacher argmax discounted by the teacher's in-head
-probability mass. Unlike the original softmax distillation, this never
-renormalizes away the probability mass the teacher assigns to labels outside
-the 48-label head (such as `txt`), so inputs the teacher considers ambiguous
-or out-of-scope train toward uniformly low logits and keep low softmax
-confidence at inference.
+Training additionally mixes in short prefix crops (12–1,024 bytes, 35% of the
+train count, hard labels only) so tiny standalone snippets see n-gram
+statistics that match real short files.
 
-The shipped run additionally self-distills from a ~2x larger intermediate
-parent (`wordseq-b1536-k3-m2048-med-3conv-hidden`, 0.9492 test teacher parity)
-trained on the same corpus with the same one-vs-all scheme; the parent's
-per-class sigmoid marginals are cached with `scripts/cache_self_distill.py`
-and added as a second BCE term.
+The corpus is built entirely from ungated sources: per-language samples from
+`bigcode/the-stack-smol-xl`, files harvested from public GitHub repository
+tarballs for labels with no per-language subset there (yaml, json, toml, ini,
+xml, swift, cobol, objectivec, gradle, gemfile/gemspec), and a small synthetic
+set targeting the Markdown/YAML bare-list ambiguity from issue #5. Files from
+one repository always land in the same split, and per-repository caps prevent a
+single repository from dominating a label.
 
 The model distills teacher probabilities and filesystem-extension labels. It
 does not contain original source files, but its labels and soft targets are
@@ -52,54 +76,55 @@ derived from the training corpus and Magika teacher.
 
 ## Evaluation
 
-Held-out filesystem-label test split of the rebuilt corpus (34,087 files,
+Held-out filesystem-label test split of the rebuilt corpus (31,917 files,
 train/valid/test repositories are disjoint, rows where the teacher keeps at
-most 10% of its probability mass on the head labels are excluded):
+most 10% of its probability mass on the head labels are excluded). The rebuilt
+corpus avoids the gated `bigcode/the-stack` dataset, so these numbers are not
+comparable to metrics previously reported for the retired MSQ1 artifact on its
+own rebuilt split.
 
-- `test_fs_accuracy=0.942353`
-- `macro_recall=0.939690`
-- `test_teacher_parity=0.944055`
+| Model | size (bytes) | fs_accuracy | macro_recall | teacher_parity |
+|---|---:|---:|---:|---:|
+| Selected-column Bloom binary head (shipped) | **45,540** | 0.950497 | 0.926957 | 0.933922 |
+| Previous wordseq MSQ1 student | 47,840 | 0.944888 | 0.937713 | 0.952408 |
+| Full-width Bloom binary head (not shipped) | 1,932,116 | 0.947959 | 0.923254 | 0.929505 |
 
-For comparison, the pre-fine-tune artifact scores `test_fs_accuracy=0.926160`,
-`macro_recall=0.929904`, and `test_teacher_parity=0.922111` on the same split.
-The rebuilt split is balanced across all 48 labels (including rare classes),
-so these numbers are not comparable to the `bigorig` metrics reported for
-earlier artifacts.
+The shipped model is both smaller and more accurate than the previous
+convolutional student, and runs on XOR/popcount instead of floating-point
+convolutions. The key observation is that the full 319,488-bit candidate
+signature is nearly free to compute at inference (hashing and integer
+compares) — only *stored* head columns cost artifact bytes. Keeping the
+full-resolution encoder and storing just the 5,376 most informative
+columns retains almost all of the full-width model's accuracy at ~2% of its
+size; earlier compact variants that *folded* the signature down to a few
+thousand bits (destroying resolution before the head) measured 0.83–0.93 in
+the 19–42 KB range on the same split.
 
-On ambiguous bare `- item` lists (valid YAML and valid Markdown), the median
-top-1 probability drops from 0.92 (pre-fine-tune) to 0.51, while YAML or
-Markdown remains the top prediction.
-
-Most remaining confusion sits on genuinely ambiguous pairs where the teacher
-also splits its probability on the confused files: `c`/`cpp`,
+Most remaining confusion sits on genuinely ambiguous pairs: `c`/`cpp`,
 `javascript`/`typescript`, `markdown`/`yaml`, `ini`/`toml`, `batch`/`shell`,
-and `php`/`html`. Several other cells are corpus extension-label noise (for
-example `.vb` files containing SQL dumps) where the teacher agrees with the
-model on 80%+ of the confused files.
-
-The README confusion matrix groups the same held-out split by file-size bucket.
+and `php`/`html`.
 
 ## Known Weaknesses
 
 - Very short inputs are intentionally rejected when fewer than eight
   non-whitespace bytes are available.
-- Ambiguous snippets can put several languages close together even when a human
-  can infer the language from file naming context. A bare `- item` list with no
-  heading is valid YAML and valid Markdown; the model reports a split
-  YAML/Markdown distribution for such inputs rather than picking one with
-  certainty.
-- The classifier uses content only. It does not inspect file names, extensions,
-  shebangs outside the model window, repository metadata, or build-system
-  context.
+- Very short snippets (under ~100 bytes) remain weaker than long files even
+  with short-crop augmentation: the Bloom signature is sparse for tiny inputs
+  and n-gram evidence is thin.
+- Ambiguous snippets can put several languages close together even when a
+  human can infer the language from file naming context.
+- The classifier uses content only. It does not inspect file names,
+  extensions, shebangs outside the model window, repository metadata, or
+  build-system context.
 - Non-source formats are out of scope unless represented by a public
   source-language variant.
 
 ## Reproducibility
 
-Training and evaluation scripts live under `scripts/`. The frozen recipe is
-documented in `scripts/TRAINING.md`, including the expected external Magika
-teacher assets, cache layout, training command, evaluation command, and
-expected metrics.
+Training and evaluation scripts live under `scripts/`. The recipe is
+documented in `scripts/TRAINING.md`, including corpus construction, the
+expected external Magika teacher assets, cache layout, training command,
+golden-vector export, and expected metrics.
 
 The published crate package intentionally includes only the runtime model
 artifact and user-facing docs. Training scripts and generated analysis files
@@ -107,6 +132,6 @@ remain repository artifacts.
 
 ## Attribution
 
-The embedded student model was trained from outputs of Google's Magika teacher
-model. Magika is published by Google under Apache-2.0. Betlang's source code is
-MIT licensed; keep Magika attribution with redistributed model artifacts.
+The embedded model was trained from outputs of Google's Magika teacher model.
+Magika is published by Google under Apache-2.0. Betlang's source code is MIT
+licensed; keep Magika attribution with redistributed model artifacts.

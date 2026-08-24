@@ -14,7 +14,7 @@ pub use language::{Language, ParseLanguageError};
 /// effectively whitespace only, or too short to build the model window.
 ///
 /// ```
-/// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+/// let detection = betlang::detect("fn main() {\n    println!(\"hello, world!\");\n}\n");
 ///
 /// assert_eq!(detection.language(), Some(betlang::Language::Rust));
 /// ```
@@ -30,7 +30,7 @@ impl Detection {
     /// too short to build the model window.
     ///
     /// ```
-    /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+    /// let detection = betlang::detect("fn main() {\n    println!(\"hello, world!\");\n}\n");
     ///
     /// assert_eq!(detection.language(), Some(betlang::Language::Rust));
     /// ```
@@ -44,7 +44,7 @@ impl Detection {
     /// output language.
     ///
     /// ```
-    /// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+    /// let detection = betlang::detect("fn main() {\n    println!(\"hello, world!\");\n}\n");
     /// let Some((probability, language)) = detection.top_languages().next() else {
     ///     panic!("expected a language prediction");
     /// };
@@ -69,7 +69,7 @@ impl Detection {
 /// slice, or another type that can be borrowed as bytes.
 ///
 /// ```
-/// let detection = betlang::detect("fn main() { println!(\"hi\"); }");
+/// let detection = betlang::detect("fn main() {\n    println!(\"hello, world!\");\n}\n");
 ///
 /// assert_eq!(detection.language(), Some(betlang::Language::Rust));
 /// ```

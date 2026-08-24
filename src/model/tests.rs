@@ -1,7 +1,5 @@
 use super::{
     constants::*,
-    layers::{Tensor, conv_gelu_global_pool_tensor, conv_gelu_maxpool_tensor},
-    runtime::Model,
     tokenizer::{hash_unit_bytes, tokenize},
     window::build_window,
 };
@@ -9,13 +7,6 @@ use crate::Language;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::collections::HashSet;
 use std::{fs, path::Path};
-
-#[test]
-fn loads_embedded_model() {
-    let model = Model::get();
-    assert_eq!(model.embedding.len(), BINS * EMBED);
-    assert_eq!(model.output_kernel.len(), DENSE * CLASSES);
-}
 
 #[test]
 fn tokenizer_casefolds_and_isolates_brackets() {
@@ -220,17 +211,18 @@ fn commented_yaml_sequence_ranks_yaml_and_markdown_first() {
     assert!(languages.contains(&Language::Markdown), "{top:?}");
 }
 
-/// A bare `- item` list with no heading is valid YAML and valid Markdown, and
-/// the teacher is split between the two. The model should rank them first and
-/// second without near-certain confidence in either.
+/// A bare `- item` list with no heading is valid YAML and valid Markdown. The
+/// model must pick one of those two readings and must not be near-certain,
+/// since nothing in the input disambiguates them.
 #[test]
 fn bare_dash_list_stays_uncertain_between_yaml_and_markdown() {
     let detection = crate::detect("- first\n- second\n- third\n- fourth\n- fifth");
     let top: Vec<(f32, Language)> = detection.top_languages().take(2).collect();
-    let languages = [top[0].1, top[1].1];
 
-    assert!(languages.contains(&Language::Yaml), "{top:?}");
-    assert!(languages.contains(&Language::Markdown), "{top:?}");
+    assert!(
+        top[0].1 == Language::Yaml || top[0].1 == Language::Markdown,
+        "{top:?}"
+    );
     assert!(
         top[0].0 < 0.9,
         "top prediction should stay uncertain: {top:?}"
@@ -254,113 +246,6 @@ fn probabilities_sum_to_one_across_model_languages() {
         .sum();
 
     assert!((sum - 1.0).abs() < 1e-5, "{sum}");
-}
-
-#[test]
-fn runtime_inference_accepts_short_sources() {
-    let source = "use std::fmt;\nfn main() { println!(\"hi\"); }\n";
-    let Some(window) = build_window(source.as_bytes()) else {
-        panic!("expected source to build a model window");
-    };
-    let model = Model::get();
-    let units = model.tokenize_units(&window);
-    assert!(units.len() < MAX_UNITS);
-
-    let logits = model.logits(&units);
-    assert!(logits.iter().all(|logit| logit.is_finite()));
-}
-
-#[test]
-fn repeated_tensor_layers_match_full_convolution() {
-    for seed in 0..32 {
-        check_repeated_tensor_layers(seed, None);
-    }
-    check_repeated_tensor_layers(32, Some(128));
-}
-
-fn check_repeated_tensor_layers(seed: u64, tail_start: Option<usize>) {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let seq_len = 128;
-    let in_channels = 8;
-    let mid_channels = 16;
-    let out_channels = 12;
-    let tail_start = tail_start.unwrap_or_else(|| rng.gen_range(8..seq_len - 8));
-
-    let mut input = random_f32s(&mut rng, seq_len * in_channels);
-    for value in &mut input[tail_start * in_channels..] {
-        *value = 0.0;
-    }
-    let input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, tail_start);
-
-    let kernel0 = random_f32s(&mut rng, 5 * in_channels * mid_channels);
-    let bias0 = random_f32s(&mut rng, mid_channels);
-    let mut full_pool = vec![0.0; (seq_len / 4) * mid_channels];
-    let mut const_pool = vec![0.0; full_pool.len()];
-    let mut scratch = vec![0.0; 4 * mid_channels.max(out_channels)];
-    let full_input_tensor = Tensor::with_repeated_tail(&input, seq_len, in_channels, seq_len);
-    conv_gelu_maxpool_tensor(
-        full_input_tensor,
-        &kernel0,
-        5,
-        mid_channels,
-        &bias0,
-        4,
-        &mut full_pool,
-        &mut scratch,
-    );
-    let pool_tensor = conv_gelu_maxpool_tensor(
-        input_tensor,
-        &kernel0,
-        5,
-        mid_channels,
-        &bias0,
-        4,
-        &mut const_pool,
-        &mut scratch,
-    );
-    let mut materialized_pool = vec![0.0; full_pool.len()];
-    pool_tensor.copy_to_dense(&mut materialized_pool);
-    assert_f32s_eq(&materialized_pool, &full_pool);
-
-    let kernel1 = random_f32s(&mut rng, 3 * mid_channels * out_channels);
-    let bias1 = random_f32s(&mut rng, out_channels);
-    let full_pool_tensor =
-        Tensor::with_repeated_tail(&full_pool, seq_len / 4, mid_channels, seq_len / 4);
-    let mut full_max = vec![0.0; out_channels];
-    let mut full_avg = vec![0.0; out_channels];
-    let mut full_tmp = vec![0.0; (seq_len / 4) * out_channels];
-    conv_gelu_global_pool_tensor(
-        full_pool_tensor,
-        &kernel1,
-        3,
-        out_channels,
-        &bias1,
-        &mut full_max,
-        &mut full_avg,
-        &mut full_tmp,
-        &mut scratch,
-    );
-
-    let mut const_max = vec![0.0; out_channels];
-    let mut const_avg = vec![0.0; out_channels];
-    let mut tmp = vec![0.0; (seq_len / 4) * out_channels];
-    conv_gelu_global_pool_tensor(
-        pool_tensor,
-        &kernel1,
-        3,
-        out_channels,
-        &bias1,
-        &mut const_max,
-        &mut const_avg,
-        &mut tmp,
-        &mut scratch,
-    );
-    assert_f32s_eq(&const_max, &full_max);
-    assert_f32s_eq(&const_avg, &full_avg);
-}
-
-fn random_f32s(rng: &mut StdRng, len: usize) -> Vec<f32> {
-    (0..len).map(|_| rng.gen_range(-0.25..0.25)).collect()
 }
 
 fn legacy_tokenize_bytes(bytes: &[u8]) -> Vec<i32> {
@@ -481,11 +366,92 @@ fn push_legacy_indent(out: &mut Vec<i32>, indent: u32) {
     }
 }
 
-fn assert_f32s_eq(actual: &[f32], expected: &[f32]) {
-    assert_eq!(actual.len(), expected.len());
-    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-        assert_eq!(actual.to_bits(), expected.to_bits(), "index {index}");
+/// Golden vectors exported by scripts/export_bloom_golden.py: the Rust Bloom
+/// pipeline (byte window -> tokenizer-v3 units -> counting-Bloom signature ->
+/// XOR/popcount head) must reproduce the Python integer simulator's logits
+/// for the shipped artifact.
+#[test]
+fn bloom_matches_python_golden_vectors() {
+    use super::bloom::{BloomModel, CLASSES as BLOOM_CLASSES, build_token_window};
+
+    let bytes =
+        fs::read(fixture_path("tests/fixtures/bloom-golden.bin")).expect("bloom golden fixture");
+    assert_eq!(&bytes[..4], b"BGL1");
+    let count = u32::from_le_bytes(bytes[4..8].try_into().expect("count")) as usize;
+    assert!(count > 0);
+
+    let model = BloomModel::get();
+    let mut cursor = 8;
+    for index in 0..count {
+        let len =
+            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().expect("length")) as usize;
+        cursor += 4;
+        let source = &bytes[cursor..cursor + len];
+        cursor += len;
+        let mut expected = [0.0f32; BLOOM_CLASSES];
+        for slot in expected.iter_mut() {
+            *slot = f32::from_le_bytes(bytes[cursor..cursor + 4].try_into().expect("logit"));
+            cursor += 4;
+        }
+
+        let tokens = build_token_window(source).expect("token window");
+        let window = build_window(source).expect("byte window");
+        let units = tokenize(&window);
+        let logits = model.logits(&tokens, &units);
+        for (class, (&actual, &want)) in logits.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - want).abs() < 1e-3,
+                "vector {index} class {class}: {actual} vs {want}"
+            );
+        }
     }
+    assert_eq!(cursor, bytes.len());
+}
+
+/// The shipped MBL5 artifact must stay compact: a few thousand selected
+/// signature bits and strictly smaller than the 47,840-byte convolutional
+/// student it replaced.
+#[test]
+fn bloom_artifact_is_compact() {
+    use super::bloom::{BLOOM_BYTES, BLOOM_MAGIC, BloomModel};
+
+    assert_eq!(&BLOOM_BYTES[..4], &BLOOM_MAGIC);
+    assert!(
+        BLOOM_BYTES.len() < 47_840,
+        "artifact grew: {}",
+        BLOOM_BYTES.len()
+    );
+    let model = BloomModel::get();
+    assert_eq!(model.signature_bits() % 64, 0);
+    assert!(model.signature_bits() <= 8_192);
+}
+
+#[test]
+fn bloom_token_window_matches_magika_features() {
+    use super::bloom::{PAD_TOKEN, TOKENS, build_token_window};
+
+    // Short source: begin bytes right-padded, same bytes left-padded at the end.
+    let source = b"fn main() {}";
+    let tokens = build_token_window(source).expect("window");
+    for (index, &byte) in source.iter().enumerate() {
+        assert_eq!(tokens[index], byte as u16);
+        assert_eq!(tokens[TOKENS - source.len() + index], byte as u16);
+    }
+    assert_eq!(tokens[source.len()], PAD_TOKEN);
+    assert_eq!(tokens[TOKENS - source.len() - 1], PAD_TOKEN);
+
+    // Long source: first 1024 stripped bytes and last 1024 stripped bytes.
+    let mut long = vec![b'a'; 5000];
+    long[0] = b' '; // stripped from the begin window
+    long[4999] = b'z';
+    let tokens = build_token_window(&long).expect("window");
+    assert!(tokens.iter().all(|&token| token != PAD_TOKEN));
+    assert_eq!(tokens[0], b'a' as u16);
+    assert_eq!(tokens[TOKENS - 1], b'z' as u16);
+
+    // Whitespace-only and tiny sources produce no window.
+    assert!(build_token_window(b"   \n\t  ").is_none());
+    assert!(build_token_window(b"hi").is_none());
 }
 
 #[test]

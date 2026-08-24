@@ -1,42 +1,36 @@
-//! Inference for the wordseq student.
+//! Inference for the Shannon n-gram counting-Bloom binary model.
 //!
-//! Loads `assets/magika/source-student-q4.bin` (weights-only MSQ1 export) and
-//! runs a forward pass: byte-window tokenization -> word-unit tokenization
-//! -> HashEmbedding lookup (K=3) -> 3 conv stages with max-pool -> global
-//! max+avg pool -> 2 dense layers -> 48-class softmax logits.
-//!
-//! Model architecture: `wordseq-b1024-k3-m2048-tiny-3conv-hidden`
-//! - 1024-bin x 24-dim shared HashEmbedding table (4-bit, ~12 KB)
-//! - QConv1D k=7 24->64ch (2-bit ternary)
-//! - MaxPool(4)
-//! - QConv1D k=5 64->128ch (2-bit)
-//! - MaxPool(2)
-//! - QConv1D k=3 128->128ch (2-bit)
-//! - GlobalMax + GlobalAvg -> 256-dim
-//! - QDense 256->96 (2-bit) + GELU
-//! - QDense 96->48 (4-bit)
+//! Loads `assets/magika/source-bloom.bin` (weights-only MBL5 export) and runs
+//! a forward pass: byte-window tokenization -> tokenizer-v3 word units ->
+//! deterministic Zobrist/counting-Bloom buckets -> selected-column binary
+//! signature -> binary {-1,+1} linear head evaluated with XOR + popcount,
+//! plus a per-(class, plane) int8 scale and per-class bias -> 48-class
+//! softmax logits.
 
-mod activation;
+mod bloom;
 mod constants;
-mod embedded;
-mod layers;
-mod reader;
-mod runtime;
 #[cfg(test)]
 mod tests;
 mod tokenizer;
 mod window;
 
-use self::{constants::CLASSES, runtime::Model, window::build_window};
+use self::{
+    bloom::{BloomModel, build_token_window},
+    constants::CLASSES,
+    tokenizer::tokenize,
+    window::build_window,
+};
 use crate::{Detection, Language};
 
 pub(crate) fn detect(source: &[u8]) -> Detection {
+    let Some(tokens) = build_token_window(source) else {
+        return Detection::from_predictions(Vec::new());
+    };
     let Some(window) = build_window(source) else {
         return Detection::from_predictions(Vec::new());
     };
-    let model = Model::get();
-    let units = model.tokenize_units(&window);
-    let logits = model.logits(&units);
+    let units = tokenize(&window);
+    let logits = BloomModel::get().logits(&tokens, &units);
     detection_from_logits(&logits)
 }
 
