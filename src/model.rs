@@ -1,10 +1,11 @@
 //! Inference for the Shannon n-gram counting-Bloom binary model.
 //!
-//! Loads `assets/magika/source-bloom.bin` (weights-only MBL4 export) and runs
+//! Loads `assets/magika/source-bloom.bin` (weights-only MBL5 export) and runs
 //! a forward pass: byte-window tokenization -> tokenizer-v3 word units ->
-//! deterministic Zobrist/counting-Bloom compact binary signature -> binary
-//! {-1,+1} linear head evaluated with XOR + popcount, plus a per-(class,
-//! plane) int8 scale and per-class bias -> 48-class softmax logits.
+//! deterministic Zobrist/counting-Bloom buckets -> selected-column binary
+//! signature -> binary {-1,+1} linear head evaluated with XOR + popcount,
+//! plus a per-(class, plane) int8 scale and per-class bias -> 48-class
+//! softmax logits.
 
 mod bloom;
 mod constants;

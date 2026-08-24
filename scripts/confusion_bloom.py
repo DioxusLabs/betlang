@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Render the README confusion-matrix PNGs for an exported Bloom MBL4 model.
+"""Render the README confusion-matrix PNGs for an exported Bloom MBL5 model.
 
-Evaluates the artifact on a cache split with the vectorized integer simulator,
-aligns cache rows to raw file sizes by hashing token windows against the
-corpus files (same scheme as confusion_by_size.py), and renders
+Evaluates the artifact on a cache split with the vectorized integer simulator
+(gathering the artifact's selected columns from the cached full-resolution
+signatures), aligns cache rows to raw file sizes by hashing token windows
+against the corpus files (same scheme as confusion_by_size.py), and renders
 assets/confusion-overall.png plus assets/confusion-by-size.png.
 
 Usage:
@@ -31,24 +32,37 @@ from confusion_by_size import (  # noqa: E402
     render_overall_png,
     render_size_png,
 )
-from export_bloom_golden import load_mbl4  # noqa: E402
-from train_bloom_head import BITS, CLASSES, PLANES, WORDS  # noqa: E402
+from export_bloom_golden import load_mbl5  # noqa: E402
+from train_bloom_head import BLOCK, CLASSES, FULL_BITS, FULL_PLANES, FULL_WORDS  # noqa: E402
 
 
-def batch_logits(model: dict[str, np.ndarray], signatures: np.ndarray) -> np.ndarray:
-    """Vectorized XOR/popcount forward for MBL4 artifacts."""
+def selection_columns(model: dict[str, np.ndarray]) -> np.ndarray:
+    """Full-resolution column index of each selected signature bit."""
+    cols = []
+    at = 0
+    for group, level, width in model["planes"]:
+        plane = FULL_PLANES.index((group, level))
+        cols.append(plane * BLOCK + model["buckets"][at:at + width].astype(np.int64))
+        at += width
+    return np.concatenate(cols)
+
+
+def batch_logits(model: dict[str, np.ndarray], cols: np.ndarray,
+                 signatures: np.ndarray) -> np.ndarray:
+    """Vectorized XOR/popcount forward for MBL5 over full-res signatures."""
     n = signatures.shape[0]
+    k = int(model["bits"])
     bits = np.unpackbits(
         signatures.view(np.uint8).reshape(n, -1), axis=1, bitorder="little"
-    )[:, :BITS]
+    )[:, :FULL_BITS][:, cols]
     w_bits = np.unpackbits(
         model["head"].view(np.uint8).reshape(CLASSES, -1), axis=1, bitorder="little"
-    )[:, :BITS]
+    )[:, :k]
     x_pm = 2 * bits.astype(np.int32) - 1
     w_pm = 2 * w_bits.astype(np.int32) - 1
     acc = np.zeros((n, CLASSES), dtype=np.int64)
     at = 0
-    for plane, (_, _, _, width) in enumerate(PLANES):
+    for plane, (_, _, width) in enumerate(model["planes"]):
         z = x_pm[:, at:at + width] @ w_pm[:, at:at + width].T
         acc += model["q"][None, :, plane].astype(np.int64) * z
         at += width
@@ -71,10 +85,10 @@ def main() -> int:
     count = meta["count"]
     labels = meta["labels"]
     feats = np.memmap(
-        args.cache_dir / f"{args.split}.bloom{BITS}_v6.mmap",
+        args.cache_dir / f"{args.split}.bloom{FULL_BITS}_v6.mmap",
         dtype=np.uint64,
         mode="r",
-        shape=(count, WORDS),
+        shape=(count, FULL_WORDS),
     )
     fs_labels = np.asarray(
         np.memmap(
@@ -85,11 +99,13 @@ def main() -> int:
         )
     )
 
-    model = load_mbl4(args.model)
+    model = load_mbl5(args.model)
+    cols = selection_columns(model)
     preds = np.empty(count, dtype=np.int64)
     for start in range(0, count, args.batch_size):
         stop = min(start + args.batch_size, count)
-        preds[start:stop] = batch_logits(model, np.asarray(feats[start:stop])).argmax(axis=1)
+        preds[start:stop] = batch_logits(
+            model, cols, np.asarray(feats[start:stop])).argmax(axis=1)
         print(f"eval {stop}/{count}", flush=True)
 
     fs_accuracy = float((preds == fs_labels).mean())

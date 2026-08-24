@@ -44,37 +44,39 @@ The confusion matrix uses the same labels:
 
 ## Model
 
-The embedded model is `assets/magika/source-bloom.bin`, a 26,808-byte
-weights-only MBL4 payload (1.8x smaller than the 47,840-byte convolutional
+The embedded model is `assets/magika/source-bloom.bin`, a 45,540-byte
+weights-only MBL5 payload (smaller than the 47,840-byte convolutional
 student it replaces) with SHA-256:
 
 ```text
-7d78f5778248096b450155c9e56ae5d0281b6932dbf1d6b98142b518a5aca1f0
+351f2818d55e3f24ec8a84b6af9cf7a15256fc084e1b56aa6899a2ee2fe0c24f
 ```
 
-Architecture: a deterministic counting-Bloom n-gram signature (byte n-grams,
-case-folded words, and tokenizer-v3 unit n-grams hashed into 50 compact
-binary planes totalling 3,968 bits) followed by a binary {-1,+1} linear head
-evaluated entirely with XOR + popcount plus one int8 multiply per (class,
-plane) and one float multiply-add per class. On the rebuilt held-out
-filesystem-label test split it reaches `test_fs_accuracy=0.899` versus
-`0.945` for the previous 47,840-byte convolutional student on the same
-split — the accuracy cost of shipping a 1.8x smaller artifact that runs
-entirely on binary CPU ops.
+Architecture: a deterministic counting-Bloom n-gram encoder (byte n-grams,
+case-folded words, and tokenizer-v3 unit n-grams counted into 4,096-bucket
+blocks, 319,488 candidate bits) of which the artifact stores only the
+5,376 most informative trainer-selected columns, followed by a binary
+{-1,+1} linear head evaluated entirely with XOR + popcount plus one int8
+multiply per (class, plane) and one float multiply-add per class. On the
+rebuilt held-out filesystem-label test split it reaches
+`test_fs_accuracy=0.950` versus `0.945` for the previous
+47,840-byte convolutional student on the same split — smaller *and* more
+accurate, running entirely on binary CPU ops.
 
 See [MODEL_CARD.md](MODEL_CARD.md) for the training and evaluation summary.
 
 ## Performance
 
-Betlang uses a fixed 4096-byte Magika window. The byte window is hashed into a
-3,968-bit binary signature and the 48 logits are computed with XOR +
+Betlang uses a fixed 4096-byte Magika window. The byte window is hashed into
+counting-Bloom buckets, the model's selected columns are gathered into a
+5,376-bit binary signature, and the 48 logits are computed with XOR +
 popcount over packed u64 words. The model is loaded once per process and then
 reused through a `OnceLock`.
 
 Benchmark entry points are available through `cargo bench`. Current baseline
-numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md); the compact binary
-model is ~310x faster than the previous convolutional student on short inputs
-and ~740x faster on full 4 KiB windows on the same host.
+numbers are tracked in [BENCHMARKS.md](BENCHMARKS.md); the binary model is
+~390x faster than the previous convolutional student on short inputs and
+~1000x faster on full 4 KiB windows on the same host.
 
 ## License And Attribution
 

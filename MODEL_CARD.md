@@ -3,10 +3,10 @@
 ## Artifact
 
 - File: `assets/magika/source-bloom.bin`
-- Format: weights-only MBL4 binary payload
-- Size: 26,808 bytes (1.8x smaller than the 47,840-byte convolutional student it replaces)
-- SHA-256: `7d78f5778248096b450155c9e56ae5d0281b6932dbf1d6b98142b518a5aca1f0`
-- Architecture: compact counting-Bloom n-gram signature + binary linear head
+- Format: weights-only MBL5 binary payload
+- Size: 45,540 bytes (smaller than the 47,840-byte convolutional student it replaces)
+- SHA-256: `351f2818d55e3f24ec8a84b6af9cf7a15256fc084e1b56aa6899a2ee2fe0c24f`
+- Architecture: full-resolution counting-Bloom n-gram encoder + trainer-selected columns + binary linear head
 - Tokenizer: raw byte n-grams plus word-unit tokenizer version 3
 - Output head: 48 model labels exposed one-to-one as public `Language` variants
 
@@ -22,13 +22,15 @@ dominated by integer XOR + popcount:
    halves separately), case-folded identifier word (two independent hash
    folds), word bigram/trigram, line-start word, and tokenizer-v3 unit n-gram
    (orders 1–4) is hashed with a fixed SplitMix64-seeded Zobrist table into a
-   4,096-bucket counting Bloom block.
-3. **Compact folding + thermometer binarization** — each 4,096-bucket block is
-   folded into one or more small power-of-two views (64–128 buckets, taken
-   from different bit fields of the hash), and each folded bucket count passes
-   through fixed thresholds (1/2/4/8 depending on the feature group). This
-   yields 50 compact binary planes totalling 3,968 bits packed into 62 u64
-   words.
+   4,096-bucket counting Bloom block (30 blocks total).
+3. **Column selection + thermometer binarization** — each bucket count passes
+   through fixed thresholds (1/2/4/8 depending on the feature group), giving
+   319,488 candidate bits that are nearly free to compute — but every stored
+   column costs 48 head bits plus a 16-bit bucket id in the artifact. The
+   trainer therefore selects the 5,376 most informative columns
+   (model-aligned saliency, chosen in u64-aligned 64-column chunks) and the
+   artifact stores only their (plane, bucket) coordinates; the runtime
+   gathers exactly those buckets into a packed 5,376-bit signature.
 4. **Binary head** — each of the 48 classes holds a packed {-1,+1} weight row.
    The logit is `bias + step[class] * Σ_plane q[class][plane] * (width - 2*popcount(x XOR w))`,
    i.e. an XOR/popcount dot product with one int8 multiply per (class, plane)
@@ -83,17 +85,20 @@ own rebuilt split.
 
 | Model | size (bytes) | fs_accuracy | macro_recall | teacher_parity |
 |---|---:|---:|---:|---:|
-| Compact Bloom binary head (shipped) | **26,808** | 0.899176 | 0.879002 | 0.885892 |
+| Selected-column Bloom binary head (shipped) | **45,540** | 0.950497 | 0.926957 | 0.933922 |
 | Previous wordseq MSQ1 student | 47,840 | 0.944888 | 0.937713 | 0.952408 |
-| Large Bloom binary head (not shipped) | 1,932,116 | 0.947959 | 0.923254 | 0.929505 |
+| Full-width Bloom binary head (not shipped) | 1,932,116 | 0.947959 | 0.923254 | 0.929505 |
 
-The shipped compact model trades accuracy for size: it is 1.8x smaller than
-the previous convolutional student and runs on XOR/popcount instead of
-floating-point convolutions, at a ~4.6 point filesystem-accuracy cost. The
-same architecture recovers the accuracy when given more bits (the large
-319,488-bit variant reaches 0.948), so the signature width is a direct
-size/accuracy dial: on the same split a ~19 KB variant (2,752 bits) measured
-0.83 and a ~42 KB variant (6,528 bits) measured 0.927.
+The shipped model is both smaller and more accurate than the previous
+convolutional student, and runs on XOR/popcount instead of floating-point
+convolutions. The key observation is that the full 319,488-bit candidate
+signature is nearly free to compute at inference (hashing and integer
+compares) — only *stored* head columns cost artifact bytes. Keeping the
+full-resolution encoder and storing just the 5,376 most informative
+columns retains almost all of the full-width model's accuracy at ~2% of its
+size; earlier compact variants that *folded* the signature down to a few
+thousand bits (destroying resolution before the head) measured 0.83–0.93 in
+the 19–42 KB range on the same split.
 
 Most remaining confusion sits on genuinely ambiguous pairs: `c`/`cpp`,
 `javascript`/`typescript`, `markdown`/`yaml`, `ini`/`toml`, `batch`/`shell`,

@@ -1,24 +1,34 @@
 #!/usr/bin/env python3
-"""Train the betlang Shannon n-gram Bloom binary head.
+"""Train the betlang Shannon n-gram Bloom binary head (selected columns).
 
 Stage 1 (deterministic, no learned weights): the Magika byte window is encoded
-into a compact binary signature. For every byte position and every n-gram
-order n in ORDERS, a Zobrist hash (XOR of per-offset random 64-bit codes,
-which is a Shannon-style random binary code for each (byte, offset) symbol) is
-folded into one or more small counting-Bloom views per (half, order) group; a
-view takes a power-of-two number of buckets from a bit-field of the hash, so a
-group can expose several independent folds of the same n-gram stream. Bucket
-counts pass through per-plane thermometer thresholds (quantized log-frequency,
-i.e. Shannon surprisal). The result is a BITS-wide binary feature vector
-computed with table lookups + XOR + integer compares only.
+into counting-Bloom buckets. For every byte position and every n-gram order n
+in ORDERS, a Zobrist hash (XOR of per-offset random 64-bit codes, which is a
+Shannon-style random binary code for each (byte, offset) symbol) is folded
+into 4,096 buckets per (half, order) group and *counted*; word-unit and
+tokenizer-v3 unit streams get their own groups. Bucket counts pass through
+per-plane thermometer thresholds (quantized log-frequency, i.e. Shannon
+surprisal), giving 319,488 candidate signature bits computed with table
+lookups + XOR + integer compares only.
 
-Stage 2 (learned): a binary {-1,+1} linear head over the signature, trained
-with a straight-through estimator against Magika teacher marginals (BCE) plus
-hard labels. Inference is XNOR + popcount per class with a per-(class, plane)
-int8 scale, followed by an affine calibration for probabilities.
+Stage 2 (column selection): computing candidate bits is nearly free at
+inference, but every kept column costs 48 head bits plus a 16-bit bucket id in
+the artifact. A saliency score — how much each column's class-conditional
+activation deviation aligns with a full-width trained head's weights — ranks
+all 319,488 columns, and a per-plane knapsack keeps the top BITS columns in
+64-column chunks so plane segments stay u64-aligned.
 
-Usage:
-  python scripts/train_bloom_head.py --cache-dir CACHE --output model.bin
+Stage 3 (learned): a binary {-1,+1} linear head over the selected columns,
+trained with a straight-through estimator against Magika teacher marginals
+(BCE) plus hard filesystem labels. Inference is XNOR + popcount per class with
+a per-(class, plane) int8 scale, followed by one float multiply per class.
+
+Usage (three stages; the full run and selection are cached):
+  python scripts/train_bloom_head.py full --cache-dir CACHE --scorer full.pt
+  python scripts/train_bloom_head.py select --cache-dir CACHE \
+      --scorer full.pt --k 4608 --selection sel.npz
+  python scripts/train_bloom_head.py train --cache-dir CACHE \
+      --selection sel.npz --output model.bin
 """
 
 from __future__ import annotations
@@ -44,91 +54,51 @@ HALF = 1024
 CLASSES = 48
 
 ORDERS = (1, 2, 3, 4, 5, 6, 7, 8)
-# Bucket space of the raw hash fold (12 bits); views fold it further down.
-BASE_BITS = 4096
+BLOCK = 4096
 NGRAM_GROUPS = 2 * len(ORDERS)  # (half, order) counting groups
 # Word-unit groups (per half): casefolded identifier unigrams (two
 # independent hash folds), bigrams, trigrams, and line-start unigrams.
-WORD_KINDS = 5
-WORD_GROUPS = 2 * WORD_KINDS
+WORD_KIND_LEVELS = (
+    (1, 2, 4, 8),  # unigram, first fold
+    (1, 2),        # bigram
+    (1, 2, 4, 8),  # unigram, second fold
+    (1, 2),        # trigram
+    (1, 2, 4, 8),  # line-start unigram
+)
+WORD_GROUPS = 2 * len(WORD_KIND_LEVELS)
 # Wordseq-unit n-gram groups over the production tokenizer-v3 unit stream
 # (words / punct runs / numbers / brackets / indents), one group per order.
 UNIT_ORDERS = (1, 2, 3, 4)
+UNIT_LEVELS = ((1, 2, 4, 8), (1, 2), (1,), (1,))
 UNIT_GROUPS = len(UNIT_ORDERS)
 GROUPS = NGRAM_GROUPS + WORD_GROUPS + UNIT_GROUPS
-COUNT_BUCKETS = GROUPS * BASE_BITS
-
-# Compact per-group signature spec: {group kind -> (width, levels, views)}.
-# `width` power-of-two buckets per view; `levels` count thermometer
-# thresholds (quantized log-frequency); `views` independent hash bit-field
-# folds (Bloom-style multiple hashes). Low orders carry frequency
-# information (log-TF) and get wider views, high orders are presence-only.
-NGRAM_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
-    1: (64, (1, 2, 4, 8), 1),
-    2: (128, (1, 2, 4), 1),
-    3: (128, (1, 2), 1),
-    4: (128, (1,), 1),
-    5: (64, (1,), 1),
-    6: (64, (1,), 1),
-    7: (64, (1,), 1),
-    8: (64, (1,), 1),
-}
-WORD_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
-    0: (64, (1, 2, 4), 1),  # unigram, first fold
-    1: (64, (1,), 1),       # bigram
-    2: (64, (1,), 1),       # unigram, second fold
-    3: (64, (1,), 1),       # trigram
-    4: (64, (1, 2), 1),     # line-start unigram
-}
-UNIT_SPEC: dict[int, tuple[int, tuple[int, ...], int]] = {
-    0: (64, (1, 2, 4), 1),
-    1: (64, (1,), 1),
-    2: (64, (1,), 1),
-    3: (64, (1,), 1),
-}
-
-
-def view_shift(width: int, view: int) -> int:
-    """Bit offset into the 12-bit base hash for this view's fold."""
-    lb = width.bit_length() - 1
-    return min(view * lb, 12 - lb)
-
-
-def group_spec(group: int) -> tuple[int, tuple[int, ...], int]:
-    if group < NGRAM_GROUPS:
-        return NGRAM_SPEC[group // 2 + 1]
-    if group < NGRAM_GROUPS + WORD_GROUPS:
-        return WORD_SPEC[(group - NGRAM_GROUPS) // 2]
-    return UNIT_SPEC[group - NGRAM_GROUPS - WORD_GROUPS]
-
-
-# (group, shift, count threshold, width) per signature bit-plane, nested as
-# group-major (n-gram (order, half), word (kind, half), unit order) with
-# levels and views inside. Must match the artifact plane table exactly.
-PLANES: list[tuple[int, int, int, int]] = []
+COUNT_BUCKETS = GROUPS * BLOCK
+# Count thermometer levels per order: low orders carry frequency information
+# (log-TF), high orders are presence-only.
+ORDER_LEVELS = tuple(
+    (1, 2, 4, 8) if order <= 3 else (1, 2) if order <= 5 else (1,)
+    for order in ORDERS
+)
+# Full-resolution candidate plane table: (group, count threshold) per plane,
+# 4,096 candidate columns each. Selection picks columns from these planes.
+FULL_PLANES: list[tuple[int, int]] = []
 for _oi, _order in enumerate(ORDERS):
     for _half in range(2):
-        _width, _levels, _views = NGRAM_SPEC[_order]
-        for _level in _levels:
-            for _view in range(_views):
-                PLANES.append((2 * _oi + _half, view_shift(_width, _view), _level, _width))
-for _kind in range(WORD_KINDS):
+        for _level in ORDER_LEVELS[_oi]:
+            FULL_PLANES.append((2 * _oi + _half, _level))
+for _kind, _levels in enumerate(WORD_KIND_LEVELS):
     for _half in range(2):
-        _width, _levels, _views = WORD_SPEC[_kind]
         for _level in _levels:
-            for _view in range(_views):
-                PLANES.append((NGRAM_GROUPS + 2 * _kind + _half,
-                               view_shift(_width, _view), _level, _width))
-for _oi, _order in enumerate(UNIT_ORDERS):
-    _width, _levels, _views = UNIT_SPEC[_oi]
+            FULL_PLANES.append((NGRAM_GROUPS + 2 * _kind + _half, _level))
+for _oi, _levels in enumerate(UNIT_LEVELS):
     for _level in _levels:
-        for _view in range(_views):
-            PLANES.append((NGRAM_GROUPS + WORD_GROUPS + _oi,
-                           view_shift(_width, _view), _level, _width))
-BLOCKS = len(PLANES)
-BITS = sum(width for _, _, _, width in PLANES)
-assert BITS % 64 == 0, "plane widths must pack to whole words"
-WORDS = BITS // 64
+        FULL_PLANES.append((NGRAM_GROUPS + WORD_GROUPS + _oi, _level))
+FULL_BLOCKS = len(FULL_PLANES)  # 78 planes
+FULL_BITS = FULL_BLOCKS * BLOCK  # 319488
+FULL_WORDS = FULL_BITS // 64
+# Columns are selected in 64-column chunks so every plane segment of the
+# packed signature stays u64-aligned (no masked popcounts in the runtime).
+CHUNK_COLS = 64
 
 ZOBRIST_SEED = 0xBE7A_1AB5_5EED_0001
 UNIT_SEED = 0xBE7A_1AB5_5EED_0002
@@ -191,15 +161,12 @@ def unit_salts() -> np.ndarray:
     return xorshift64(UNIT_SEED, max(UNIT_ORDERS))
 
 
-def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) -> np.ndarray:
-    """Encode (n, 2048) token windows into packed (n, WORDS) u64 signatures.
+def encode_counts(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) -> np.ndarray:
+    """Count n-gram/word/unit hashes into (n, GROUPS, BLOCK) Bloom buckets.
 
-    Each (half, order) group is a counting Bloom block: n-gram Zobrist hashes
-    are folded into BASE_BITS buckets and *counted*; each plane then folds the
-    counts into its view's small buckets and exposes them through its
-    thermometer threshold. n-grams never cross the begin/end half boundary and
-    any n-gram containing the PAD token is skipped. Unit n-grams run over the
-    tokenizer-v3 unit stream (-1 = padding) without halving.
+    n-grams never cross the begin/end half boundary and any n-gram containing
+    the PAD token is skipped. Unit n-grams run over the tokenizer-v3 unit
+    stream (-1 = padding) without halving.
     """
     n = tokens.shape[0]
     tok = tokens.astype(np.int64)
@@ -229,8 +196,8 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
             acc_valid &= svalid
             group = 2 * order_index + half
             folded = rotl64(acc, 7 * order_index + half)
-            bucket = (folded & np.uint64(BASE_BITS - 1)).astype(np.int64)
-            bucket += group * BASE_BITS
+            bucket = (folded & np.uint64(BLOCK - 1)).astype(np.int64)
+            bucket += group * BLOCK
             bucket = np.where(acc_valid, bucket, COUNT_BUCKETS)
             rows = np.arange(n)[:, None] * stride
             indices.append((rows + bucket).reshape(-1))
@@ -255,8 +222,8 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
 
         def fold_bucket(hashes: np.ndarray, rot: int, group: int,
                         emit: np.ndarray) -> np.ndarray:
-            bucket = (rotl64(hashes, rot) & np.uint64(BASE_BITS - 1)).astype(np.int64)
-            bucket += group * BASE_BITS
+            bucket = (rotl64(hashes, rot) & np.uint64(BLOCK - 1)).astype(np.int64)
+            bucket += group * BLOCK
             return rows_flat + np.where(emit, bucket, COUNT_BUCKETS)
 
         for i in range(HALF):
@@ -301,30 +268,30 @@ def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) ->
         acc_uvalid &= svalid
         group = NGRAM_GROUPS + WORD_GROUPS + order_index
         folded = rotl64(acc_u, 11 * order_index + 5)
-        bucket = (folded & np.uint64(BASE_BITS - 1)).astype(np.int64)
-        bucket += group * BASE_BITS
+        bucket = (folded & np.uint64(BLOCK - 1)).astype(np.int64)
+        bucket += group * BLOCK
         bucket = np.where(acc_uvalid, bucket, COUNT_BUCKETS)
         indices.append((rows + bucket).reshape(-1))
 
     flat = np.concatenate(indices)
     counts = np.bincount(flat, minlength=n * stride).reshape(n, stride)
-    counts = counts[:, :COUNT_BUCKETS].reshape(n, GROUPS, BASE_BITS)
+    return counts[:, :COUNT_BUCKETS].reshape(n, GROUPS, BLOCK)
 
-    bits = np.zeros((n, BITS), dtype=np.uint8)
-    view_cache: dict[tuple[int, int, int], np.ndarray] = {}
-    at = 0
-    for group, shift, level, width in PLANES:
-        key = (group, shift, width)
-        if key not in view_cache:
-            c = counts[:, group].astype(np.int32)
-            idx = (np.arange(BASE_BITS) >> shift) & (width - 1)
-            perm = np.argsort(idx, kind="stable")
-            view_cache[key] = c[:, perm].reshape(n, width, BASE_BITS // width).sum(axis=2)
-        bits[:, at:at + width] = view_cache[key] >= level
-        at += width
 
-    packed = np.packbits(bits, axis=1, bitorder="little")
-    return packed.view(np.uint64).reshape(n, WORDS)
+def encode_windows(tokens: np.ndarray, units: np.ndarray, tables: np.ndarray) -> np.ndarray:
+    """Encode (n, 2048) token windows into packed full-resolution signatures.
+
+    Column p * BLOCK + b of the 319,488-bit candidate signature is
+    `counts[group(p)][b] >= level(p)` for full-resolution plane p.
+    """
+    n = tokens.shape[0]
+    counts = encode_counts(tokens, units, tables)
+    bits = np.zeros((n, FULL_BITS), dtype=np.uint8)
+    for plane_index, (group, level) in enumerate(FULL_PLANES):
+        lo = plane_index * BLOCK
+        bits[:, lo:lo + BLOCK] = counts[:, group] >= level
+    packed = np.ascontiguousarray(np.packbits(bits, axis=1, bitorder="little"))
+    return packed.view(np.uint64).reshape(n, FULL_WORDS)
 
 
 @dataclass
@@ -398,11 +365,12 @@ def ensure_augmented(cache_dir: Path, train: Split, count: int, fraction: float,
     kept as the hard target (crops carry no teacher marginals).
     """
     n_aug = int(count * fraction)
-    tag = f"train.bloomaug{BITS}_v1_s{seed}_n{n_aug}"
+    tag = f"train.bloomaug{FULL_BITS}_v1_s{seed}_n{n_aug}"
     feat_path = cache_dir / f"{tag}.feats.mmap"
     label_path = cache_dir / f"{tag}.labels.mmap"
     if feat_path.exists() and label_path.exists():
-        return (np.memmap(feat_path, dtype=np.uint64, mode="r", shape=(n_aug, WORDS)),
+        return (np.memmap(feat_path, dtype=np.uint64, mode="r",
+                          shape=(n_aug, FULL_WORDS)),
                 np.memmap(label_path, dtype=np.int64, mode="r", shape=(n_aug,)))
     rng = np.random.default_rng(seed ^ 0xA06)
     src = np.sort(rng.choice(count, size=n_aug, replace=n_aug > count))
@@ -410,7 +378,7 @@ def ensure_augmented(cache_dir: Path, train: Split, count: int, fraction: float,
                                  size=n_aug)).astype(np.int64)
     tables = zobrist_tables()
     tmp = feat_path.with_suffix(".tmp")
-    out = np.memmap(tmp, dtype=np.uint64, mode="w+", shape=(n_aug, WORDS))
+    out = np.memmap(tmp, dtype=np.uint64, mode="w+", shape=(n_aug, FULL_WORDS))
     for start in range(0, n_aug, batch):
         stop = min(start + batch, n_aug)
         windows = build_crop_windows(
@@ -422,19 +390,19 @@ def ensure_augmented(cache_dir: Path, train: Split, count: int, fraction: float,
     del out
     labels[src].astype(np.int64).tofile(label_path)
     tmp.rename(feat_path)
-    return (np.memmap(feat_path, dtype=np.uint64, mode="r", shape=(n_aug, WORDS)),
+    return (np.memmap(feat_path, dtype=np.uint64, mode="r", shape=(n_aug, FULL_WORDS)),
             np.memmap(label_path, dtype=np.int64, mode="r", shape=(n_aug,)))
 
 
 def ensure_features(cache_dir: Path, split: str, data: Split, batch: int = 1024) -> np.ndarray:
-    """Compute (or load) packed Bloom signatures for a split."""
-    tag = f"{split}.bloom{BITS}_v6.mmap"
+    """Compute (or load) packed full-resolution Bloom signatures for a split."""
+    tag = f"{split}.bloom{FULL_BITS}_v6.mmap"
     path = cache_dir / tag
     if path.exists():
-        return np.memmap(path, dtype=np.uint64, mode="r", shape=(data.count, WORDS))
+        return np.memmap(path, dtype=np.uint64, mode="r", shape=(data.count, FULL_WORDS))
     tables = zobrist_tables()
     tmp = path.with_suffix(".tmp")
-    out = np.memmap(tmp, dtype=np.uint64, mode="w+", shape=(data.count, WORDS))
+    out = np.memmap(tmp, dtype=np.uint64, mode="w+", shape=(data.count, FULL_WORDS))
     for start in range(0, data.count, batch):
         stop = min(start + batch, data.count)
         out[start:stop] = encode_windows(
@@ -444,7 +412,136 @@ def ensure_features(cache_dir: Path, split: str, data: Split, batch: int = 1024)
     out.flush()
     del out
     tmp.rename(path)
-    return np.memmap(path, dtype=np.uint64, mode="r", shape=(data.count, WORDS))
+    return np.memmap(path, dtype=np.uint64, mode="r", shape=(data.count, FULL_WORDS))
+
+
+def ensure_class_stats(cache_dir: Path, feats: np.ndarray,
+                       labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-class column activation sums over train (cached)."""
+    path = cache_dir / "train.colstats_v1.npz"
+    if path.exists():
+        data = np.load(path)
+        return data["sums"], data["counts"]
+    n = feats.shape[0]
+    sums = np.zeros((CLASSES, FULL_BITS), dtype=np.int64)
+    counts = np.bincount(labels, minlength=CLASSES).astype(np.int64)
+    for start in range(0, n, 1024):
+        stop = min(start + 1024, n)
+        packed = np.asarray(feats[start:stop])
+        bits = np.unpackbits(packed.view(np.uint8).reshape(stop - start, -1),
+                             axis=1, bitorder="little")[:, :FULL_BITS]
+        lab = labels[start:stop]
+        for c in np.unique(lab):
+            sums[c] += bits[lab == c].sum(axis=0, dtype=np.int64)
+        if (start // 1024) % 20 == 0:
+            print(f"stats: {stop}/{n}", flush=True)
+    np.savez(path, sums=sums, counts=counts)
+    return sums, counts
+
+
+def load_scorer(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Full-width scorer weights: per-(class, plane) eff scale + sign bits.
+
+    Accepts a `full` stage checkpoint (.pt) or a legacy full-width MBL3
+    artifact.
+    """
+    if path.suffix == ".pt":
+        state = torch.load(path, map_location="cpu")["state"]
+        latent = state["latent"].numpy()
+        block_scale = state["block_scale"].numpy()
+        eff = block_scale / math.sqrt(FULL_BITS)
+        return eff, (latent >= 0).astype(np.uint8)
+    blob = path.read_bytes()
+    assert blob[:4] == b"MBL3", "scorer must be a .pt checkpoint or MBL3 artifact"
+    block_bits, blocks, hidden, classes = struct.unpack_from("<IIII", blob, 4)
+    assert (block_bits, blocks, hidden, classes) == (BLOCK, FULL_BLOCKS, 0, CLASSES)
+    cur = 20
+    eff = np.frombuffer(blob, dtype="<f4", count=CLASSES * FULL_BLOCKS,
+                        offset=cur).reshape(CLASSES, FULL_BLOCKS).copy()
+    cur += CLASSES * FULL_BLOCKS * 4 + CLASSES * 4  # skip biases
+    packed = np.frombuffer(blob, dtype=np.uint8, offset=cur).reshape(CLASSES, -1)
+    w = np.unpackbits(packed, axis=1, bitorder="little")[:, :FULL_BITS]
+    return eff, w
+
+
+def align_scores(sums: np.ndarray, counts: np.ndarray, eff: np.ndarray,
+                 w: np.ndarray) -> np.ndarray:
+    """Saliency of each candidate column for the trained full-width head.
+
+    score_j = sum_c pi_c * (p_{j|c} - p_j) * eff[c, plane(j)] * sign[c, j]:
+    how much the column's class-conditional activation deviation aligns with
+    the weights the full-width head learned for it. Negative scores mean the
+    column mostly cancels and is not worth artifact bytes.
+    """
+    pi = counts / counts.sum()
+    p_jc = sums / counts[:, None]
+    p_j = (pi[:, None] * p_jc).sum(axis=0)
+    plane_of = np.repeat(np.arange(FULL_BLOCKS), BLOCK)
+    u = eff[:, plane_of] * (2.0 * w - 1.0)
+    dev = p_jc - p_j[None, :]
+    return np.maximum((pi[:, None] * dev * u).sum(axis=0), 0.0)
+
+
+def knapsack_select(scores: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """Keep k columns as per-plane 64-column chunks with the best score mass.
+
+    Returns (planes, buckets): planes rows are (full plane index, width) and
+    buckets holds each plane's selected bucket ids, ascending, concatenated in
+    plane order.
+    """
+    assert k % CHUNK_COLS == 0
+    per_plane = scores.reshape(FULL_BLOCKS, BLOCK)
+    order = np.argsort(-per_plane, axis=1)
+    ranked = np.take_along_axis(per_plane, order, axis=1)
+    chunk_vals = ranked.reshape(FULL_BLOCKS, BLOCK // CHUNK_COLS, CHUNK_COLS).sum(axis=2)
+    take = np.sort(np.argsort(-chunk_vals.ravel())[: k // CHUNK_COLS])
+    sel: dict[int, list[np.ndarray]] = {}
+    for chunk in take:
+        plane, ci = divmod(int(chunk), BLOCK // CHUNK_COLS)
+        sel.setdefault(plane, []).append(
+            order[plane, ci * CHUNK_COLS:(ci + 1) * CHUNK_COLS])
+    planes = np.array([(p, sum(len(b) for b in sel[p])) for p in sorted(sel)],
+                      dtype=np.int64)
+    buckets = np.concatenate([np.sort(np.concatenate(sel[p])) for p in sorted(sel)])
+    return planes, buckets
+
+
+def selection_columns(planes: np.ndarray, buckets: np.ndarray) -> np.ndarray:
+    """Global candidate-column indices of a selection, in signature order."""
+    cols = []
+    at = 0
+    for plane, width in planes:
+        cols.append(plane * BLOCK + buckets[at:at + width])
+        at += width
+    return np.concatenate(cols)
+
+
+def ensure_selected(cache_dir: Path, split: str, feats: np.ndarray,
+                    cols: np.ndarray, tag: str, batch: int = 1024) -> np.ndarray:
+    """Gather selected columns from full-resolution features (cached)."""
+    k = cols.size
+    words = k // 64
+    path = cache_dir / f"{split}.{tag}.mmap"
+    if path.exists():
+        return np.memmap(path, dtype=np.uint64, mode="r",
+                         shape=(feats.shape[0], words))
+    n = feats.shape[0]
+    tmp = path.with_suffix(".tmp")
+    out = np.memmap(tmp, dtype=np.uint64, mode="w+", shape=(n, words))
+    for start in range(0, n, batch):
+        stop = min(start + batch, n)
+        packed = np.asarray(feats[start:stop])
+        bits = np.unpackbits(packed.view(np.uint8).reshape(stop - start, -1),
+                             axis=1, bitorder="little")[:, :FULL_BITS]
+        sel_bits = np.ascontiguousarray(bits[:, cols])
+        repacked = np.ascontiguousarray(
+            np.packbits(sel_bits, axis=1, bitorder="little"))
+        out[start:stop] = repacked.view(np.uint64).reshape(stop - start, words)
+    out.flush()
+    del out
+    tmp.rename(path)
+    print(f"gathered {split} -> {path.name}", flush=True)
+    return np.memmap(path, dtype=np.uint64, mode="r", shape=(n, words))
 
 
 class SignSTE(torch.autograd.Function):
@@ -464,7 +561,7 @@ def sign_ste(x: torch.Tensor) -> torch.Tensor:
 
 
 class BloomHead(nn.Module):
-    """Binary {-1,+1} linear head over the compact Bloom signature.
+    """Binary {-1,+1} linear head over a (selected or full) Bloom signature.
 
     The head uses per-(class, plane) scales (XNOR-net style): the per-plane
     bipolar dot products (computed with XOR + popcount at inference) are
@@ -473,47 +570,50 @@ class BloomHead(nn.Module):
     int8 with one float step per class for export).
     """
 
-    def __init__(self, float_head: bool = False) -> None:
+    def __init__(self, widths: list[int], float_head: bool = False) -> None:
         super().__init__()
         self.float_head = float_head
-        self.latent = nn.Parameter(torch.empty(CLASSES, BITS))
+        self.widths = widths
+        self.bits = sum(widths)
+        self.nplanes = len(widths)
+        self.latent = nn.Parameter(torch.empty(CLASSES, self.bits))
         nn.init.uniform_(self.latent, -0.1, 0.1)
-        self.block_scale = nn.Parameter(torch.full((CLASSES, BLOCKS), 4.0))
+        self.block_scale = nn.Parameter(torch.full((CLASSES, self.nplanes), 4.0))
         self.bias = nn.Parameter(torch.zeros(CLASSES))
         bounds = [0]
-        for _, _, _, width in PLANES:
+        for width in widths:
             bounds.append(bounds[-1] + width)
-        self.bounds = [(bounds[i], bounds[i + 1]) for i in range(BLOCKS)]
+        self.bounds = [(bounds[i], bounds[i + 1]) for i in range(self.nplanes)]
 
     def eff_scale(self) -> torch.Tensor:
         """Effective per-(class, plane) scale, fan-in normalized."""
-        return self.block_scale / math.sqrt(BITS)
+        return self.block_scale / math.sqrt(self.bits)
 
     def forward(self, feats: torch.Tensor) -> torch.Tensor:
         # Float head is a diagnostic-only upper bound for the binary head.
         w = self.latent if self.float_head else sign_ste(self.latent)
         # Per-plane bipolar dot products (planes have unequal widths).
         dots = [feats[:, lo:hi] @ w[:, lo:hi].T for lo, hi in self.bounds]
-        d = torch.stack(dots, dim=2)  # (n, CLASSES, BLOCKS)
+        d = torch.stack(dots, dim=2)  # (n, CLASSES, planes)
         return (d * self.eff_scale().unsqueeze(0)).sum(dim=2) + self.bias
 
 
-def unpack_batch(packed: np.ndarray) -> torch.Tensor:
-    """Packed u64 -> float ±1 tensor of shape (n, BITS)."""
-    raw = np.unpackbits(packed.view(np.uint8).reshape(packed.shape[0], BITS // 8),
+def unpack_batch(packed: np.ndarray, bits: int) -> torch.Tensor:
+    """Packed u64 -> float ±1 tensor of shape (n, bits)."""
+    raw = np.unpackbits(packed.view(np.uint8).reshape(packed.shape[0], bits // 8),
                         axis=1, bitorder="little")
-    bits = raw.astype(np.float32)
-    return torch.from_numpy(bits * 2.0 - 1.0)
+    return torch.from_numpy(raw.astype(np.float32) * 2.0 - 1.0)
 
 
-def evaluate(model: BloomHead, feats: np.ndarray, data: Split, batch: int) -> tuple[float, float]:
+def evaluate(model: BloomHead, feats: np.ndarray, data: Split,
+             batch: int) -> tuple[float, float]:
     model.eval()
     correct_teacher = 0
     correct_fs = 0
     with torch.no_grad():
         for start in range(0, data.count, batch):
             stop = min(start + batch, data.count)
-            x = unpack_batch(np.asarray(feats[start:stop]))
+            x = unpack_batch(np.asarray(feats[start:stop]), model.bits)
             pred = model(x).argmax(dim=1).numpy()
             correct_teacher += int((pred == data.labels[start:stop]).sum())
             if data.fs_labels is not None:
@@ -521,60 +621,18 @@ def evaluate(model: BloomHead, feats: np.ndarray, data: Split, batch: int) -> tu
     return correct_teacher / data.count, correct_fs / data.count
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--cache-dir", type=Path, required=True)
-    p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--epochs", type=int, default=300)
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--learning-rate", type=float, default=1e-3)
-    p.add_argument("--warmup-steps", type=int, default=1000)
-    p.add_argument("--ema-decay", type=float, default=0.998)
-    p.add_argument("--soft-loss-weight", type=float, default=0.5)
-    p.add_argument("--hard-loss-weight", type=float, default=0.5)
-    p.add_argument("--hard-labels", choices=("teacher", "fs"), default="fs",
-                   help="hard CE targets: teacher argmax or filesystem labels")
-    p.add_argument("--augment-fraction", type=float, default=0.35,
-                   help="extra short prefix-crop samples as a fraction of train "
-                        "count (hard fs labels only)")
-    p.add_argument("--float-head", action="store_true",
-                   help="diagnostic: float output weights (no export)")
-    p.add_argument("--limit", type=int, default=None)
-    p.add_argument("--seed", type=int, default=2)
-    p.add_argument("--threads", type=int, default=8)
-    args = p.parse_args()
-
-    torch.manual_seed(args.seed)
-    torch.set_num_threads(args.threads)
+def train_head(args: argparse.Namespace, widths: list[int], train: Split,
+               valid: Split, train_feats: np.ndarray, valid_feats: np.ndarray,
+               aug_feats: np.ndarray | None,
+               aug_labels: np.ndarray | None) -> BloomHead:
     rng = np.random.default_rng(args.seed)
-
-    train = open_split(args.cache_dir, "train")
-    valid = open_split(args.cache_dir, "valid")
-    test = open_split(args.cache_dir, "test")
-    train_feats = ensure_features(args.cache_dir, "train", train)
-    valid_feats = ensure_features(args.cache_dir, "valid", valid)
-    test_feats = ensure_features(args.cache_dir, "test", test)
-
-    count = train.count if args.limit is None else min(args.limit, train.count)
-    print(f"train={count} valid={valid.count} test={test.count} bits={BITS}", flush=True)
-
+    count = train.count
+    labels = np.asarray(train.fs_labels[:count])
     marginals = np.asarray(train.marginals[:count])
-    if args.hard_labels == "fs" and train.fs_labels is not None:
-        labels = np.asarray(train.fs_labels[:count])
-    else:
-        labels = np.asarray(train.labels[:count])
-
-    aug_feats: np.ndarray | None = None
-    aug_labels: np.ndarray | None = None
-    n_aug = 0
-    if args.augment_fraction > 0:
-        aug_feats, aug_labels = ensure_augmented(
-            args.cache_dir, train, count, args.augment_fraction, labels, args.seed)
-        n_aug = aug_feats.shape[0]
-        print(f"augmented={n_aug}", flush=True)
+    n_aug = 0 if aug_feats is None else aug_feats.shape[0]
     total = count + n_aug
 
-    model = BloomHead(args.float_head)
+    model = BloomHead(widths, args.float_head)
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         (no_decay if "latent" in name or "block_scale" in name else decay).append(param)
@@ -582,7 +640,7 @@ def main() -> None:
         [{"params": no_decay, "weight_decay": 0.0}, {"params": decay, "weight_decay": 1e-3}],
         lr=args.learning_rate,
     )
-    steps_per_epoch = max(1, (count + n_aug) // args.batch_size)
+    steps_per_epoch = max(1, total // args.batch_size)
     total_steps = args.epochs * steps_per_epoch
 
     def lr_lambda(step: int) -> float:
@@ -594,7 +652,6 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     ema = {k: v.detach().clone() for k, v in model.state_dict().items()
            if v.dtype.is_floating_point}
-
     best_state = None
     best_fs = -1.0
 
@@ -615,7 +672,8 @@ def main() -> None:
                 assert aug_feats is not None and aug_labels is not None
                 parts.append(np.asarray(aug_feats[crop_idx]))
                 hard_parts.append(np.asarray(aug_labels[crop_idx]))
-            x = unpack_batch(np.concatenate(parts) if len(parts) > 1 else parts[0])
+            x = unpack_batch(np.concatenate(parts) if len(parts) > 1 else parts[0],
+                             model.bits)
             hard = torch.from_numpy(np.concatenate(hard_parts).copy())
 
             logits = model(x)
@@ -657,39 +715,28 @@ def main() -> None:
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    parity, fs_acc = evaluate(model, test_feats, test, args.batch_size)
+    return model
+
+
+def report_test(model: BloomHead, test: Split, test_feats: np.ndarray,
+                batch: int) -> None:
+    parity, fs_acc = evaluate(model, test_feats, test, batch)
     print(f"test_teacher_parity={parity:.6f}", flush=True)
     print(f"test_fs_accuracy={fs_acc:.6f}", flush=True)
-
-    if test.fs_labels is not None:
-        preds = []
-        model.eval()
-        with torch.no_grad():
-            for start in range(0, test.count, args.batch_size):
-                stop = min(start + args.batch_size, test.count)
-                x = unpack_batch(np.asarray(test_feats[start:stop]))
-                preds.append(model(x).argmax(dim=1).numpy())
-        pred = np.concatenate(preds)
-        fs = np.asarray(test.fs_labels)
-        recalls = []
-        for c in range(CLASSES):
-            mask = fs == c
-            if mask.any():
-                recalls.append(float((pred[mask] == c).mean()))
-        print(f"test_fs_macro_recall={np.mean(recalls):.6f}", flush=True)
-
-    if args.float_head:
+    if test.fs_labels is None:
         return
-    export(model, args.output)
-
-    sample = np.asarray(test_feats[:512])
-    sim_logits = simulate(model, sample)
+    preds = []
     model.eval()
     with torch.no_grad():
-        torch_logits = model(unpack_batch(sample)).numpy()
-    agree = float((sim_logits.argmax(1) == torch_logits.argmax(1)).mean())
-    max_err = float(np.abs(sim_logits - torch_logits).max())
-    print(f"simulator: argmax agreement={agree:.4f} max_logit_err={max_err:.4f}", flush=True)
+        for start in range(0, test.count, batch):
+            stop = min(start + batch, test.count)
+            x = unpack_batch(np.asarray(test_feats[start:stop]), model.bits)
+            preds.append(model(x).argmax(dim=1).numpy())
+    pred = np.concatenate(preds)
+    fs = np.asarray(test.fs_labels)
+    recalls = [float((pred[fs == c] == c).mean()) for c in range(CLASSES)
+               if (fs == c).any()]
+    print(f"test_fs_macro_recall={np.mean(recalls):.6f}", flush=True)
 
 
 def pack_rows(bits01: np.ndarray) -> bytes:
@@ -710,13 +757,16 @@ def quantized_scales(model: BloomHead) -> tuple[np.ndarray, np.ndarray]:
     return q, step.astype(np.float32)
 
 
-def export(model: BloomHead, output: Path) -> None:
-    """MBL4: header, plane table, int8 scales, biases, packed head rows."""
+def export(model: BloomHead, planes: np.ndarray, buckets: np.ndarray,
+           output: Path) -> None:
+    """MBL5: header, plane table, bucket ids, int8 scales, biases, head rows."""
     model.eval()
-    blob = bytearray(b"MBL4")
-    blob += struct.pack("<III", BITS, BLOCKS, CLASSES)
-    for group, shift, level, width in PLANES:
-        blob += struct.pack("<BBBB", group, shift, level, width.bit_length() - 1)
+    blob = bytearray(b"MBL5")
+    blob += struct.pack("<III", model.bits, len(planes), CLASSES)
+    for plane, width in planes:
+        group, level = FULL_PLANES[int(plane)]
+        blob += struct.pack("<BBH", group, level, int(width))
+    blob += buckets.astype("<u2").tobytes()
     q, step = quantized_scales(model)
     blob += q.tobytes()
     blob += step.astype("<f4").tobytes()
@@ -729,7 +779,7 @@ def export(model: BloomHead, output: Path) -> None:
 
 
 def simulate(model: BloomHead, feats: np.ndarray) -> np.ndarray:
-    """Integer XOR/popcount inference over packed signatures; returns logits.
+    """Integer XOR/popcount inference over packed selected signatures.
 
     Mirrors the Rust runtime: per-plane bipolar dot products accumulate as
     int8-scale * int, with one float multiply per class at the end.
@@ -737,7 +787,7 @@ def simulate(model: BloomHead, feats: np.ndarray) -> np.ndarray:
     n = feats.shape[0]
     q, step = quantized_scales(model)
     bias = model.bias.detach().numpy().astype(np.float32)
-    x_bits = np.unpackbits(feats.view(np.uint8).reshape(n, BITS // 8), axis=1,
+    x_bits = np.unpackbits(feats.view(np.uint8).reshape(n, model.bits // 8), axis=1,
                            bitorder="little").astype(np.uint8)
     out_w = (model.latent.detach().numpy() >= 0).astype(np.uint8)
     acc = np.zeros((n, CLASSES), dtype=np.int64)
@@ -746,6 +796,152 @@ def simulate(model: BloomHead, feats: np.ndarray) -> np.ndarray:
         z = (hi - lo) - 2 * mismatches
         acc += q[None, :, plane].astype(np.int64) * z
     return step[None, :] * acc.astype(np.float32) + bias[None, :]
+
+
+def add_train_args(p: argparse.ArgumentParser, epochs: int) -> None:
+    p.add_argument("--epochs", type=int, default=epochs)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--warmup-steps", type=int, default=1000)
+    p.add_argument("--ema-decay", type=float, default=0.998)
+    p.add_argument("--soft-loss-weight", type=float, default=0.5)
+    p.add_argument("--hard-loss-weight", type=float, default=0.5)
+    p.add_argument("--augment-fraction", type=float, default=0.35,
+                   help="extra short prefix-crop samples as a fraction of train "
+                        "count (hard fs labels only)")
+    p.add_argument("--float-head", action="store_true",
+                   help="diagnostic: float output weights (no export)")
+    p.add_argument("--seed", type=int, default=2)
+    p.add_argument("--threads", type=int, default=8)
+
+
+def cmd_full(args: argparse.Namespace) -> None:
+    """Train the full-width (319,488-column) scorer head; saves a checkpoint."""
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(args.threads)
+    train = open_split(args.cache_dir, "train")
+    valid = open_split(args.cache_dir, "valid")
+    test = open_split(args.cache_dir, "test")
+    train_feats = ensure_features(args.cache_dir, "train", train)
+    valid_feats = ensure_features(args.cache_dir, "valid", valid)
+    test_feats = ensure_features(args.cache_dir, "test", test)
+    print(f"train={train.count} valid={valid.count} test={test.count} "
+          f"bits={FULL_BITS}", flush=True)
+
+    aug_feats = aug_labels = None
+    if args.augment_fraction > 0:
+        labels = np.asarray(train.fs_labels[:train.count])
+        aug_feats, aug_labels = ensure_augmented(
+            args.cache_dir, train, train.count, args.augment_fraction, labels,
+            args.seed)
+        print(f"augmented={aug_feats.shape[0]}", flush=True)
+
+    model = train_head(args, [BLOCK] * FULL_BLOCKS, train, valid,
+                       train_feats, valid_feats, aug_feats, aug_labels)
+    report_test(model, test, test_feats, args.batch_size)
+    torch.save({"state": model.state_dict()}, args.scorer)
+    print(f"saved scorer checkpoint to {args.scorer}", flush=True)
+
+
+def cmd_select(args: argparse.Namespace) -> None:
+    """Score all candidate columns and write the selection table."""
+    train = open_split(args.cache_dir, "train")
+    train_feats = ensure_features(args.cache_dir, "train", train)
+    labels = np.asarray(train.fs_labels[:train.count])
+    sums, counts = ensure_class_stats(args.cache_dir, train_feats, labels)
+    eff, w = load_scorer(args.scorer)
+    scores = align_scores(sums, counts, eff, w)
+    planes, buckets = knapsack_select(scores, args.k)
+    np.savez(args.selection, planes=planes, buckets=buckets)
+    print(f"selection: {len(planes)} planes, {buckets.size} columns "
+          f"-> {args.selection}", flush=True)
+
+
+def cmd_train(args: argparse.Namespace) -> None:
+    """Train the binary head over the selected columns and export MBL5."""
+    torch.manual_seed(args.seed)
+    torch.set_num_threads(args.threads)
+
+    sel = np.load(args.selection)
+    planes, buckets = sel["planes"], sel["buckets"]
+    cols = selection_columns(planes, buckets)
+    widths = [int(width) for _, width in planes]
+    k = cols.size
+    tag = f"bloomsel{k}_v1"
+    print(f"selection: {len(planes)} planes, {k} columns", flush=True)
+
+    train = open_split(args.cache_dir, "train")
+    valid = open_split(args.cache_dir, "valid")
+    test = open_split(args.cache_dir, "test")
+    train_feats = ensure_selected(
+        args.cache_dir, "train", ensure_features(args.cache_dir, "train", train),
+        cols, tag)
+    valid_feats = ensure_selected(
+        args.cache_dir, "valid", ensure_features(args.cache_dir, "valid", valid),
+        cols, tag)
+    test_feats = ensure_selected(
+        args.cache_dir, "test", ensure_features(args.cache_dir, "test", test),
+        cols, tag)
+    print(f"train={train.count} valid={valid.count} test={test.count} bits={k}",
+          flush=True)
+
+    aug_feats = aug_labels = None
+    if args.augment_fraction > 0:
+        labels = np.asarray(train.fs_labels[:train.count])
+        full_aug, aug_labels = ensure_augmented(
+            args.cache_dir, train, train.count, args.augment_fraction, labels,
+            args.seed)
+        aug_feats = ensure_selected(
+            args.cache_dir, f"aug{full_aug.shape[0]}", full_aug, cols, tag)
+        print(f"augmented={aug_feats.shape[0]}", flush=True)
+
+    model = train_head(args, widths, train, valid, train_feats, valid_feats,
+                       aug_feats, aug_labels)
+    report_test(model, test, test_feats, args.batch_size)
+
+    if args.float_head:
+        return
+    export(model, planes, buckets, args.output)
+
+    sample = np.asarray(test_feats[:512])
+    sim_logits = simulate(model, sample)
+    model.eval()
+    with torch.no_grad():
+        torch_logits = model(unpack_batch(sample, model.bits)).numpy()
+    agree = float((sim_logits.argmax(1) == torch_logits.argmax(1)).mean())
+    max_err = float(np.abs(sim_logits - torch_logits).max())
+    print(f"simulator: argmax agreement={agree:.4f} max_logit_err={max_err:.4f}",
+          flush=True)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="stage", required=True)
+
+    pf = sub.add_parser("full", help="train the full-width scorer head")
+    pf.add_argument("--cache-dir", type=Path, required=True)
+    pf.add_argument("--scorer", type=Path, required=True)
+    add_train_args(pf, epochs=30)
+    pf.set_defaults(fn=cmd_full)
+
+    ps = sub.add_parser("select", help="write the column-selection table")
+    ps.add_argument("--cache-dir", type=Path, required=True)
+    ps.add_argument("--scorer", type=Path, required=True,
+                    help="full-stage checkpoint (.pt) or legacy MBL3 artifact")
+    ps.add_argument("--k", type=int, default=4608,
+                    help="selected columns (multiple of 64)")
+    ps.add_argument("--selection", type=Path, required=True)
+    ps.set_defaults(fn=cmd_select)
+
+    pt = sub.add_parser("train", help="train the selected head and export MBL5")
+    pt.add_argument("--cache-dir", type=Path, required=True)
+    pt.add_argument("--selection", type=Path, required=True)
+    pt.add_argument("--output", type=Path, required=True)
+    add_train_args(pt, epochs=300)
+    pt.set_defaults(fn=cmd_train)
+
+    args = p.parse_args()
+    args.fn(args)
 
 
 if __name__ == "__main__":

@@ -1,30 +1,34 @@
-//! Shannon n-gram counting-Bloom binary model (MBL4) runtime.
+//! Shannon n-gram counting-Bloom binary model (MBL5) runtime.
 //!
-//! The encoder turns the 2048-token Magika window into a compact binary
-//! signature using only table lookups, XOR, rotates, and integer compares:
-//! every byte n-gram (orders 1-8, computed separately for the begin/end half)
-//! is given a 64-bit Zobrist code — the XOR of per-offset random codes, i.e. a
-//! Shannon random block code over (symbol, offset) pairs — and counted in one
-//! or more small counting-Bloom views per (half, order) group. A view takes
-//! `width` power-of-two buckets from a bit-field of the hash (`shift`), so a
-//! group can expose several independent folds of the same n-gram stream.
-//! Bucket counts pass through per-plane thermometer thresholds (quantized
-//! log-frequency — Shannon surprisal — of each n-gram), giving a few thousand
-//! signature bits instead of hundreds of thousands.
+//! The encoder turns the 2048-token Magika window into a binary signature
+//! using only table lookups, XOR, rotates, and integer compares: every byte
+//! n-gram (orders 1-8, computed separately for the begin/end half) is given a
+//! 64-bit Zobrist code — the XOR of per-offset random codes, i.e. a Shannon
+//! random block code over (symbol, offset) pairs — and counted in 4,096
+//! counting-Bloom buckets per (half, order) group; word-unit and tokenizer-v3
+//! unit streams get their own groups. A candidate signature bit is a bucket
+//! count passed through a thermometer threshold (quantized log-frequency —
+//! Shannon surprisal — of each n-gram), giving 319,488 candidate bits that
+//! are nearly free to compute.
 //!
-//! The classifier is a binary {-1,+1} linear head evaluated with XOR +
-//! popcount per (class, plane), combined with a per-(class, plane) int8 scale
-//! and a per-class f32 step (XNOR-net style calibration), so inference stays
-//! binary end to end with one float multiply per class.
+//! Storing head weights for every candidate is not free, so the artifact
+//! keeps only the trainer-selected columns: per plane (a (group, threshold)
+//! pair), a sorted list of selected bucket ids, u64-aligned per plane. The
+//! classifier is a binary {-1,+1} linear head over the selected columns,
+//! evaluated with XOR + popcount per (class, plane), combined with a
+//! per-(class, plane) int8 scale and a per-class f32 step (XNOR-net style
+//! calibration), so inference stays binary end to end with one float multiply
+//! per class.
 //!
-//! The view/plane layout is read from the artifact, not hard-coded: the
-//! trainer's plane table drives both feature encoding and the head.
+//! The plane table and column selection are read from the artifact, not
+//! hard-coded: the trainer's selection drives both feature encoding and the
+//! head.
 
 use std::sync::OnceLock;
 
 pub(crate) static BLOOM_BYTES: &[u8] = include_bytes!("../../assets/magika/source-bloom.bin");
 
-pub(crate) const BLOOM_MAGIC: [u8; 4] = *b"MBL4";
+pub(crate) const BLOOM_MAGIC: [u8; 4] = *b"MBL5";
 
 pub(crate) const TOKENS: usize = 2_048;
 pub(crate) const PAD_TOKEN: u16 = 256;
@@ -41,6 +45,8 @@ pub(crate) const WORD_GROUPS: usize = 10;
 pub(crate) const UNIT_MAX_ORDER: usize = 4;
 pub(crate) const UNIT_GROUPS: usize = UNIT_MAX_ORDER;
 pub(crate) const GROUPS: usize = NGRAM_GROUPS + WORD_GROUPS + UNIT_GROUPS;
+/// Counting-Bloom buckets per group (fixed full resolution).
+pub(crate) const BLOCK: usize = 4_096;
 
 const ZOBRIST_SEED: u64 = 0xBE7A_1AB5_5EED_0001;
 const UNIT_SEED: u64 = 0xBE7A_1AB5_5EED_0002;
@@ -98,30 +104,23 @@ fn casefold(symbol: u16) -> u16 {
     }
 }
 
-/// One counting-Bloom fold of a group's hash stream: `width` buckets taken
-/// from the hash bit-field starting at `shift`.
-struct View {
-    shift: u32,
-    mask: u64,
-    /// Start of this view's buckets in the per-inference counts buffer.
-    offset: usize,
-}
-
-/// One signature bit-plane: `counts[view] >= level` over the view's buckets.
+/// One signature plane: the selected columns of one (group, threshold)
+/// candidate plane. Bit i of the segment is `counts[group][ids[i]] >= level`.
 struct Plane {
-    view: usize,
-    level: u16,
+    group: usize,
+    level: u8,
+    /// Selected columns in this plane (a multiple of 64).
     width: usize,
-    /// Start of this plane's bits in the packed signature (multiple of 64).
+    /// Start of this plane's bits in the packed signature.
     word_offset: usize,
+    /// Start of this plane's bucket ids in `bucket_ids`.
+    id_offset: usize,
 }
 
 pub(crate) struct BloomModel {
-    /// Distinct (group, shift, width) folds, with per-group index ranges.
-    views: Box<[View]>,
-    group_views: [(u16, u16); GROUPS],
-    count_slots: usize,
     planes: Box<[Plane]>,
+    /// Selected bucket ids, ascending within each plane's segment.
+    bucket_ids: Box<[u16]>,
     /// Total signature bits (a multiple of 64).
     bits: usize,
     /// `CLASSES` rows of packed head weights over the signature bits.
@@ -161,66 +160,46 @@ fn read_words(bytes: &[u8], cur: &mut usize, count: usize) -> Box<[u64]> {
 impl BloomModel {
     fn load() -> Self {
         let bytes = BLOOM_BYTES;
-        debug_assert!(bytes.starts_with(&BLOOM_MAGIC), "bad MBL4 magic");
+        debug_assert!(bytes.starts_with(&BLOOM_MAGIC), "bad MBL5 magic");
         let mut cur = BLOOM_MAGIC.len();
         let bits = read_u32(bytes, &mut cur) as usize;
         let plane_count = read_u32(bytes, &mut cur) as usize;
         let classes = read_u32(bytes, &mut cur) as usize;
-        debug_assert_eq!(classes, CLASSES, "unexpected MBL4 class count");
-        debug_assert!(bits.is_multiple_of(64), "unaligned MBL4 signature");
+        debug_assert_eq!(classes, CLASSES, "unexpected MBL5 class count");
+        debug_assert!(bits.is_multiple_of(64), "unaligned MBL5 signature");
 
-        // Plane table: (group, shift, level, width_log2) per plane. Planes of
-        // the same (group, shift, width) share one counting view.
-        let mut views: Vec<(usize, View)> = Vec::new();
-        let mut group_views = [(0u16, 0u16); GROUPS];
+        // Plane table: (group, level, selected width) per plane.
         let mut planes = Vec::with_capacity(plane_count);
-        let mut count_slots = 0usize;
         let mut bit_at = 0usize;
         for _ in 0..plane_count {
             let group = bytes[cur] as usize;
-            let shift = bytes[cur + 1] as u32;
-            let level = bytes[cur + 2] as u16;
-            let width = 1usize << bytes[cur + 3];
+            let level = bytes[cur + 1];
+            let width = u16::from_le_bytes([bytes[cur + 2], bytes[cur + 3]]) as usize;
             cur += 4;
-            debug_assert!(group < GROUPS, "bad MBL4 group id");
-            debug_assert!(width >= 64, "plane narrower than a word");
-            let view = views
-                .iter()
-                .position(|&(g, ref v)| {
-                    g == group && v.shift == shift && v.mask == (width as u64 - 1)
-                })
-                .unwrap_or_else(|| {
-                    views.push((
-                        group,
-                        View {
-                            shift,
-                            mask: width as u64 - 1,
-                            offset: count_slots,
-                        },
-                    ));
-                    count_slots += width;
-                    views.len() - 1
-                });
+            debug_assert!(group < GROUPS, "bad MBL5 group id");
+            debug_assert!(level >= 1, "bad MBL5 threshold");
+            debug_assert!(width.is_multiple_of(64), "unaligned MBL5 plane");
+            debug_assert!(width <= BLOCK, "plane wider than its group");
             planes.push(Plane {
-                view,
+                group,
                 level,
                 width,
                 word_offset: bit_at / 64,
+                id_offset: bit_at,
             });
             bit_at += width;
         }
-        debug_assert_eq!(bit_at, bits, "MBL4 plane widths disagree with header");
-        // Views arrive grouped because the plane table nests levels inside
-        // each group; record each group's contiguous view range.
-        for (index, &(group, _)) in views.iter().enumerate() {
-            let range = &mut group_views[group];
-            if range.1 == 0 {
-                *range = (index as u16, index as u16 + 1);
-            } else {
-                debug_assert_eq!(range.1 as usize, index, "MBL4 group views not contiguous");
-                range.1 = index as u16 + 1;
-            }
+        debug_assert_eq!(bit_at, bits, "MBL5 plane widths disagree with header");
+
+        // Selected bucket ids, one u16 per signature bit, per-plane ascending.
+        let mut bucket_ids = Vec::with_capacity(bits);
+        for i in 0..bits {
+            let at = cur + 2 * i;
+            let id = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            debug_assert!((id as usize) < BLOCK, "bad MBL5 bucket id");
+            bucket_ids.push(id);
         }
+        cur += 2 * bits;
 
         let mut scale_q = Vec::with_capacity(CLASSES * plane_count);
         for i in 0..CLASSES * plane_count {
@@ -236,13 +215,11 @@ impl BloomModel {
             *slot = read_f32(bytes, &mut cur);
         }
         let head_weights = read_words(bytes, &mut cur, CLASSES * (bits / 64));
-        debug_assert_eq!(cur, bytes.len(), "unexpected MBL4 payload length");
+        debug_assert_eq!(cur, bytes.len(), "unexpected MBL5 payload length");
 
         Self {
-            views: views.into_iter().map(|(_, view)| view).collect(),
-            group_views,
-            count_slots,
             planes: planes.into_boxed_slice(),
+            bucket_ids: bucket_ids.into_boxed_slice(),
             bits,
             head_weights,
             scale_q: scale_q.into_boxed_slice(),
@@ -262,12 +239,9 @@ impl BloomModel {
     }
 
     #[inline]
-    fn bump(&self, counts: &mut [u16], group: usize, hash: u64) {
-        let (start, end) = self.group_views[group];
-        for view in &self.views[start as usize..end as usize] {
-            let bucket = ((hash >> view.shift) & view.mask) as usize;
-            counts[view.offset + bucket] = counts[view.offset + bucket].saturating_add(1);
-        }
+    fn bump(&self, counts: &mut [u8], group: usize, hash: u64) {
+        let slot = group * BLOCK + (hash & (BLOCK as u64 - 1)) as usize;
+        counts[slot] = counts[slot].saturating_add(1);
     }
 
     /// Encode a token window plus its tokenizer-v3 unit stream into the packed
@@ -276,7 +250,7 @@ impl BloomModel {
         static ZOBRIST: OnceLock<Box<[[u64; SYMBOLS]; TABLES]>> = OnceLock::new();
         let tables = ZOBRIST.get_or_init(zobrist_tables);
 
-        let mut counts = vec![0u16; self.count_slots];
+        let mut counts = vec![0u8; GROUPS * BLOCK];
         for half in 0..2 {
             let htok = &tokens[half * HALF..(half + 1) * HALF];
             for position in 0..HALF {
@@ -376,14 +350,16 @@ impl BloomModel {
             }
         }
 
+        // Gather the selected columns: counts[group][id] >= level, packed
+        // little-endian per plane segment.
         let mut signature = vec![0u64; self.words()];
         for plane in self.planes.iter() {
-            let view = &self.views[plane.view];
-            let block = &counts[view.offset..view.offset + plane.width];
+            let block = &counts[plane.group * BLOCK..(plane.group + 1) * BLOCK];
+            let ids = &self.bucket_ids[plane.id_offset..plane.id_offset + plane.width];
             let base = plane.word_offset * 64;
-            for (bucket, &count) in block.iter().enumerate() {
-                let bit = (count >= plane.level) as u64;
-                let at = base + bucket;
+            for (index, &id) in ids.iter().enumerate() {
+                let bit = (block[id as usize] >= plane.level) as u64;
+                let at = base + index;
                 signature[at / 64] |= bit << (at % 64);
             }
         }

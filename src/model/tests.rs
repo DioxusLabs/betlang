@@ -408,22 +408,22 @@ fn bloom_matches_python_golden_vectors() {
     assert_eq!(cursor, bytes.len());
 }
 
-/// The shipped MBL4 artifact must stay compact: a few thousand signature
-/// bits and comfortably under the 47,840-byte convolutional student it
-/// replaced.
+/// The shipped MBL5 artifact must stay compact: a few thousand selected
+/// signature bits and strictly smaller than the 47,840-byte convolutional
+/// student it replaced.
 #[test]
 fn bloom_artifact_is_compact() {
     use super::bloom::{BLOOM_BYTES, BLOOM_MAGIC, BloomModel};
 
     assert_eq!(&BLOOM_BYTES[..4], &BLOOM_MAGIC);
     assert!(
-        BLOOM_BYTES.len() < 30_000,
+        BLOOM_BYTES.len() < 47_840,
         "artifact grew: {}",
         BLOOM_BYTES.len()
     );
     let model = BloomModel::get();
     assert_eq!(model.signature_bits() % 64, 0);
-    assert!(model.signature_bits() <= 4_096);
+    assert!(model.signature_bits() <= 8_192);
 }
 
 #[test]
