@@ -449,7 +449,7 @@ fn pointwise_tb<S: Simd, const N: usize, const TB: usize>(
         let v_rows = &v_buf[(j * tiles + block_start) * in_channels..][..TB * in_channels];
         let zero = f32x4::splat(simd, 0.0);
         let mut acc = [[zero; 4]; TB];
-        for (c, w) in u.chunks_exact(GROUP).enumerate() {
+        for (c, w) in u.as_chunks::<GROUP>().0.iter().enumerate() {
             let w = as_array_chunks::<4>(w);
             let w0 = f32x4::from_slice(simd, &w[0]);
             let w1 = f32x4::from_slice(simd, &w[1]);
@@ -521,7 +521,7 @@ fn store_pooled<S: Simd>(
             }
         }
         2 => {
-            for (pair, rows) in y.chunks_exact(2).enumerate() {
+            for (pair, rows) in y.as_chunks::<2>().0.iter().enumerate() {
                 let dst = as_array_chunks_mut::<4>(&mut dst[pair * out_channels..][..GROUP]);
                 for chunk in 0..4 {
                     let hi = rows[0][chunk].max(rows[1][chunk]);
