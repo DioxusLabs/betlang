@@ -19,6 +19,7 @@
 mod activation;
 mod constants;
 mod embedded;
+mod forward;
 mod layers;
 mod reader;
 mod runtime;
@@ -26,6 +27,7 @@ mod runtime;
 mod tests;
 mod tokenizer;
 mod window;
+mod wino;
 
 use self::{constants::CLASSES, runtime::Model, window::build_window};
 use crate::{Detection, Language};

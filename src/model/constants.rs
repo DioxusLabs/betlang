@@ -22,19 +22,6 @@ pub(crate) const POOLED: usize = CONV2 * 2; // GlobalMax + GlobalAvg
 pub(crate) const DENSE: usize = 96;
 pub(crate) const CLASSES: usize = 48;
 
-const EMBED_SCRATCH: usize = MAX_UNITS * EMBED;
-const POOL0_SCRATCH: usize = (MAX_UNITS / CONV0_POOL) * CONV0;
-const POOL1_SCRATCH: usize = (MAX_UNITS / CONV0_POOL / CONV1_POOL) * CONV1;
-
-const fn max_usize(a: usize, b: usize) -> usize {
-    if a > b { a } else { b }
-}
-
-pub(crate) const ACTIVATION_SCRATCH: usize =
-    max_usize(EMBED_SCRATCH + POOL0_SCRATCH, POOL0_SCRATCH + POOL1_SCRATCH);
-pub(crate) const CONV_SCRATCH: usize = 4 * CONV2;
-pub(crate) const INFERENCE_SCRATCH: usize = ACTIVATION_SCRATCH + CONV_SCRATCH;
-
 // Tokenizer flag bits. Must match `_PUNCT_FLAG`/etc. in the Python trainer.
 pub(crate) const WORD_MASK: u32 = 0x00FF_FFFF;
 pub(crate) const PUNCT_FLAG: u32 = 0x1000_0000;
