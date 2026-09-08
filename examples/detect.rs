@@ -16,6 +16,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use betlang::Language;
 use rayon::prelude::*;
@@ -54,18 +55,40 @@ fn detect_stdin() -> ExitCode {
         eprintln!("betlang: failed to read stdin: {err}");
         return ExitCode::from(2);
     }
-    report_single(betlang::detect(&buf))
+    // The forward plan is built once per process on the first call; warm it
+    // so the reported throughput reflects steady-state inference.
+    betlang::detect(&buf);
+    let start = Instant::now();
+    let detection = betlang::detect(&buf);
+    report_throughput(buf.len() as u64, start.elapsed());
+    report_single(detection)
 }
 
 fn detect_file(path: &Path) -> ExitCode {
-    let (bytes, _) = match read_model_window(path) {
+    let (bytes, size) = match read_model_window(path) {
         Ok(window) => window,
         Err(err) => {
             eprintln!("betlang: failed to read {}: {err}", path.display());
             return ExitCode::from(2);
         }
     };
-    report_single(betlang::detect(bytes))
+    betlang::detect(&bytes);
+    let start = Instant::now();
+    let detection = betlang::detect(&bytes);
+    report_throughput(size, start.elapsed());
+    report_single(detection)
+}
+
+/// Report detection throughput on stderr: real input bytes over the wall time
+/// of the forward pass.
+fn report_throughput(bytes: u64, elapsed: Duration) {
+    let secs = elapsed.as_secs_f64();
+    let rate = if secs > 0.0 { bytes as f64 / secs } else { 0.0 };
+    eprintln!(
+        "betlang: detected {} in {elapsed:.2?} ({}/s)",
+        format_bytes(bytes),
+        format_bytes(rate as u64),
+    );
 }
 
 /// The model only inspects the first and last 4096 bytes of a file, so read
@@ -188,7 +211,9 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         });
     }
 
+    let classify_start = Instant::now();
     let nodes: Vec<Node> = pending_nodes.into_par_iter().map(classify_node).collect();
+    let classify_elapsed = classify_start.elapsed();
 
     if nodes.is_empty() {
         eprintln!("betlang: nothing to scan under {}", root.display());
@@ -235,6 +260,20 @@ fn breakdown_tree(root: &Path) -> ExitCode {
         print_accuracy(&by_truth, graded, correct);
         println!();
         print_confusion(&by_truth, &confusion);
+    }
+
+    let file_count = nodes
+        .iter()
+        .filter(|node| matches!(node.kind, Kind::File { .. }))
+        .count() as u64;
+    let secs = classify_elapsed.as_secs_f64();
+    if secs > 0.0 {
+        eprintln!(
+            "betlang: classified {file_count} files ({}) in {classify_elapsed:.2?} ({:.0} files/s, {}/s)",
+            format_bytes(total),
+            file_count as f64 / secs,
+            format_bytes((total as f64 / secs) as u64),
+        );
     }
 
     ExitCode::SUCCESS
